@@ -29,13 +29,11 @@
 
 #include "absl/strings/string_view.h"
 #include "api/array_view.h"
-#include "api/dtls_transport_interface.h"
 #include "api/environment/environment.h"
 #include "pc/coordinator/bur_estimator.h"
 #include "api/field_trials_view.h"
 #include "api/priority.h"
 #include "api/rtc_error.h"
-#include "api/sctp_transport_interface.h"
 #include "api/task_queue/task_queue_base.h"
 #include "api/transport/data_channel_transport_interface.h"
 #include "media/sctp/sctp_transport_internal.h"
@@ -47,44 +45,47 @@
 #include "net/dcsctp/public/types.h"
 #include "net/dcsctp/timer/task_queue_timeout.h"
 #include "p2p/base/packet_transport_internal.h"
-#include "p2p/dtls/dtls_transport_internal.h"
 #include "rtc_base/containers/flat_map.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/task_utils/repeating_task.h"
 #include "rtc_base/network/received_packet.h"
 #include "rtc_base/random.h"
 #include "pc/rtp_sctp_coordinator.h"
-#include "pc/rtp_sctp_coordinator.h"
+#include "rtc_base/third_party/sigslot/sigslot.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/thread_annotations.h"
+#include "system_wrappers/include/clock.h"
 
 namespace webrtc {
 
 // Forward declaration
 class RtpSctpCoordinator;
 
-class DcSctpTransport : public SctpTransportInternal,
-                        public dcsctp::DcSctpSocketCallbacks {
+class DcSctpTransport : public cricket::SctpTransportInternal,
+                        public dcsctp::DcSctpSocketCallbacks,
+                        public sigslot::has_slots<> {
  public:
   DcSctpTransport(const Environment& env,
-                  Thread* network_thread,
-                  DtlsTransportInternal* transport);
+                  rtc::Thread* network_thread,
+                  rtc::PacketTransportInternal* transport);
   DcSctpTransport(const Environment& env,
-                  Thread* network_thread,
-                  DtlsTransportInternal* transport,
+                  rtc::Thread* network_thread,
+                  rtc::PacketTransportInternal* transport,
                   std::unique_ptr<dcsctp::DcSctpSocketFactory> socket_factory);
   ~DcSctpTransport() override;
 
-  // SctpTransportInternal
+  // cricket::SctpTransportInternal
   void SetOnConnectedCallback(std::function<void()> callback) override;
   void SetDataChannelSink(DataChannelSink* sink) override;
-  DtlsTransportInternal* dtls_transport() const override;
-  bool Start(const SctpOptions& options) override;
+  void SetDtlsTransport(rtc::PacketTransportInternal* transport) override;
+  bool Start(int local_sctp_port,
+             int remote_sctp_port,
+             int max_message_size) override;
   bool OpenStream(int sid, PriorityValue priority) override;
   bool ResetStream(int sid) override;
   RTCError SendData(int sid,
                     const SendDataParams& params,
-                    const CopyOnWriteBuffer& payload) override;
+                    const rtc::CopyOnWriteBuffer& payload) override;
   bool ReadyToSendData() override;
   int max_message_size() const override;
   std::optional<int> max_outbound_streams() const override;
@@ -92,9 +93,8 @@ class DcSctpTransport : public SctpTransportInternal,
   size_t buffered_amount(int sid) const override;
   size_t buffered_amount_low_threshold(int sid) const override;
   void SetBufferedAmountLowThreshold(int sid, size_t bytes) override;
+  void set_debug_name_for_testing(const char* debug_name) override;
 
-  static std::vector<uint8_t> GenerateConnectionToken(const Environment& env);
-  
   // Set BUR Coordinator for rate control
   void SetCoordinator(RtpSctpCoordinator* coordinator);
 
@@ -109,14 +109,17 @@ class DcSctpTransport : public SctpTransportInternal,
   void ApplyPendingStreamPriorities();
   // dcsctp::DcSctpSocketCallbacks
   dcsctp::SendPacketStatus SendPacketWithStatus(
-      ArrayView<const uint8_t> data) override;
+      rtc::ArrayView<const uint8_t> data) override;
   std::unique_ptr<dcsctp::Timeout> CreateTimeout(
       TaskQueueBase::DelayPrecision precision) override;
   dcsctp::TimeMs TimeMillis() override;
   uint32_t GetRandomInt(uint32_t low, uint32_t high) override;
   void OnTotalBufferedAmountLow() override;
-  bool HasPacingQueuedPackets() const override;
-  int64_t GetMicrosecondsSinceLastPacingSend() const override;
+  // Research hooks queried by the (research-modified) dcsctp socket for
+  // T3-RTX suppression. Not virtual in this tree's DcSctpSocketCallbacks,
+  // so they are plain methods here.
+  bool HasPacingQueuedPackets() const;
+  int64_t GetMicrosecondsSinceLastPacingSend() const;
   void OnBufferedAmountLow(dcsctp::StreamID stream_id) override;
   void OnMessageReceived(dcsctp::DcSctpMessage message) override;
   void OnError(dcsctp::ErrorKind error, absl::string_view message) override;
@@ -124,33 +127,32 @@ class DcSctpTransport : public SctpTransportInternal,
   void OnConnected() override;
   void OnClosed() override;
   void OnConnectionRestarted() override;
-  void OnStreamsResetFailed(ArrayView<const dcsctp::StreamID> outgoing_streams,
-                            absl::string_view reason) override;
+  void OnStreamsResetFailed(
+      rtc::ArrayView<const dcsctp::StreamID> outgoing_streams,
+      absl::string_view reason) override;
   void OnStreamsResetPerformed(
-      ArrayView<const dcsctp::StreamID> outgoing_streams) override;
+      rtc::ArrayView<const dcsctp::StreamID> outgoing_streams) override;
   void OnIncomingStreamsReset(
-      ArrayView<const dcsctp::StreamID> incoming_streams) override;
+      rtc::ArrayView<const dcsctp::StreamID> incoming_streams) override;
 
   // Transport callbacks
   void ConnectTransportSignals();
   void DisconnectTransportSignals();
-  void OnTransportWritableState(PacketTransportInternal* transport);
-  void OnTransportReadPacket(PacketTransportInternal* transport,
-                             const ReceivedIpPacket& packet);
-  void OnDtlsTransportState(DtlsTransportInternal* transport,
-                            DtlsTransportState);
+  void OnTransportWritableState(rtc::PacketTransportInternal* transport);
+  void OnTransportReadPacket(rtc::PacketTransportInternal* transport,
+                             const rtc::ReceivedPacket& packet);
   void MaybeConnectSocket();
 
-  Thread* const network_thread_;
-  DtlsTransportInternal* const transport_;
+  rtc::Thread* const network_thread_;
+  rtc::PacketTransportInternal* transport_;
   const Environment env_;
   Random random_;
 
   const std::unique_ptr<dcsctp::DcSctpSocketFactory> socket_factory_;
   dcsctp::TaskQueueTimeoutFactory task_queue_timeout_factory_;
   std::unique_ptr<dcsctp::DcSctpSocketInterface> socket_;
-  const std::string debug_name_;
-  CopyOnWriteBuffer receive_buffer_;
+  std::string debug_name_;
+  rtc::CopyOnWriteBuffer receive_buffer_;
 
   // Used to keep track of the state of data channels.
   // Reset needs to happen both ways before signaling the transport
@@ -177,12 +179,10 @@ class DcSctpTransport : public SctpTransportInternal,
   std::function<void()> on_connected_callback_ RTC_GUARDED_BY(network_thread_);
   DataChannelSink* data_channel_sink_ RTC_GUARDED_BY(network_thread_) = nullptr;
 
-  std::optional<std::vector<uint8_t>> local_init_;
-  std::optional<std::vector<uint8_t>> remote_init_;
-
-  static dcsctp::DcSctpOptions CreateDcSctpOptions(
-      const SctpOptions& options,
-      const FieldTrialsView& field_trials);
+  dcsctp::DcSctpOptions CreateDcSctpOptions(int local_sctp_port,
+                                            int remote_sctp_port,
+                                            int max_message_size,
+                                            const FieldTrialsView& field_trials);
 
   // ===== Pacing Members (Modified WebRTC Style) =====
   struct PacingQueueEntry {
@@ -195,7 +195,7 @@ class DcSctpTransport : public SctpTransportInternal,
   bool pacing_enabled_ = true;
   bool static_pacing_override_ = false;
   bool bur_initialized_ = false;  // Per-instance init flag (replaces static pacing_checked)
-  
+
   // Coordinator for BUR-based pacing
   RtpSctpCoordinator* coordinator_ = nullptr;
   int64_t pacing_next_deadline_us_ = 0;
@@ -203,8 +203,9 @@ class DcSctpTransport : public SctpTransportInternal,
   int64_t pacing_last_process_us_ = 0;
   int64_t last_pacing_send_time_us_ = 0;  // For T3-RTX suppression grace period
   RepeatingTaskHandle pacing_drain_task_;
-  
-  dcsctp::SendPacketStatus SendPacketImmediate(ArrayView<const uint8_t> data);
+
+  dcsctp::SendPacketStatus SendPacketImmediate(
+      rtc::ArrayView<const uint8_t> data);
   void MaybeSchedulePacingDrain(int64_t target_us, int64_t now_us);
   TimeDelta DrainPacingQueue();
   int64_t CalculateTransmitTimeUs(size_t bytes, int64_t rate_bps) const;
@@ -212,7 +213,7 @@ class DcSctpTransport : public SctpTransportInternal,
   // BUR-based rate control
   BurEstimator bur_estimator_;
   // bool bur_enabled_ = false;  // DISABLED for RTT testing
-  
+
   // ===== BUR-based Pacing Control =====
   struct BurState {
     int64_t interval_start_ms = 0;     // Start of current measurement interval
@@ -227,12 +228,12 @@ class DcSctpTransport : public SctpTransportInternal,
     double smoothed_bur = 0.0;         // Exponentially smoothed BUR
   };
   BurState bur_state_;
-  
+
   // BUR calculation and rate control
   double CalculateBur(int64_t L_us);
   void AdjustPacingRate(double bur);
   void OnBurIntervalComplete(int64_t now_ms, int64_t L_ms);
-  
+
   // BUR pacing parameters (configurable via environment variables)
   // See config/bur_profiles.csv for profile definitions
   int64_t bur_interval_ms_ = 50;            // BUR_INTERVAL_MS (default 50ms)
@@ -244,9 +245,9 @@ class DcSctpTransport : public SctpTransportInternal,
   double bur_spike_threshold_ = 1.0;        // BUR_SPIKE_THRESHOLD (default 1.0)
   double bur_max_mi_multiplier_ = 1.2;      // BUR_MAX_MI_MULTIPLIER (default 1.2)
   double bur_spike_reduction_ = 0.85;       // BUR_SPIKE_REDUCTION (default 0.85)
-  
+
   void InitBurParameters();  // Initialize from environment variables
-  
+
   // ===== Shared Memory Bandwidth Reader =====
   // Structure must match network_emulator.h SharedBandwidthData
   struct SharedBandwidthData {

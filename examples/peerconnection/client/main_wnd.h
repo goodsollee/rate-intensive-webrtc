@@ -11,9 +11,11 @@
 #ifndef EXAMPLES_PEERCONNECTION_CLIENT_MAIN_WND_H_
 #define EXAMPLES_PEERCONNECTION_CLIENT_MAIN_WND_H_
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "api/media_stream_interface.h"
 #include "api/video/video_frame.h"
@@ -33,11 +35,17 @@ class MainWndCallback {
   virtual void UIThreadCallback(int msg_id, void* data) = 0;
   virtual void Close() = 0;
 
-  virtual std::string GetLogFolder() const = 0;
+  // Defaulted (non-pure) for the transplanted research Conductor, which does
+  // not implement these baseline testbed hooks.
+  virtual std::string GetLogFolder() const { return std::string(); }
 
   // Controls bulk SCTP traffic.
-  virtual void StartBulkSctp() = 0;
-  virtual void StopBulkSctp() = 0;
+  virtual void StartBulkSctp() {}
+  virtual void StopBulkSctp() {}
+
+  // Research UI hook: chat/demo query submitted from the window. Default
+  // no-op so window implementations that never emit queries still link.
+  virtual void OnQuerySubmitted(const std::string& query) {}
 
  protected:
   virtual ~MainWndCallback() {}
@@ -74,6 +82,18 @@ class MainWindow {
   virtual void StopRemoteRenderer() = 0;
 
   virtual void QueueUIThreadCallback(int msg_id, void* data) = 0;
+
+  // Research UI hooks (demo chat / performance graph). Default no-ops so
+  // window implementations without these panels (e.g. HeadlessMainWnd)
+  // compile unchanged; GtkMainWnd overrides them.
+  virtual void AppendChatMessage(const std::string& role,
+                                 const std::string& text) {}
+  virtual void OnQueryStarted() {}
+  virtual void SetQueryPhase(const std::string& phase) {}
+  virtual void LoadContextDocuments(const std::vector<std::string>& texts) {}
+  virtual void OnSctpDataReceived(size_t bytes) {}
+  virtual void UpdateThroughput(float video_mbps, float sctp_mbps) {}
+  virtual uint64_t GetSctpBytesReceived() const { return 0; }
 };
 
 #ifdef WIN32

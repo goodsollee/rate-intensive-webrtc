@@ -11,6 +11,7 @@
 #define NET_DCSCTP_PUBLIC_DCSCTP_SOCKET_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -204,6 +205,21 @@ inline constexpr absl::string_view ToString(SctpImplementation implementation) {
 
 // Tracked metrics, which is the return value of GetMetrics. Optional members
 // will be unset when they are not yet known.
+// Summary of a received SACK, exposed to the transport layer for TSN-based
+// bandwidth/BUR estimation (research hook).
+// STUB NOTE: the original research tree also modified the dcsctp socket
+// implementation to invoke the SetOnSackReceived callback, honor SetCwnd /
+// SetSsthresh / NotifyPacketSent and fill Metrics::unacked_bytes. Those
+// implementation-side changes were NOT part of the transplant commit; the
+// virtuals below default to no-ops until that port lands, so the coordinator's
+// SCTP feedback loop is inert (fine for RTP-only / COORDINATOR_MODE=disabled).
+struct SackInfo {
+  uint32_t cumulative_tsn_ack = 0;
+  int64_t rtt_us = -1;
+  size_t bytes_acked = 0;
+  bool has_packet_loss = false;
+};
+
 struct Metrics {
   // Transmission stats and metrics.
 
@@ -267,6 +283,10 @@ struct Metrics {
   // signaled by the peer during connection.
   uint16_t negotiated_maximum_incoming_streams = 0;
   uint16_t negotiated_maximum_outgoing_streams = 0;
+
+  // Bytes in flight (sent but not yet cumulatively acked). Research hook;
+  // stays 0 until the dcsctp implementation port lands (see STUB NOTE).
+  size_t unacked_bytes = 0;
 };
 
 // Callbacks that the DcSctpSocket will call synchronously to the owning
@@ -625,6 +645,17 @@ class DcSctpSocketInterface {
   // be carried over if this socket is handed over by calling
   // `GetHandoverStateAndClose`.
   virtual std::optional<Metrics> GetMetrics() const = 0;
+
+  // === Research hooks (see SackInfo STUB NOTE above) ===
+  // Registers an observer invoked on every received SACK.
+  virtual void SetOnSackReceived(
+      std::function<void(const SackInfo&)> /*callback*/) {}
+  // Overrides the congestion window / slow-start threshold (external CC).
+  virtual void SetCwnd(size_t /*cwnd_bytes*/) {}
+  virtual void SetSsthresh(size_t /*ssthresh_bytes*/) {}
+  // Corrects the send timestamp of a TSN after pacer-delayed transmission.
+  virtual void NotifyPacketSent(uint32_t /*tsn*/,
+                                webrtc::Timestamp /*sent_time*/) {}
 
   // Returns empty bitmask if the socket is in the state in which a snapshot of
   // the state can be made by `GetHandoverStateAndClose()`. Return value is

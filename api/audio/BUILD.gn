@@ -184,3 +184,8 @@ if (rtc_include_tests) {
     ]
   }
 }
+
+# Compat alias (see api/BUILD.gn): newer name for the ADM factory dependency.
+group("create_audio_device_module") {
+  public_deps = [ "//modules/audio_device:audio_device" ]
+}

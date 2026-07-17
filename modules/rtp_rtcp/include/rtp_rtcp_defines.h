@@ -18,11 +18,15 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/variant.h"
 #include "api/array_view.h"
+#include "api/audio_codecs/audio_format.h"
+#include "api/rtp_headers.h"
 #include "api/transport/network_types.h"
 #include "api/units/data_rate.h"
 #include "api/units/time_delta.h"
@@ -30,7 +34,8 @@
 #include "modules/rtp_rtcp/include/report_block_data.h"
 #include "modules/rtp_rtcp/source/rtcp_packet.h"
 #include "modules/rtp_rtcp/source/rtcp_packet/congestion_control_feedback.h"
-#include "rtc_base/checks.h"
+#include "modules/rtp_rtcp/source/rtcp_packet/remote_estimate.h"
+#include "system_wrappers/include/clock.h"
 
 #define RTCP_CNAME_SIZE 256  // RFC 3550 page 44, including null termination
 #define IP_PACKET_SIZE 1500  // we assume ethernet
@@ -38,11 +43,9 @@
 namespace webrtc {
 class RtpPacket;
 class RtpPacketToSend;
-class RtpPacketReceived;
-
 namespace rtcp {
 class TransportFeedback;
-}  // namespace rtcp
+}
 
 const int kVideoPayloadTypeFrequency = 90000;
 
@@ -178,8 +181,9 @@ class NetworkLinkRtcpObserver {
 
   // Called on an RTCP packet with sender or receiver reports with non zero
   // report blocks. Report blocks are combined from all reports into one array.
-  virtual void OnReport(Timestamp /* receive_time */,
-                        ArrayView<const ReportBlockData> /* report_blocks */) {}
+  virtual void OnReport(
+      Timestamp /* receive_time */,
+      rtc::ArrayView<const ReportBlockData> /* report_blocks */) {}
   virtual void OnRttUpdate(Timestamp /* receive_time */, TimeDelta /* rtt */) {}
 };
 
@@ -262,30 +266,25 @@ class StreamFeedbackProvider {
 
 class RtcpRttStats {
  public:
-  virtual ~RtcpRttStats() = default;
   virtual void OnRttUpdate(int64_t rtt) = 0;
+
+  virtual int64_t LastProcessedRtt() const = 0;
+
+  virtual ~RtcpRttStats() {}
 };
 
 struct RtpPacketCounter {
   RtpPacketCounter()
-      : header_bytes(0),
-        payload_bytes(0),
-        padding_bytes(0),
-        packets(0),
-        packets_with_ect1(0),
-        packets_with_ce(0) {}
+      : header_bytes(0), payload_bytes(0), padding_bytes(0), packets(0) {}
 
   explicit RtpPacketCounter(const RtpPacket& packet);
   explicit RtpPacketCounter(const RtpPacketToSend& packet_to_send);
-  explicit RtpPacketCounter(const RtpPacketReceived& packet_received);
 
   void Add(const RtpPacketCounter& other) {
     header_bytes += other.header_bytes;
     payload_bytes += other.payload_bytes;
     padding_bytes += other.padding_bytes;
     packets += other.packets;
-    packets_with_ect1 += other.packets_with_ect1;
-    packets_with_ce += other.packets_with_ce;
     total_packet_delay += other.total_packet_delay;
   }
 
@@ -293,15 +292,12 @@ struct RtpPacketCounter {
     return header_bytes == other.header_bytes &&
            payload_bytes == other.payload_bytes &&
            padding_bytes == other.padding_bytes && packets == other.packets &&
-           packets_with_ect1 == other.packets_with_ect1 &&
-           packets_with_ce == other.packets_with_ce &&
            total_packet_delay == other.total_packet_delay;
   }
 
   // Not inlined, since use of RtpPacket would result in circular includes.
   void AddPacket(const RtpPacket& packet);
   void AddPacket(const RtpPacketToSend& packet_to_send);
-  void AddPacket(const RtpPacketReceived& packet_received);
 
   size_t TotalBytes() const {
     return header_bytes + payload_bytes + padding_bytes;
@@ -311,11 +307,9 @@ struct RtpPacketCounter {
   size_t payload_bytes;  // Payload bytes, excluding RTP headers and padding.
   size_t padding_bytes;  // Number of padding bytes.
   size_t packets;        // Number of packets.
-  size_t packets_with_ect1;  // Number of packets with ECT1 flag set to true.
-  size_t packets_with_ce;    // Number of packets with CE flag set to true.
   // The total delay of all `packets`. For RtpPacketToSend packets, this is
   // `time_in_send_queue()`. For receive packets, this is zero.
-  TimeDelta total_packet_delay = TimeDelta::Zero();
+  webrtc::TimeDelta total_packet_delay = webrtc::TimeDelta::Zero();
 };
 
 // Data usage statistics for a (rtp) stream.
@@ -363,8 +357,16 @@ struct StreamDataCounters {
 };
 
 class RtpSendRates {
+  template <std::size_t... Is>
+  constexpr std::array<DataRate, sizeof...(Is)> make_zero_array(
+      std::index_sequence<Is...>) {
+    return {{(static_cast<void>(Is), DataRate::Zero())...}};
+  }
+
  public:
-  constexpr RtpSendRates() = default;
+  RtpSendRates()
+      : send_rates_(
+            make_zero_array(std::make_index_sequence<kNumMediaTypes>())) {}
   RtpSendRates(const RtpSendRates& rhs) = default;
   RtpSendRates& operator=(const RtpSendRates&) = default;
 
@@ -387,10 +389,6 @@ class StreamDataCountersCallback {
  public:
   virtual ~StreamDataCountersCallback() {}
 
-  // TODO: webrtc:40644448 - Make this pure virtual.
-  virtual StreamDataCounters GetDataCounters(uint32_t ssrc) const {
-    RTC_CHECK_NOTREACHED();
-  }
   virtual void DataCountersUpdated(const StreamDataCounters& counters,
                                    uint32_t ssrc) = 0;
 };
@@ -404,7 +402,7 @@ struct RtpReceiveStats {
   // Interarrival jitter in samples.
   uint32_t jitter = 0;
   // Interarrival jitter in time.
-  TimeDelta interarrival_jitter = TimeDelta::Zero();
+  webrtc::TimeDelta interarrival_jitter = webrtc::TimeDelta::Zero();
 
   // Time of the last packet received in unix epoch,
   // i.e. Timestamp::Zero() represents 1st Jan 1970 00:00

@@ -765,7 +765,7 @@ inline QueryMetrics QueryTracker::ComputeMetrics(const QueryState& query) const 
 
 inline int64_t QueryTracker::GetCurrentTimeMs() {
   // Use webrtc::TimeMillis() for consistency with file_receiver timing
-  return webrtc::TimeMillis();
+  return rtc::TimeMillis();
 }
 
 }  // namespace coordinator

@@ -178,7 +178,7 @@ class CapturerTrackSource : public webrtc::VideoTrackSource {
   ~CapturerTrackSource() override = default;
 
  private:
-  webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
+  rtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
     return capturer_.get();
   }
 
@@ -221,9 +221,24 @@ std::string DisableAudioMediaSection(const std::string& sdp) {
 
 }  // namespace
 
+// Ported to older baseline: `absl_nonnull` qualifier not available here.
+
+namespace {
+// Signaling base URL: the original research setup used an external HTTPS
+// server ("https://<host>"). To also support the bundled local
+// signaling_server.py (plain http on a port), a scheme given explicitly in
+// --signaling_server (e.g. "http://192.168.100.1:8888") is used verbatim.
+std::string SignalingBaseUrl(const std::string& server) {
+  if (server.find("://") != std::string::npos) {
+    return server;
+  }
+  return "https://" + server;
+}
+}  // namespace
+
 Conductor::Conductor(const webrtc::Environment& env,
-                     PeerConnectionClient* absl_nonnull client,
-                     MainWindow* absl_nonnull main_wnd)
+                     PeerConnectionClient* client,
+                     MainWindow* main_wnd)
     : peer_id_(-1),
       loopback_(false),
       env_(env),
@@ -264,13 +279,15 @@ bool Conductor::InitializePeerConnection() {
   RTC_DCHECK(!peer_connection_);
 
   if (!signaling_thread_) {
-    signaling_thread_ = webrtc::Thread::CreateWithSocketServer();
+    signaling_thread_ = rtc::Thread::CreateWithSocketServer();
     signaling_thread_->Start();
   }
 
   webrtc::PeerConnectionFactoryDependencies deps;
   deps.signaling_thread = signaling_thread_.get();
-  deps.env = env_;
+  // Ported to older baseline: PeerConnectionFactoryDependencies has no `env`
+  // member on this revision; the factory creates its own environment
+  // internally (env_ is kept for the research code paths that reference it).
 
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
@@ -344,8 +361,10 @@ bool Conductor::CreatePeerConnection() {
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
   webrtc::PeerConnectionInterface::IceServer server;
   server.uri = GetPeerConnectionString();
-  server.username = GetTurnUserName();
-  server.password = GetTurnPassword();
+  // Ported to older baseline: defaults.h here has no GetTurnUserName /
+  // GetTurnPassword (STUN-only default server), so no credentials are set.
+  server.username = "";
+  server.password = "";
   config.servers.push_back(server);
 
   webrtc::PeerConnectionDependencies pc_dependencies(this);
@@ -443,7 +462,7 @@ void Conductor::OnRemoveTrack(
   main_wnd_->QueueUIThreadCallback(TRACK_REMOVED, receiver->track().release());
 }
 
-void Conductor::OnIceCandidate(const webrtc::IceCandidate* candidate) {
+void Conductor::OnIceCandidate(const webrtc::IceCandidateInterface* candidate) {
   RTC_LOG(LS_INFO) << __FUNCTION__ << " " << candidate->sdp_mline_index();
   // For loopback test. To save some connecting delay.
   if (loopback_) {
@@ -456,7 +475,14 @@ void Conductor::OnIceCandidate(const webrtc::IceCandidate* candidate) {
   Json::Value jmessage;
   jmessage[kCandidateSdpMidName] = candidate->sdp_mid();
   jmessage[kCandidateSdpMlineIndexName] = candidate->sdp_mline_index();
-  jmessage[kCandidateSdpName] = candidate->ToString();
+  // Ported to older baseline: IceCandidateInterface::ToString takes an
+  // out-parameter on this revision.
+  std::string candidate_sdp;
+  if (!candidate->ToString(&candidate_sdp)) {
+    RTC_LOG(LS_ERROR) << "Failed to serialize candidate";
+    return;
+  }
+  jmessage[kCandidateSdpName] = candidate_sdp;
 
   Json::StreamWriterBuilder factory;
   SendMessage(Json::writeString(factory, jmessage));
@@ -539,7 +565,7 @@ void Conductor::OnMessageFromPeer(int peer_id, const std::string& message) {
   std::string type_str;
   std::string json_object;
 
-  webrtc::GetStringFromJsonObject(jmessage, kSessionDescriptionTypeName,
+  rtc::GetStringFromJsonObject(jmessage, kSessionDescriptionTypeName,
                                   &type_str);
   if (!type_str.empty()) {
     if (type_str == "offer-loopback") {
@@ -560,7 +586,7 @@ void Conductor::OnMessageFromPeer(int peer_id, const std::string& message) {
     }
     webrtc::SdpType type = *type_maybe;
     std::string sdp;
-    if (!webrtc::GetStringFromJsonObject(jmessage, kSessionDescriptionSdpName,
+    if (!rtc::GetStringFromJsonObject(jmessage, kSessionDescriptionSdpName,
                                          &sdp)) {
       RTC_LOG(LS_WARNING)
           << "Can't parse received session description message.";
@@ -670,16 +696,16 @@ void Conductor::OnMessageFromPeer(int peer_id, const std::string& message) {
     std::string sdp_mid;
     int sdp_mlineindex = 0;
     std::string sdp;
-    if (!webrtc::GetStringFromJsonObject(jmessage, kCandidateSdpMidName,
+    if (!rtc::GetStringFromJsonObject(jmessage, kCandidateSdpMidName,
                                          &sdp_mid) ||
-        !webrtc::GetIntFromJsonObject(jmessage, kCandidateSdpMlineIndexName,
+        !rtc::GetIntFromJsonObject(jmessage, kCandidateSdpMlineIndexName,
                                       &sdp_mlineindex) ||
-        !webrtc::GetStringFromJsonObject(jmessage, kCandidateSdpName, &sdp)) {
+        !rtc::GetStringFromJsonObject(jmessage, kCandidateSdpName, &sdp)) {
       RTC_LOG(LS_WARNING) << "Can't parse received message.";
       return;
     }
     webrtc::SdpParseError error;
-    std::unique_ptr<webrtc::IceCandidate> candidate(
+    std::unique_ptr<webrtc::IceCandidateInterface> candidate(
         webrtc::CreateIceCandidate(sdp_mid, sdp_mlineindex, sdp, &error));
     if (!candidate) {
       RTC_LOG(LS_WARNING) << "Can't parse received candidate message. "
@@ -784,7 +810,7 @@ void Conductor::AddTracks() {
     webrtc::scoped_refptr<webrtc::AudioTrackInterface> audio_track(
         peer_connection_factory_->CreateAudioTrack(
             kAudioLabel,
-            peer_connection_factory_->CreateAudioSource(webrtc::AudioOptions())
+            peer_connection_factory_->CreateAudioSource(cricket::AudioOptions())
                 .get()));
     auto result_or_error = peer_connection_->AddTrack(audio_track, {kStreamId});
     if (!result_or_error.ok()) {
@@ -1028,7 +1054,7 @@ void Conductor::SendMessage(const std::string& json_object) {
       return;
     }
     
-    std::string post_url = "https://" + signaling_server_ + "/message/" + room_id_ + "/" + client_id_;
+    std::string post_url = SignalingBaseUrl(signaling_server_) + "/message/" + room_id_ + "/" + client_id_;
     std::string response;
     
     struct curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
@@ -1274,7 +1300,7 @@ void Conductor::PumpData() {
   // Fill buffer up to high water mark
   while (data_channel_->buffered_amount() < kHighWaterMark && bulk_send_active_.load()) {
     webrtc::DataBuffer buffer(
-        webrtc::CopyOnWriteBuffer(bulk_send_chunk_.data(), bulk_send_chunk_.size()), true);
+        rtc::CopyOnWriteBuffer(bulk_send_chunk_.data(), bulk_send_chunk_.size()), true);
     data_channel_->SendAsync(std::move(buffer), nullptr);
     bulk_send_total_sent_ += bulk_send_chunk_.size();
   }
@@ -1305,7 +1331,7 @@ void Conductor::FinishBulkSend() {
   // Send end marker
   std::vector<uint8_t> end_marker = {'E', 'N', 'D'};
   webrtc::DataBuffer end_buffer(
-      webrtc::CopyOnWriteBuffer(end_marker.data(), end_marker.size()), true);
+      rtc::CopyOnWriteBuffer(end_marker.data(), end_marker.size()), true);
   data_channel_->Send(end_buffer);
   
   int64_t actual_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1488,7 +1514,7 @@ void Conductor::SendControlMessage(const Json::Value& msg) {
   Json::StreamWriterBuilder builder;
   std::string json = Json::writeString(builder, msg);
   webrtc::DataBuffer buffer(
-      webrtc::CopyOnWriteBuffer(json.data(), json.size()), false);
+      rtc::CopyOnWriteBuffer(json.data(), json.size()), false);
   control_channel_->Send(buffer);
 }
 
@@ -1707,15 +1733,15 @@ void Conductor::OnControlMessage(const std::string& json) {
     if (data_size > 0 && context_data_channel_ &&
         context_data_channel_->state() ==
             webrtc::DataChannelInterface::kOpen) {
-      int64_t start_ms = webrtc::TimeMillis();
+      int64_t start_ms = rtc::TimeMillis();
       constexpr size_t kChunkSize = 256 * 1024;  // 256KB chunks
       for (size_t offset = 0; offset < data_size; offset += kChunkSize) {
         size_t chunk = std::min(kChunkSize, data_size - offset);
         webrtc::DataBuffer buf(
-            webrtc::CopyOnWriteBuffer(data_ptr + offset, chunk), true);
+            rtc::CopyOnWriteBuffer(data_ptr + offset, chunk), true);
         context_data_channel_->Send(buf);
       }
-      int64_t elapsed_ms = webrtc::TimeMillis() - start_ms;
+      int64_t elapsed_ms = rtc::TimeMillis() - start_ms;
 
       // Send completion signal
       Json::Value done;
@@ -1758,7 +1784,7 @@ void Conductor::OnControlMessage(const std::string& json) {
   if (type == "context_meta" && !is_sender_) {
     recv_context_buffer_.clear();
     context_done_received_ = false;
-    transfer_start_ms_ = webrtc::TimeMillis();
+    transfer_start_ms_ = rtc::TimeMillis();
     context_method_ = jmessage["method"].asString();
     recv_expected_size_ = jmessage["size"].asUInt64();
     recv_context_buffer_.reserve(recv_expected_size_);
@@ -1795,7 +1821,7 @@ void Conductor::TryProcessPendingContext() {
 
   // All data received — process
   context_done_received_ = false;
-  int64_t transfer_ms = webrtc::TimeMillis() - transfer_start_ms_;
+  int64_t transfer_ms = rtc::TimeMillis() - transfer_start_ms_;
   size_t received = recv_context_buffer_.size();
 
   // Show transfer metrics
@@ -1843,7 +1869,7 @@ void Conductor::ProcessReceivedContext(const std::string& query) {
   }
 
   main_wnd_->AppendChatMessage("System", "Thinking...");
-  inference_start_ms_ = webrtc::TimeMillis();
+  inference_start_ms_ = rtc::TimeMillis();
 
   if (context_method_ == "raw_text") {
     main_wnd_->SetQueryPhase("Encoding context + generating...");
@@ -1926,7 +1952,7 @@ void Conductor::OnQuerySubmitted(const std::string& query) {
   if (!demo_mode_)
     return;
 
-  query_start_ms_ = webrtc::TimeMillis();
+  query_start_ms_ = rtc::TimeMillis();
   printf("[DEMO] Query submitted: %s\n", query.c_str());
   fflush(stdout);
 
@@ -1951,7 +1977,7 @@ void Conductor::OnQuerySubmitted(const std::string& query) {
 
   if (llm_adapter_ && llm_adapter_->IsInitialized()) {
     main_wnd_->AppendChatMessage("System", "Thinking...");
-    inference_start_ms_ = webrtc::TimeMillis();
+    inference_start_ms_ = rtc::TimeMillis();
 
     // Run inference in background thread to not block UI
     std::string query_copy = query;
@@ -1992,7 +2018,7 @@ void Conductor::InitializeLlmAdapter() {
       [this](int ctx_id, const std::string& token, int idx, bool is_final) {
         if (idx == 0) {
           // First token: log TTFT
-          int64_t now = webrtc::TimeMillis();
+          int64_t now = rtc::TimeMillis();
           int64_t ttft_ms = now - inference_start_ms_;
           int64_t e2e_ttft_ms = now - query_start_ms_;
           printf("[TIMING] TTFT: %lld ms (inference), %lld ms (E2E from query)\n",
@@ -2005,7 +2031,7 @@ void Conductor::InitializeLlmAdapter() {
           main_wnd_->AppendChatMessage("Assistant", token);
         } else if (is_final) {
           // Final token: log total response time with tok/s
-          int64_t now = webrtc::TimeMillis();
+          int64_t now = rtc::TimeMillis();
           int64_t total_ms = now - query_start_ms_;
           int64_t inference_ms = now - inference_start_ms_;
           int64_t ttft_ms = now - inference_start_ms_;  // approximation for decode-only time
@@ -2084,7 +2110,7 @@ void Conductor::StartWebSocketSignaling() {
 
 void Conductor::ConnectToRoom() {
   // Build the join URL
-  std::string join_url = "https://" + signaling_server_ + "/join/" + room_id_;
+  std::string join_url = SignalingBaseUrl(signaling_server_) + "/join/" + room_id_;
   RTC_LOG(LS_INFO) << "Joining room: " << join_url;
   printf("[WS] Joining room: %s\n", join_url.c_str()); fflush(stdout);
 
@@ -2899,7 +2925,7 @@ void Conductor::SendControlMessage(const std::string& msg) {
             msg.c_str());
     return;
   }
-  webrtc::DataBuffer buffer(webrtc::CopyOnWriteBuffer(
+  webrtc::DataBuffer buffer(rtc::CopyOnWriteBuffer(
       reinterpret_cast<const uint8_t*>(msg.data()), msg.size()), false);
   control_channel_->Send(std::move(buffer));
   fprintf(stderr, "[CTRL] Sent: %s\n", msg.c_str());
@@ -2972,7 +2998,7 @@ void Conductor::FlowObserver::OnStateChange() {
 void Conductor::FlowObserver::OnMessage(const webrtc::DataBuffer& buffer) {
   for (auto& flow : conductor_->sctp_flows_) {
     if (flow->flow_id == flow_id_) {
-      int64_t now_ms = webrtc::TimeMillis();
+      int64_t now_ms = rtc::TimeMillis();
       if (flow->first_recv_ms == 0) flow->first_recv_ms = now_ms;
       flow->last_recv_ms = now_ms;
       flow->bytes_sent += buffer.data.size();  // Re-use bytes_sent as bytes_received on receiver
@@ -3235,7 +3261,7 @@ void Conductor::PumpFlowData(int flow_id) {
     }
 
     webrtc::DataBuffer buffer(
-        webrtc::CopyOnWriteBuffer(data_ptr, send_size), true);
+        rtc::CopyOnWriteBuffer(data_ptr, send_size), true);
     flow->channel->SendAsync(std::move(buffer), nullptr);
     flow->bytes_sent += send_size;
 

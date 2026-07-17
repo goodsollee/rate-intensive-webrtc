@@ -28,14 +28,14 @@
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
 
-class CustomSocketServer : public webrtc::PhysicalSocketServer {
+class CustomSocketServer : public rtc::PhysicalSocketServer {
  public:
   explicit CustomSocketServer(GtkMainWnd* wnd, bool headless, bool demo_mode)
       : wnd_(wnd), conductor_(nullptr), client_(nullptr),
         headless_(headless), demo_mode_(demo_mode) {}
   ~CustomSocketServer() override {}
 
-  void SetMessageQueue(webrtc::Thread* queue) override {
+  void SetMessageQueue(rtc::Thread* queue) override {
     message_queue_ = queue;
   }
 
@@ -82,11 +82,11 @@ class CustomSocketServer : public webrtc::PhysicalSocketServer {
 
     webrtc::TimeDelta wait_time = headless_ ? webrtc::TimeDelta::Millis(10)
                                             : webrtc::TimeDelta::Zero();
-    return webrtc::PhysicalSocketServer::Wait(wait_time, process_io);
+    return rtc::PhysicalSocketServer::Wait(wait_time, process_io);
   }
 
  protected:
-  webrtc::Thread* message_queue_;
+  rtc::Thread* message_queue_;
   GtkMainWnd* wnd_;
   Conductor* conductor_;
   PeerConnectionClient* client_;
@@ -140,9 +140,9 @@ int main(int argc, char* argv[]) {
                  headless, demo_mode);
 
   CustomSocketServer socket_server(&wnd, headless, demo_mode);
-  webrtc::AutoSocketServerThread thread(&socket_server);
+  rtc::AutoSocketServerThread thread(&socket_server);
 
-  webrtc::InitializeSSL();
+  rtc::InitializeSSL();
   
   PeerConnectionClient client;
   auto conductor = webrtc::make_ref_counted<Conductor>(env, &client, &wnd);
@@ -224,6 +224,6 @@ int main(int argc, char* argv[]) {
   thread.Run();
 
   wnd.Destroy();
-  webrtc::CleanupSSL();
+  rtc::CleanupSSL();
   return 0;
 }

@@ -11,32 +11,29 @@
 #ifndef MODULES_RTP_RTCP_SOURCE_RTP_SENDER_VIDEO_H_
 #define MODULES_RTP_RTCP_SOURCE_RTP_SENDER_VIDEO_H_
 
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
 #include <map>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
 
+#include "absl/strings/string_view.h"
 #include "api/array_view.h"
-#include "api/field_trials_view.h"
 #include "api/frame_transformer_interface.h"
 #include "api/scoped_refptr.h"
+#include "api/sequence_checker.h"
+#include "api/task_queue/task_queue_base.h"
 #include "api/task_queue/task_queue_factory.h"
 #include "api/transport/rtp/dependency_descriptor.h"
-#include "api/units/data_rate.h"
 #include "api/units/time_delta.h"
 #include "api/units/timestamp.h"
-#include "api/video/color_space.h"
-#include "api/video/encoded_image.h"
 #include "api/video/video_codec_type.h"
+#include "api/video/video_frame_type.h"
 #include "api/video/video_layers_allocation.h"
-#include "api/video/video_rotation.h"
-#include "api/video/video_timing.h"
 #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"
 #include "modules/rtp_rtcp/source/absolute_capture_time_sender.h"
 #include "modules/rtp_rtcp/source/active_decode_targets_helper.h"
+#include "modules/rtp_rtcp/source/rtp_rtcp_config.h"
 #include "modules/rtp_rtcp/source/rtp_sender.h"
 #include "modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h"
 #include "modules/rtp_rtcp/source/rtp_video_header.h"
@@ -47,7 +44,6 @@
 #include "rtc_base/race_checker.h"
 #include "rtc_base/synchronization/mutex.h"
 #include "rtc_base/thread_annotations.h"
-#include "system_wrappers/include/clock.h"
 
 namespace webrtc {
 
@@ -89,14 +85,13 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
     bool enable_retransmit_all_layers = false;
     std::optional<int> red_payload_type;
     const FieldTrialsView* field_trials = nullptr;
-    scoped_refptr<FrameTransformerInterface> frame_transformer;
+    rtc::scoped_refptr<FrameTransformerInterface> frame_transformer;
     TaskQueueFactory* task_queue_factory = nullptr;
-    bool raw_packetization = false;
   };
 
   explicit RTPSenderVideo(const Config& config);
 
-  ~RTPSenderVideo() override;
+  virtual ~RTPSenderVideo();
 
   // `capture_time` and `clock::CurrentTime` should be using the same epoch.
   // `expected_retransmission_time.IsFinite()` -> retransmission allowed.
@@ -104,22 +99,21 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
   // video encoder, excluding any additional overhead.
   // Calls to this method are assumed to be externally serialized.
   bool SendVideo(int payload_type,
-                 VideoCodecType codec_type,
+                 std::optional<VideoCodecType> codec_type,
                  uint32_t rtp_timestamp,
                  Timestamp capture_time,
-                 ArrayView<const uint8_t> payload,
+                 rtc::ArrayView<const uint8_t> payload,
                  size_t encoder_output_size,
                  RTPVideoHeader video_header,
                  TimeDelta expected_retransmission_time,
                  std::vector<uint32_t> csrcs) override;
 
   bool SendEncodedImage(int payload_type,
-                        VideoCodecType codec_type,
+                        std::optional<VideoCodecType> codec_type,
                         uint32_t rtp_timestamp,
                         const EncodedImage& encoded_image,
                         RTPVideoHeader video_header,
-                        TimeDelta expected_retransmission_time,
-                        const std::vector<uint32_t>& csrcs = {});
+                        TimeDelta expected_retransmission_time);
 
   // Configures video structures produced by encoder to send using the
   // dependency descriptor rtp header extension. Next call to SendVideo should
@@ -127,6 +121,13 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
   // All calls to SendVideo after this call must use video_header compatible
   // with the video_structure.
   void SetVideoStructure(const FrameDependencyStructure* video_structure);
+
+  // Notifies this sender that an RTCP keyframe request (PLI or FIR) arrived
+  // for its SSRC. The next key frame passed to SendVideo() is then labeled as
+  // RTCP-requested in the PDU-Set-Info header extension (keyframe-reason
+  // bits). Thread-safe: called from the thread processing incoming RTCP,
+  // while SendVideo() runs on the send path.
+  void OnRtcpKeyFrameRequest();
   // Should only be used by a RTPSenderVideoFrameTransformerDelegate and exists
   // to ensure correct syncronization.
   void SetVideoStructureAfterTransformation(
@@ -154,13 +155,6 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
   // 'retransmission_mode' is either a value of enum RetransmissionMode, or
   // computed with bitwise operators on values of enum RetransmissionMode.
   void SetRetransmissionSetting(int32_t retransmission_settings);
-
-  // Notifies this sender that an RTCP keyframe request (PLI or FIR) arrived
-  // for its SSRC. The next key frame passed to SendVideo() is then labeled as
-  // RTCP-requested in the PDU-Set-Info header extension (keyframe-reason
-  // bits). Thread-safe: called from the thread processing incoming RTCP,
-  // while SendVideo() runs on the send path.
-  void OnRtcpKeyFrameRequest();
 
  protected:
   static uint8_t GetTemporalId(const RTPVideoHeader& header);
@@ -210,7 +204,16 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
 
   // These members should only be accessed from within SendVideo() to avoid
   // potential race conditions.
-  RaceChecker send_checker_;
+  rtc::RaceChecker send_checker_;
+  // PDU-Set sequence number (PSSN) for the PDU-Set-Info header extension.
+  // Incremented once per sent frame, wraps at 10 bits.
+  uint16_t pdu_set_sequence_number_ RTC_GUARDED_BY(send_checker_) = 0;
+  // Time (Clock::TimeInMilliseconds) of the last RTCP keyframe request
+  // (PLI/FIR) observed for this stream, or -1 if none is pending. Written by
+  // OnRtcpKeyFrameRequest() on the RTCP receive thread, consumed (exchanged
+  // back to -1) by SendVideo() when stamping the keyframe-reason bits of the
+  // PDU-Set-Info extension.
+  std::atomic<int64_t> pending_rtcp_keyframe_request_ms_{-1};
   int32_t retransmission_settings_ RTC_GUARDED_BY(send_checker_);
   VideoRotation last_rotation_ RTC_GUARDED_BY(send_checker_);
   std::optional<ColorSpace> last_color_space_ RTC_GUARDED_BY(send_checker_);
@@ -223,17 +226,6 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
   SendVideoLayersAllocation send_allocation_ RTC_GUARDED_BY(send_checker_);
   std::optional<VideoLayersAllocation> last_full_sent_allocation_
       RTC_GUARDED_BY(send_checker_);
-
-  // PDU-Set sequence number (PSSN) for the PDU-Set-Info header extension.
-  // Incremented once per sent frame, wraps at 10 bits.
-  uint16_t pdu_set_sequence_number_ RTC_GUARDED_BY(send_checker_) = 0;
-
-  // Time (Clock::TimeInMilliseconds) of the last RTCP keyframe request
-  // (PLI/FIR) observed for this stream, or -1 if none is pending. Written by
-  // OnRtcpKeyFrameRequest() on the RTCP receive thread, consumed (exchanged
-  // back to -1) by SendVideo() when stamping the keyframe-reason bits of the
-  // PDU-Set-Info extension.
-  std::atomic<int64_t> pending_rtcp_keyframe_request_ms_{-1};
 
   // Current target playout delay.
   std::optional<VideoPlayoutDelay> current_playout_delay_
@@ -269,16 +261,18 @@ class RTPSenderVideo : public RTPVideoFrameSenderInterface {
   // Set to true if the generic descriptor should be authenticated.
   const bool generic_descriptor_auth_experiment_;
 
-  const bool raw_packetization_;
-
   AbsoluteCaptureTimeSender absolute_capture_time_sender_
       RTC_GUARDED_BY(send_checker_);
   // Tracks updates to the active decode targets and decides when active decode
   // targets bitmask should be attached to the dependency descriptor.
   ActiveDecodeTargetsHelper active_decode_targets_tracker_;
 
-  const scoped_refptr<RTPSenderVideoFrameTransformerDelegate>
+  const rtc::scoped_refptr<RTPSenderVideoFrameTransformerDelegate>
       frame_transformer_delegate_;
+
+  // Whether to do two-pass packetization for AV1 which leads to a set of
+  // packets with more even size distribution.
+  const bool enable_av1_even_split_;
 };
 
 }  // namespace webrtc

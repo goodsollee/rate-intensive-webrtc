@@ -19,6 +19,11 @@
 
 namespace dcsctp {
 struct DcSctpOptions {
+  // Research hook: fixed congestion-window override in bytes (0 = disabled).
+  // Honored by the dcsctp implementation port (not yet landed — see the STUB
+  // NOTE in dcsctp_socket.h); parsing/env plumbing works regardless.
+  size_t cwnd_override_bytes = 0;
+
   // The largest safe SCTP packet. Starting from the minimum guaranteed MTU
   // value of 1280 for IPv6 (which may not support fragmentation), take off 85
   // bytes for DTLS/TURN/TCP/IP and ciphertext overhead.

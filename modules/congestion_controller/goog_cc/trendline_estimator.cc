@@ -10,13 +10,16 @@
 
 #include "modules/congestion_controller/goog_cc/trendline_estimator.h"
 
+#include <math.h>
+
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -24,6 +27,7 @@
 
 #include "pc/rtp_sctp_coordinator.h"
 
+#include "absl/strings/match.h"
 #include "api/field_trials_view.h"
 #include "api/network_state_predictor.h"
 #include "api/transport/bandwidth_usage.h"
@@ -42,9 +46,9 @@ constexpr double kDefaultTrendlineThresholdGain = 4.0;
 const char kBweWindowSizeInPacketsExperiment[] =
     "WebRTC-BweWindowSizeInPackets";
 
-size_t ReadTrendlineFilterWindowSize(const FieldTrialsView& key_value_config) {
+size_t ReadTrendlineFilterWindowSize(const FieldTrialsView* key_value_config) {
   std::string experiment_string =
-      key_value_config.Lookup(kBweWindowSizeInPacketsExperiment);
+      key_value_config->Lookup(kBweWindowSizeInPacketsExperiment);
   size_t window_size;
   int parsed_values =
       sscanf(experiment_string.c_str(), "Enabled-%zu", &window_size);
@@ -117,14 +121,45 @@ constexpr double kOverUsingTimeThreshold = 10;
 constexpr int kMinNumDeltas = 60;
 constexpr int kDeltaCounterMax = 1000;
 
+// GCC trendline CSV logging (research instrumentation).
+// The transplanted source kept this state as TrendlineEstimator members
+// (gcc_csv_file_/gcc_csv_initialized_/gcc_csv_start_ms_ + InitGccCsvLogging),
+// but all instances wrote to the same $UNIFIED_CSV_DIR/gcc_trendline.csv path,
+// so file-scope state is functionally equivalent and avoids touching the
+// baseline header.
+// Intentionally leaked to avoid an exit-time destructor.
+std::ofstream& GccCsvFile() {
+  static std::ofstream* const file = new std::ofstream();
+  return *file;
+}
+bool gcc_csv_initialized = false;
+int64_t gcc_csv_start_ms = 0;
+
+void InitGccCsvLogging() {
+  const char* result_dir = std::getenv("UNIFIED_CSV_DIR");
+  if (result_dir && std::strlen(result_dir) > 0) {
+    std::string csv_path = std::string(result_dir) + "/gcc_trendline.csv";
+    GccCsvFile().open(csv_path, std::ios::out | std::ios::trunc);
+    if (GccCsvFile().is_open()) {
+      GccCsvFile() << "time_ms,delta_ms,accumulated_delay,smoothed_delay,"
+                      "trend,modified_trend,threshold,hypothesis\n";
+    }
+  }
+  gcc_csv_initialized = true;
+}
+
 }  // namespace
 
+constexpr char TrendlineEstimatorSettings::kKey[];
+
 TrendlineEstimatorSettings::TrendlineEstimatorSettings(
-    const FieldTrialsView& key_value_config) {
-  if (key_value_config.IsEnabled(kBweWindowSizeInPacketsExperiment)) {
+    const FieldTrialsView* key_value_config) {
+  if (absl::StartsWith(
+          key_value_config->Lookup(kBweWindowSizeInPacketsExperiment),
+          "Enabled")) {
     window_size = ReadTrendlineFilterWindowSize(key_value_config);
   }
-  Parser()->Parse(key_value_config.Lookup(TrendlineEstimatorSettings::kKey));
+  Parser()->Parse(key_value_config->Lookup(TrendlineEstimatorSettings::kKey));
   if (window_size < 10 || 200 < window_size) {
     RTC_LOG(LS_WARNING) << "Window size must be between 10 and 200 packets";
     window_size = kDefaultTrendlineWindowSize;
@@ -163,7 +198,7 @@ std::unique_ptr<StructParametersParser> TrendlineEstimatorSettings::Parser() {
 }
 
 TrendlineEstimator::TrendlineEstimator(
-    const FieldTrialsView& key_value_config,
+    const FieldTrialsView* key_value_config,
     NetworkStatePredictor* network_state_predictor)
     : settings_(key_value_config),
       smoothing_coef_(kDefaultTrendlineSmoothingCoeff),
@@ -192,23 +227,7 @@ TrendlineEstimator::TrendlineEstimator(
       << " network state predictor";
 }
 
-TrendlineEstimator::~TrendlineEstimator() {
-  if (gcc_csv_file_.is_open())
-    gcc_csv_file_.close();
-}
-
-void TrendlineEstimator::InitGccCsvLogging() {
-  const char* result_dir = std::getenv("UNIFIED_CSV_DIR");
-  if (result_dir && std::strlen(result_dir) > 0) {
-    std::string csv_path = std::string(result_dir) + "/gcc_trendline.csv";
-    gcc_csv_file_.open(csv_path, std::ios::out | std::ios::trunc);
-    if (gcc_csv_file_.is_open()) {
-      gcc_csv_file_ << "time_ms,delta_ms,accumulated_delay,smoothed_delay,"
-                        "trend,modified_trend,threshold,hypothesis\n";
-      gcc_csv_initialized_ = true;
-    }
-  }
-}
+TrendlineEstimator::~TrendlineEstimator() {}
 
 void TrendlineEstimator::UpdateTrendline(double recv_delta_ms,
                                          double send_delta_ms,
@@ -266,23 +285,23 @@ void TrendlineEstimator::UpdateTrendline(double recv_delta_ms,
   RtpSctpCoordinator::OnTwccUpdate(accumulated_delay_, arrival_time_ms);
 
   // GCC trendline CSV logging
-  if (!gcc_csv_initialized_) {
+  if (!gcc_csv_initialized) {
     InitGccCsvLogging();
-    gcc_csv_start_ms_ = arrival_time_ms;
+    gcc_csv_start_ms = arrival_time_ms;
   }
-  if (gcc_csv_file_.is_open()) {
-    int64_t rel_ms = arrival_time_ms - gcc_csv_start_ms_;
+  if (GccCsvFile().is_open()) {
+    int64_t rel_ms = arrival_time_ms - gcc_csv_start_ms;
     int hyp = (hypothesis_ == BandwidthUsage::kBwNormal) ? 0 :
               (hypothesis_ == BandwidthUsage::kBwUnderusing) ? 1 : 2;
-    gcc_csv_file_ << rel_ms << ","
-                  << (recv_delta_ms - send_delta_ms) << ","
-                  << accumulated_delay_ << ","
-                  << smoothed_delay_ << ","
-                  << prev_trend_ << ","
-                  << prev_modified_trend_ << ","
-                  << threshold_ << ","
-                  << hyp << "\n";
-    gcc_csv_file_.flush();
+    GccCsvFile() << rel_ms << ","
+                 << (recv_delta_ms - send_delta_ms) << ","
+                 << accumulated_delay_ << ","
+                 << smoothed_delay_ << ","
+                 << prev_trend_ << ","
+                 << prev_modified_trend_ << ","
+                 << threshold_ << ","
+                 << hyp << "\n";
+    GccCsvFile().flush();
   }
 }
 
@@ -361,7 +380,7 @@ void TrendlineEstimator::UpdateThreshold(double modified_trend,
   const int64_t kMaxTimeDeltaMs = 100;
   int64_t time_delta_ms = std::min(now_ms - last_update_ms_, kMaxTimeDeltaMs);
   threshold_ += k * (fabs(modified_trend) - threshold_) * time_delta_ms;
-  threshold_ = SafeClamp(threshold_, 6.f, 600.f);
+  threshold_ = rtc::SafeClamp(threshold_, 6.f, 600.f);
   last_update_ms_ = now_ms;
 }
 

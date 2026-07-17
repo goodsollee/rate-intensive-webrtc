@@ -59,9 +59,11 @@ class Conductor : public webrtc::PeerConnectionObserver,
     SWITCH_TO_STREAMING_UI,
   };
 
+  // Ported to older baseline: `absl_nonnull` qualifier not available in this
+  // tree's abseil revision, dropped.
   Conductor(const webrtc::Environment& env,
-            PeerConnectionClient* absl_nonnull client,
-            MainWindow* absl_nonnull main_wnd);
+            PeerConnectionClient* client,
+            MainWindow* main_wnd);
 
   bool connection_active() const;
 
@@ -120,9 +122,11 @@ class Conductor : public webrtc::PeerConnectionObserver,
       webrtc::PeerConnectionInterface::IceConnectionState new_state) override;
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState new_state) override {}
-  void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
+  // Ported to older baseline: IceCandidate -> IceCandidateInterface, and
+  // OnIceCandidateRemoved(single candidate) does not exist on this
+  // PeerConnectionObserver (only OnIceCandidatesRemoved), so it was dropped.
+  void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override;
   void OnIceConnectionReceivingChange(bool receiving) override {}
-  void OnIceCandidateRemoved(const webrtc::IceCandidate* candidate) override {}
 
   //
   // PeerConnectionClientObserver implementation.
@@ -174,7 +178,7 @@ class Conductor : public webrtc::PeerConnectionObserver,
   int peer_id_;
   bool loopback_;
   const webrtc::Environment env_;
-  std::unique_ptr<webrtc::Thread> signaling_thread_;
+  std::unique_ptr<rtc::Thread> signaling_thread_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
       peer_connection_factory_;

@@ -270,7 +270,7 @@ void VanillaRTCStatsCallback::ProcessInboundRTPStats(const webrtc::RTCStats& sta
             // Log the frame timings to the file
             {
                 if (per_frame_stats_file_.is_open()) {
-                    per_frame_stats_file_ << webrtc::TimeMillis() << "," << timing_info.rtp_timestamp << ","
+                    per_frame_stats_file_ << rtc::TimeMillis() << "," << timing_info.rtp_timestamp << ","
                                         << encoding_ms << ","
                                         << network_ms << ","
                                         << decoding_ms << ","
@@ -324,7 +324,7 @@ per_frame_stats_file_.flush();
     int64_t key_frames_decoded =
         static_cast<int64_t>(get_numeric("keyFramesDecoded"));
 
-    int64_t current_time_ms = webrtc::TimeMillis();
+    int64_t current_time_ms = rtc::TimeMillis();
 
     // Initialize first stats time if not set
     if (persistent_stats_.first_stats_time_ms_ == -1) {
@@ -666,7 +666,7 @@ void VanillaRTCStatsCallback::ProcessRemoteOutboundRTPStats(
   std::lock_guard<std::mutex> lock(stats_mutex_);
 
   int64_t bytes_sent = static_cast<int64_t>(get_numeric("bytesSent"));
-  int64_t now_ms     = webrtc::TimeMillis();
+  int64_t now_ms     = rtc::TimeMillis();
 
   if (persistent_stats_.first_remote_stats_time_ms_ == -1) {
       persistent_stats_.first_remote_stats_time_ms_ = now_ms;
@@ -714,7 +714,7 @@ void VanillaRTCStatsCallback::ProcessOutboundRTPStats(
   int64_t bytes_sent = static_cast<int64_t>(get_numeric("bytesSent"));
   int64_t packets_sent = static_cast<int64_t>(get_numeric("packetsSent"));
   int64_t frames_encoded = static_cast<int64_t>(get_numeric("framesEncoded"));
-  int64_t now_ms = webrtc::TimeMillis();
+  int64_t now_ms = rtc::TimeMillis();
 
   // RTCP feedback received by this sender + keyframe/retransmission ground
   // truth (cumulative). Reference labels for the RIC observability classifier.
@@ -907,10 +907,10 @@ channel_state.csv_file.flush();
     }
 
     // Accumulate for aggregated SCTP throughput in average_stats.csv
-    // Use webrtc::TimeMillis() for consistent time base with ProcessInboundRTPStats
+    // Use rtc::TimeMillis() for consistent time base with ProcessInboundRTPStats
     persistent_stats_.total_sctp_bytes_received_ += delta_bytes_received;
     if (persistent_stats_.first_sctp_stats_time_ms_ == -1) {
-        persistent_stats_.first_sctp_stats_time_ms_ = webrtc::TimeMillis();
+        persistent_stats_.first_sctp_stats_time_ms_ = rtc::TimeMillis();
         persistent_stats_.period_start_sctp_bytes_received_ = 0;
     }
 

@@ -16,6 +16,9 @@
 #include <string>
 
 #include "absl/flags/parse.h"
+#include "api/environment/environment.h"
+#include "api/environment/environment_factory.h"
+#include "api/make_ref_counted.h"
 #include "api/scoped_refptr.h"
 #include "examples/peerconnection/client/conductor.h"
 #include "examples/peerconnection/client/flag_defs.h"
@@ -95,7 +98,11 @@ int main(int argc, char* argv[]) {
   } else {
     RTC_LOG(LS_INFO) << "Role explicitly set to: " << role;
   }
-  webrtc::RtpSctpCoordinator::SetGlobalRole(role);
+  // Ported to older baseline: RtpSctpCoordinator::SetGlobalRole() does not
+  // exist on this tree's pc/rtp_sctp_coordinator.h (no global role concept),
+  // so the detected role is only logged above. Disabled minimally.
+  // webrtc::RtpSctpCoordinator::SetGlobalRole(role);
+  (void)role;
 
   // Validate port
   if ((absl::GetFlag(FLAGS_port) < 1) || (absl::GetFlag(FLAGS_port) > 65535)) {
@@ -124,9 +131,12 @@ int main(int argc, char* argv[]) {
   rtc::InitializeSSL();
   RTC_LOG(LS_INFO) << "SSL initialized";
 
-  // Create peer connection client and conductor
+  // Create peer connection client and conductor.
+  // Ported: the transplanted Conductor takes (env, client, wnd) instead of
+  // the old (client, wnd, headless) signature.
+  webrtc::Environment env = webrtc::CreateEnvironment();
   PeerConnectionClient client;
-  auto conductor = rtc::make_ref_counted<Conductor>(&client, &wnd, true);  // true = headless
+  auto conductor = rtc::make_ref_counted<Conductor>(env, &client, &wnd);
   socket_server.set_client(&client);
   socket_server.set_conductor(conductor.get());
 

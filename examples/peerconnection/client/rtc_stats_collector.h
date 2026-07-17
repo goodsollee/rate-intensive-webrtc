@@ -1,7 +1,10 @@
 #ifndef RTC_STATS_COLLECTOR_H_
 #define RTC_STATS_COLLECTOR_H_
 
+#include <atomic>
+#include <cstdint>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -102,16 +105,43 @@ struct PersistentStats {
 
     // Flow name for SCTP transport logging
     std::string sctp_flow_name_;
+
+    // --- Research additions (transplanted rtc_stats_collector.cc) ---
+
+    // Latest throughput values exposed to the UI performance graph.
+    std::atomic<float> latest_video_mbps_{0.0f};
+    std::atomic<float> latest_sctp_mbps_{0.0f};
+
+    // Optional direct receiver byte counter (e.g. from the window's
+    // OnSctpDataReceived counter); preferred over RTCDataChannelStats for
+    // aggregated SCTP throughput.
+    std::function<uint64_t()> external_sctp_bytes_getter_;
+
+    // Aggregated SCTP receiver throughput accounting.
+    uint64_t total_sctp_bytes_received_ = 0;
+    int64_t first_sctp_stats_time_ms_ = -1;
+    uint64_t period_start_sctp_bytes_received_ = 0;
+
+    // Sender-side outbound-rtp accounting (sender_stats.csv).
+    int64_t first_outbound_stats_time_ms_ = -1;
+    int64_t period_start_outbound_bytes_ = 0;
+    int64_t period_start_outbound_time_ms_ = 0;
+    int64_t outbound_bytes_sent_ = 0;
+    int64_t outbound_packets_sent_ = 0;
+    int64_t outbound_frames_encoded_ = 0;
+    std::ofstream sender_stats_file_;
 };
 
-class RTCStatsCollectorCallback : public webrtc::RTCStatsCollectorCallback {
+// Renamed from RTCStatsCollectorCallback to match the transplanted research
+// rtc_stats_collector.cc (avoids confusion with webrtc's own class).
+class VanillaRTCStatsCallback : public webrtc::RTCStatsCollectorCallback {
 public:
-    RTCStatsCollectorCallback(
+    VanillaRTCStatsCallback(
         std::ofstream& per_frame_stats_file,
         std::ofstream& average_stats_file,
         std::mutex& stats_mutex,
         PersistentStats& persistent_stats);  // Add persistent stats
-    ~RTCStatsCollectorCallback();
+    ~VanillaRTCStatsCallback();
 
 
 protected:
@@ -120,12 +150,12 @@ protected:
 
 private:
     void ProcessRemoteOutboundRTPStats(const webrtc::RTCStats& stats);
+    void ProcessOutboundRTPStats(const webrtc::RTCStats& stats);
     void ProcessDataChannelStats(const webrtc::RTCStats& stats);
-    void ProcessTransportStats(const webrtc::RTCStats& stats);
-    
+
     void OnStatsDeliveredOnSignalingThread(
         rtc::scoped_refptr<const webrtc::RTCStatsReport> report);
-    
+
     void ProcessInboundRTPStats(const webrtc::RTCStats& stats);
 
     std::ofstream& per_frame_stats_file_;
@@ -150,6 +180,22 @@ public:
     void SetSctpFlowName(const std::string& flow_name) {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         persistent_stats_.sctp_flow_name_ = flow_name;
+    }
+
+    // Direct receiver byte counter for aggregated SCTP throughput (research).
+    void SetExternalSctpBytesGetter(std::function<uint64_t()> getter) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        persistent_stats_.external_sctp_bytes_getter_ = std::move(getter);
+    }
+
+    // Latest throughput values for the UI performance graph (research).
+    float GetLatestVideoMbps() const {
+        return persistent_stats_.latest_video_mbps_.load(
+            std::memory_order_relaxed);
+    }
+    float GetLatestSctpMbps() const {
+        return persistent_stats_.latest_sctp_mbps_.load(
+            std::memory_order_relaxed);
     }
 
 private:

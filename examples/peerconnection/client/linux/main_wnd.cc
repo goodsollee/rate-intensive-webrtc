@@ -1130,7 +1130,7 @@ GtkMainWnd::VideoRenderer::VideoRenderer(
       height_(0),
       main_wnd_(main_wnd),
       rendered_track_(track_to_render) {
-  rendered_track_->AddOrUpdateSink(this, webrtc::VideoSinkWants());
+  rendered_track_->AddOrUpdateSink(this, rtc::VideoSinkWants());
 }
 
 GtkMainWnd::VideoRenderer::~VideoRenderer() {
@@ -1185,7 +1185,7 @@ void GtkMainWnd::VideoRenderer::OnFrame(const webrtc::VideoFrame& video_frame) {
 GtkMainWnd::FrameDelaySink::FrameDelaySink(
     webrtc::VideoTrackInterface* track)
     : track_(track) {
-  track_->AddOrUpdateSink(this, webrtc::VideoSinkWants());
+  track_->AddOrUpdateSink(this, rtc::VideoSinkWants());
   fprintf(stderr, "[FrameDelaySink] Registered as remote video sink\n");
 }
 
@@ -1204,16 +1204,32 @@ void GtkMainWnd::FrameDelaySink::OnFrame(
 
   const auto& ft = frame.frame_timing();
 
+  // Ported to older baseline: this tree's VideoFrame::FrameTiming does not
+  // carry receive_start/receive_finish/decode_start/decode_finish/
+  // jitter_buffer_ms/timing_valid. Map to the closest available fields:
+  //   receive_start  -> first_packet_arrival_timestamp
+  //   receive_finish -> last_packet_arrival_timestamp
+  //   decode_start   -> last packet arrival (approximation)
+  //   decode_finish  -> last packet arrival + decode_ms (approximation)
+  //   jitter_buffer  -> -1 (not tracked on this baseline)
+  const int64_t receive_start_ms = ft.first_packet_arrival_timestamp;
+  const int64_t receive_finish_ms = ft.last_packet_arrival_timestamp;
+  const int64_t decode_start_ms = receive_finish_ms;
+  const int64_t decode_finish_ms =
+      receive_finish_ms > 0 ? receive_finish_ms + ft.decode_ms : 0;
+  const int64_t jitter_buffer_ms = -1;
+  const bool timing_valid = receive_start_ms > 0 && receive_finish_ms > 0;
+
   // rtp_ms: sender capture time in ms (RTP clock = 90kHz)
   int64_t rtp_ms = static_cast<int64_t>(frame.rtp_timestamp()) / 90;
 
   // Compute inter-frame delay from consecutive receive_finish timestamps
   int64_t inter_frame_delay_ms = 0;
-  if (last_receive_finish_ms_ > 0 && ft.receive_finish_ms > 0) {
-    inter_frame_delay_ms = ft.receive_finish_ms - last_receive_finish_ms_;
+  if (last_receive_finish_ms_ > 0 && receive_finish_ms > 0) {
+    inter_frame_delay_ms = receive_finish_ms - last_receive_finish_ms_;
   }
-  if (ft.receive_finish_ms > 0) {
-    last_receive_finish_ms_ = ft.receive_finish_ms;
+  if (receive_finish_ms > 0) {
+    last_receive_finish_ms_ = receive_finish_ms;
   }
 
   // RTT-based offset calibration (from original WebRTC headless_wnd.cc)
@@ -1222,7 +1238,7 @@ void GtkMainWnd::FrameDelaySink::OnFrame(
   // Sources of RTT (in priority order):
   //   1. network_delay_ms from RTCP (bidirectional video)
   //   2. NETWORK_LATENCY_MS env var (experiment config, one-way latency)
-  if (!offset_initialized_ && ft.receive_start_ms > 0) {
+  if (!offset_initialized_ && receive_start_ms > 0) {
     int64_t rtt_ms = ft.network_delay_ms;  // From RTCP (RTT)
     if (rtt_ms <= 0) {
       // Fallback: use env var NETWORK_LATENCY_MS (one-way latency → RTT = 2x)
@@ -1235,7 +1251,7 @@ void GtkMainWnd::FrameDelaySink::OnFrame(
       // rtp_time_offset_ maps rtp_ms to receiver clock:
       //   estimated_departure = rtp_ms + rtp_time_offset_ + encode_ms
       //   estimated_network_ms = last_packet_arrival - estimated_departure
-      rtp_time_offset_ = ft.receive_start_ms -
+      rtp_time_offset_ = receive_start_ms -
                          (rtt_ms / 2 - 5) -
                          (rtp_ms + ft.encode_ms);
       offset_initialized_ = true;
@@ -1252,9 +1268,9 @@ void GtkMainWnd::FrameDelaySink::OnFrame(
   int64_t e2e_delay_ms = -1;
   if (offset_initialized_) {
     int64_t estimated_departure = rtp_ms + rtp_time_offset_ + ft.encode_ms;
-    estimated_network_ms = ft.receive_finish_ms - estimated_departure;
+    estimated_network_ms = receive_finish_ms - estimated_departure;
     // E2E = encode + pacing + network + jitter_buffer + decode
-    e2e_delay_ms = ft.decode_finish_ms - (rtp_ms + rtp_time_offset_);
+    e2e_delay_ms = decode_finish_ms - (rtp_ms + rtp_time_offset_);
   }
 
   // Lazy-open CSV file
@@ -1283,16 +1299,16 @@ void GtkMainWnd::FrameDelaySink::OnFrame(
     csv_ << now_ms << ","
          << frame.rtp_timestamp() << ","
          << frame.width() << "," << frame.height() << ","
-         << ft.receive_start_ms << "," << ft.receive_finish_ms << ","
-         << ft.decode_start_ms << "," << ft.decode_finish_ms << ","
+         << receive_start_ms << "," << receive_finish_ms << ","
+         << decode_start_ms << "," << decode_finish_ms << ","
          << ft.frame_construction_delay_ms << ","
-         << ft.jitter_buffer_ms << "," << ft.decode_ms << ","
+         << jitter_buffer_ms << "," << ft.decode_ms << ","
          << inter_frame_delay_ms << ","
          << ft.encode_ms << "," << ft.pacing_ms << ","
          << ft.network_delay_ms << "," << estimated_network_ms << ","
          << e2e_delay_ms << ","
          << (ft.is_keyframe ? 1 : 0) << ","
-         << (ft.timing_valid ? 1 : 0) << "\n";
+         << (timing_valid ? 1 : 0) << "\n";
     if (++flush_counter_ >= 30) {
       csv_.flush();
       flush_counter_ = 0;
