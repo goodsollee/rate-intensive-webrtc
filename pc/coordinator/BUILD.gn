@@ -1,0 +1,15 @@
+# Copyright 2026 The WebRTC project authors. All Rights Reserved.
+#
+# Use of this source code is governed by a BSD-style license
+# that can be found in the LICENSE file in the root of the source
+# tree.
+
+import("../../webrtc.gni")
+
+rtc_library("bur_estimator") {
+  sources = [
+    "bur_estimator.cc",
+    "bur_estimator.h",
+  ]
+  deps = []
+}

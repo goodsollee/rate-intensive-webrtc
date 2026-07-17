@@ -7,6 +7,7 @@
 # be found in the AUTHORS file in the root of the source tree.
 
 import("../webrtc.gni")
+import("//third_party/llamacpp-kvcache/llamacpp.gni")
 
 if (is_android) {
   import("//build/config/android/config.gni")
@@ -42,10 +43,6 @@ group("examples") {
     }
   }
 
-  if (!build_with_chromium) {
-    deps += [ ":stun_prober" ]
-  }
-
   if (is_ios || (is_mac && target_cpu != "x86")) {
     deps += [ ":AppRTCMobile" ]
   }
@@ -59,6 +56,8 @@ group("examples") {
     if (current_os != "winuwp") {
       deps += [ ":peerconnection_client" ]
     }
+    deps += [ "peerconnection/sctp_throughput_test" ]
+    #deps += [ "peerconnection/datachannel_benchmark" ]  # Disabled: main.cc missing
   }
 }
 
@@ -81,7 +80,6 @@ if (rtc_include_tests) {
     sources = [ "turnserver/read_auth_file_unittest.cc" ]
     deps = [
       ":read_auth_file",
-      "../test:test_main",
       "//test:test_support",
       "//testing/gtest",
     ]
@@ -93,7 +91,7 @@ if (is_android) {
     testonly = true
     apk_name = "AppRTCMobile"
     android_manifest = "androidapp/AndroidManifest.xml"
-    min_sdk_version = 21
+    min_sdk_version = 23
     target_sdk_version = 31
 
     deps = [
@@ -155,6 +153,7 @@ if (is_android) {
       "../sdk/android:video_api_java",
       "../sdk/android:video_java",
       "androidapp/third_party/autobanh:autobanh_java",
+      "//build/android:build_java",
       "//third_party/androidx:androidx_annotation_annotation_java",
     ]
   }
@@ -203,7 +202,7 @@ if (is_android) {
   rtc_instrumentation_test_apk("AppRTCMobile_test_apk") {
     apk_name = "AppRTCMobileTest"
     android_manifest = "androidtests/AndroidManifest.xml"
-    min_sdk_version = 21
+    min_sdk_version = 23
     target_sdk_version = 31
 
     sources = [
@@ -345,7 +344,6 @@ if (is_ios || (is_mac && target_cpu != "x86")) {
         "../sdk:mediaconstraints_objc",
         "../sdk:metal_objc",
         "../sdk:peerconnectionfactory_base_objc",
-        "../sdk:peerconnectionfactory_base_objc",
         "../sdk:videocapture_objc",
         "../sdk:videocodec_objc",
       ]
@@ -485,18 +483,18 @@ if (is_ios || (is_mac && target_cpu != "x86")) {
       ]
 
       deps = [
+        "../api:create_modular_peer_connection_factory",
         "../api:enable_media",
-        "../api:libjingle_peerconnection_api",
+        "../api:peer_connection_interface",
         "../api:scoped_refptr",
         "../api:sequence_checker",
         "../api/audio:audio_processing",
         "../api/audio:builtin_audio_processing_builder",
         "../api/audio_codecs:builtin_audio_decoder_factory",
         "../api/audio_codecs:builtin_audio_encoder_factory",
+        "../api/environment",
+        "../api/environment:environment_factory",
         "../api/rtc_event_log:rtc_event_log_factory",
-        "../api/task_queue:default_task_queue_factory",
-        "../modules/audio_processing",
-        "../pc:libjingle_peerconnection",
         "../rtc_base/synchronization:mutex",
         "../sdk:base_objc",
         "../sdk:default_codec_factory_objc",
@@ -546,7 +544,6 @@ if (is_ios || (is_mac && target_cpu != "x86")) {
         "../sdk:helpers_objc",
         "../sdk:mediaconstraints_objc",
         "../sdk:metal_objc",
-        "../sdk:peerconnectionfactory_base_objc",
         "../sdk:peerconnectionfactory_base_objc",
         "../sdk:videocapture_objc",
         "../sdk:videocodec_objc",
@@ -650,7 +647,7 @@ if (is_ios || (is_mac && target_cpu != "x86")) {
           ":AppRTCMobile_lib",
           ":apprtcmobile_test_sources",
           "../sdk:framework_objc",
-          "//test:test_support",
+          "//test:test_support_objc",
         ]
         ldflags = [ "-all_load" ]
       }
@@ -669,59 +666,19 @@ if (is_linux || is_chromeos || is_win) {
         "gtk+-3.0",
       ]
     }
-    config("websocket_config") {
-      include_dirs = [ 
-        "//third_party/libwebsockets/include", 
-        "//third_party/libwebsockets/build/include" 
-      ]
-      lib_dirs = [ "//third_party/libwebsockets/build/lib" ]
-      libs = [ "websockets", "curl" ]
-      
-      ldflags = [
-        "-Wl,-rpath,\$ORIGIN/../../third_party/libwebsockets/build/lib"
-      ]
-    }
   }
-
-config("sctp_traffic_includes") {
-  include_dirs = [ "peerconnection/client" ]
-}
-
-rtc_library("sctp_traffic") {
-  testonly = true
-
-  sources = [
-    "peerconnection/client/sctp_traffic/traffic.h",
-
-    # BULK
-    "peerconnection/client/sctp_traffic/bulk/bulk_sender.h",
-    "peerconnection/client/sctp_traffic/bulk/bulk_sender.cc",
-    "peerconnection/client/sctp_traffic/bulk/bulk_receiver.h",
-    "peerconnection/client/sctp_traffic/bulk/bulk_receiver.cc",
-
-    # FILE
-    "peerconnection/client/sctp_traffic/file/file_receiver.cc",
-    "peerconnection/client/sctp_traffic/file/file_receiver.h",
-    "peerconnection/client/sctp_traffic/file/file_sender.cc",
-    "peerconnection/client/sctp_traffic/file/file_sender.h",
-  ]
-
-  public_configs = [ ":sctp_traffic_includes" ]
-
-  deps = [
-    "../api/task_queue:task_queue",
-    "../api/task_queue:default_task_queue_factory",
-    "../api/task_queue:pending_task_safety_flag",
-    "../api/units:time_delta",
-    "../rtc_base:logging",
-    "../rtc_base:threading",                   
-    "//third_party/abseil-cpp/absl/types:span",  
-    "//third_party/jsoncpp",
-  ]
-  if (is_linux || is_chromeos) {
-    configs += [ ":websocket_config" ]  
+  config("websocket_config") {
+    include_dirs = [ 
+      "//third_party/libwebsockets/include", 
+      "//third_party/libwebsockets/build/include" 
+    ]
+    lib_dirs = [ "//third_party/libwebsockets/build/lib" ]
+    libs = [ "websockets", "curl" ]
+    
+    ldflags = [
+      "-Wl,-rpath,\$ORIGIN/../../third_party/libwebsockets/build/lib"
+    ]
   }
-}
 
   rtc_executable("peerconnection_client") {
     testonly = true
@@ -732,12 +689,10 @@ rtc_library("sctp_traffic") {
       "peerconnection/client/defaults.h",
       "peerconnection/client/peer_connection_client.cc",
       "peerconnection/client/peer_connection_client.h",
-      "peerconnection/client/remote_media_recorder.cc",
-      "peerconnection/client/remote_media_recorder.h",
-      "peerconnection/client/traffic_profile.cc",
-      "peerconnection/client/traffic_profile.h",
       "peerconnection/client/rtc_stats_collector.cc",
       "peerconnection/client/rtc_stats_collector.h",
+      "peerconnection/client/llm_receiver_adapter.cc",
+      "peerconnection/client/llm_receiver_adapter.h",
     ]
 
     deps = [
@@ -745,20 +700,25 @@ rtc_library("sctp_traffic") {
       "../api:async_dns_resolver",
       "../api:audio_options_api",
       "../api:create_frame_generator",
-      "../api:create_peerconnection_factory",
+      "../api:create_modular_peer_connection_factory",
+      "../api:data_channel_interface",
       "../api:enable_media",
-      "../api:libjingle_peerconnection_api",
+      "../api:field_trials",
+      "../api:jsep",
       "../api:make_ref_counted",
       "../api:media_stream_interface",
+      "../api:peer_connection_interface",
       "../api:rtc_error",
+      "../api:rtp_receiver_interface",
       "../api:rtp_sender_interface",
       "../api:scoped_refptr",
       "../api/audio:audio_device",
       "../api/audio:audio_mixer_api",
       "../api/audio:audio_processing",
       "../api/audio_codecs:audio_codecs_api",
+      "../api/environment",
+      "../api/environment:environment_factory",
       "../api/task_queue",
-      "../api/task_queue:default_task_queue_factory",
       "../api/task_queue:pending_task_safety_flag",
       "../api/units:time_delta",
       "../api/video:video_frame",
@@ -768,32 +728,28 @@ rtc_library("sctp_traffic") {
       "../media:video_common",
       "../p2p:connection",
       "../p2p:port_allocator",
-      "../p2p:rtc_p2p",
       "../pc:video_track_source",
       "../rtc_base:async_dns_resolver",
       "../rtc_base:buffer",
       "../rtc_base:checks",
       "../rtc_base:logging",
-      "../rtc_base:macromagic",
       "../rtc_base:net_helpers",
       "../rtc_base:refcount",
       "../rtc_base:rtc_certificate_generator",
+      "../rtc_base:socket",
+      "../rtc_base:socket_address",
       "../rtc_base:ssl_adapter",
       "../rtc_base:stringutils",
       "../rtc_base:threading",
-      "../rtc_base/third_party/sigslot",
       "../system_wrappers",
-      "../system_wrappers:field_trial",
-      "../test:field_trial",
       "../test:frame_generator_capturer",
+      "../test:y4m_frame_generator",
       "../test:platform_video_capturer",
-      "../test:test_support",   
-      "../test:y4m_frame_generator",         
       "../test:rtp_test_utils",
       "../test:test_video_capturer",
+      "//third_party/abseil-cpp/absl/base:nullability",
       "//third_party/abseil-cpp/absl/memory",
       "//third_party/jsoncpp",
-      ":sctp_traffic",
     ]
     if (is_win) {
       sources += [
@@ -824,144 +780,10 @@ rtc_library("sctp_traffic") {
         "Xrender",
       ]
       configs += [ ":gtk_config" ]
-      configs += [ ":websocket_config"]
-    }
-
-    deps += [
-      "../api:libjingle_peerconnection_api",
-      "../api/audio_codecs:builtin_audio_decoder_factory",
-      "../api/audio_codecs:builtin_audio_encoder_factory",
-      "../api/video_codecs:builtin_video_decoder_factory",
-      "../api/video_codecs:builtin_video_encoder_factory",
-      "../api/video:video_frame",
-      "../api/video:video_rtp_headers",
-      "../api/video_codecs:video_decoder_factory_template",
-      "../api/video_codecs:video_decoder_factory_template_dav1d_adapter",
-      "../api/video_codecs:video_decoder_factory_template_libvpx_vp8_adapter",
-      "../api/video_codecs:video_decoder_factory_template_libvpx_vp9_adapter",
-      "../api/video_codecs:video_decoder_factory_template_open_h264_adapter",
-      "../api/video_codecs:video_encoder_factory_template",
-      "../api/video_codecs:video_encoder_factory_template_libaom_av1_adapter",
-      "../api/video_codecs:video_encoder_factory_template_libvpx_vp8_adapter",
-      "../api/video_codecs:video_encoder_factory_template_libvpx_vp9_adapter",
-      "../api/video_codecs:video_encoder_factory_template_open_h264_adapter",
-      "../media:rtc_audio_video",
-      "../modules/audio_device",
-      "../modules/audio_processing",
-      "../modules/video_capture:video_capture_module",
-      "../pc:libjingle_peerconnection",
-      "../rtc_base:rtc_json",
-      "../test:video_test_common",
-      "//third_party/abseil-cpp/absl/flags:flag",
-      "//third_party/abseil-cpp/absl/flags:parse",
-      "//third_party/libyuv",
-    ]
-  }
-
-  rtc_executable("peerconnection_headless_client") {
-    testonly = true
-    sources = [
-      "peerconnection/client/conductor.cc",
-      "peerconnection/client/conductor.h",
-      "peerconnection/client/defaults.cc",
-      "peerconnection/client/defaults.h",
-      "peerconnection/client/peer_connection_client.cc",
-      "peerconnection/client/peer_connection_client.h",
-      "peerconnection/client/remote_media_recorder.cc",
-      "peerconnection/client/remote_media_recorder.h",
-      "peerconnection/client/traffic_profile.cc",
-      "peerconnection/client/traffic_profile.h",
-      "peerconnection/client/rtc_stats_collector.cc",
-      "peerconnection/client/rtc_stats_collector.h",
-    ]
-
-    deps = [
-      "../api:array_view",
-      "../api:async_dns_resolver",
-      "../api:audio_options_api",
-      "../api:create_frame_generator",
-      "../api:create_peerconnection_factory",
-      "../api:enable_media",
-      "../api:libjingle_peerconnection_api",
-      "../api:make_ref_counted",
-      "../api:media_stream_interface",
-      "../api:rtc_error",
-      "../api:rtp_sender_interface",
-      "../api:scoped_refptr",
-      "../api/audio:audio_device",
-      "../api/audio:audio_mixer_api",
-      "../api/audio:audio_processing",
-      "../api/audio_codecs:audio_codecs_api",
-      "../api/task_queue",
-      "../api/task_queue:default_task_queue_factory",
-      "../api/task_queue:pending_task_safety_flag",
-      "../api/units:time_delta",
-      "../api/video:video_frame",
-      "../api/video:video_rtp_headers",
-      "../api/video_codecs:video_codecs_api",
-      "../media:media_channel",
-      "../media:video_common",
-      "../p2p:connection",
-      "../p2p:port_allocator",
-      "../p2p:rtc_p2p",
-      "../pc:video_track_source",
-      "../rtc_base:async_dns_resolver",
-      "../rtc_base:buffer",
-      "../rtc_base:checks",
-      "../rtc_base:logging",
-      "../rtc_base:macromagic",
-      "../rtc_base:net_helpers",
-      "../rtc_base:refcount",
-      "../rtc_base:rtc_certificate_generator",
-      "../rtc_base:ssl_adapter",
-      "../rtc_base:stringutils",
-      "../rtc_base:threading",
-      "../rtc_base/third_party/sigslot",
-      "../system_wrappers",
-      "../system_wrappers:field_trial",
-      "../test:field_trial",
-      "../test:frame_generator_capturer",
-      "../test:platform_video_capturer",
-      "../test:rtp_test_utils",
-      "../test:test_video_capturer",
-      "//third_party/abseil-cpp/absl/memory",
-      "//third_party/jsoncpp",
-      ":sctp_traffic",
-    ]
-    if (is_win) {
-      sources += [
-        "peerconnection/client/flag_defs.h",
-        "peerconnection/client/main.cc",
-        "peerconnection/client/main_wnd.cc",
-        "peerconnection/client/main_wnd.h",
-      ]
-      configs += [ "//build/config/win:windowed" ]
-      deps += [
-        "../rtc_base:win32",
-        "../rtc_base:win32_socket_init",
-      ]
-    }
-    if (is_linux || is_chromeos) {
-      sources += [
-        "peerconnection/client/linux/main_headless.cc",
-        "peerconnection/client/linux/headless_wnd.cc",
-        "peerconnection/client/linux/headless_wnd.h",
-        "peerconnection/client/websocket_client.cc",
-        "peerconnection/client/websocket_client.h",
-      ]
-      cflags = [ "-Wno-deprecated-declarations" ]
-      libs = [
-        "X11",
-        "Xcomposite",
-        "Xext",
-        "Xrender",
-      ]
-      configs += [ ":gtk_config" ]
       configs += [ ":websocket_config" ]
     }
 
     deps += [
-      "../api:libjingle_peerconnection_api",
       "../api/audio_codecs:builtin_audio_decoder_factory",
       "../api/audio_codecs:builtin_audio_encoder_factory",
       "../api/video:video_frame",
@@ -980,13 +802,42 @@ rtc_library("sctp_traffic") {
       "../modules/audio_device",
       "../modules/audio_processing",
       "../modules/video_capture:video_capture_module",
+      "../pc:compute_emulation",
       "../pc:libjingle_peerconnection",
       "../rtc_base:rtc_json",
       "../test:video_test_common",
       "//third_party/abseil-cpp/absl/flags:flag",
       "//third_party/abseil-cpp/absl/flags:parse",
       "//third_party/libyuv",
+      "//third_party/zstd:compress",
+      "//third_party/zstd:decompress",
     ]
+  }
+
+  if (enable_llama_inference) {
+    executable("standalone_inference_test") {
+      testonly = true
+      sources = [ "peerconnection/standalone_inference_test.cc" ]
+      deps = [ "//third_party/llamacpp-kvcache:llamacpp_integration" ]
+      configs -= [ "//build/config/clang:find_bad_constructs" ]
+      cflags_cc = [
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-Wno-shadow",
+      ]
+    }
+
+    executable("generate_kvcache") {
+      testonly = true
+      sources = [ "peerconnection/generate_kvcache.cc" ]
+      deps = [ "//third_party/llamacpp-kvcache:llamacpp_integration" ]
+      configs -= [ "//build/config/clang:find_bad_constructs" ]
+      cflags_cc = [
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-Wno-shadow",
+      ]
+    }
   }
 
   rtc_executable("peerconnection_server") {
@@ -997,19 +848,17 @@ rtc_library("sctp_traffic") {
       "peerconnection/server/main.cc",
       "peerconnection/server/peer_channel.cc",
       "peerconnection/server/peer_channel.h",
-      "peerconnection/server/utils.cc",
-      "peerconnection/server/utils.h",
     ]
     deps = [
       "../rtc_base:checks",
       "../rtc_base:ip_address",
       "../rtc_base:net_helpers",
       "../rtc_base:stringutils",
-      "../system_wrappers:field_trial",
-      "../test:field_trial",
       "//third_party/abseil-cpp/absl/flags:flag",
       "//third_party/abseil-cpp/absl/flags:parse",
       "//third_party/abseil-cpp/absl/flags:usage",
+      "//third_party/abseil-cpp/absl/strings",
+      "//third_party/abseil-cpp/absl/strings:string_view",
     ]
   }
   rtc_executable("turnserver") {
@@ -1017,27 +866,30 @@ rtc_library("sctp_traffic") {
     sources = [ "turnserver/turnserver_main.cc" ]
     deps = [
       ":read_auth_file",
+      "../api/environment",
+      "../api/environment:environment_factory",
       "../p2p:basic_packet_socket_factory",
       "../p2p:p2p_server_utils",
       "../p2p:port_interface",
-      "../p2p:rtc_p2p",
       "../pc:rtc_pc",
       "../rtc_base:async_udp_socket",
       "../rtc_base:ip_address",
       "../rtc_base:socket_address",
       "../rtc_base:socket_server",
       "../rtc_base:threading",
-      "//third_party/abseil-cpp/absl/strings:strings",
+      "//third_party/abseil-cpp/absl/memory",
+      "//third_party/abseil-cpp/absl/strings",
     ]
   }
   rtc_executable("stunserver") {
     testonly = true
     sources = [ "stunserver/stunserver_main.cc" ]
     deps = [
+      "../api/environment:environment_factory",
       "../p2p:p2p_server_utils",
-      "../p2p:rtc_p2p",
       "../pc:rtc_pc",
       "../rtc_base:async_udp_socket",
+      "../rtc_base:checks",
       "../rtc_base:socket_address",
       "../rtc_base:socket_server",
       "../rtc_base:threading",
@@ -1059,39 +911,5 @@ if (is_android) {
       "//third_party/androidx:androidx_test_core_java",
       "//third_party/google-truth:google_truth_java",
     ]
-
-    additional_jar_files = [ [
-          "../sdk/android/tests/resources/robolectric.properties",
-          "robolectric.properties",
-        ] ]
-  }
-}
-
-if (!build_with_chromium) {
-  # Doesn't build within Chrome on Win.
-  rtc_executable("stun_prober") {
-    testonly = true
-    sources = [ "stunprober/main.cc" ]
-    deps = [
-      "../p2p:basic_packet_socket_factory",
-      "../p2p:libstunprober",
-      "../p2p:rtc_p2p",
-      "../rtc_base:checks",
-      "../rtc_base:crypto_random",
-      "../rtc_base:logging",
-      "../rtc_base:network",
-      "../rtc_base:socket_address",
-      "../rtc_base:ssl_adapter",
-      "../rtc_base:threading",
-      "../rtc_base:timeutils",
-      "../test:scoped_key_value_config",
-      "//third_party/abseil-cpp/absl/flags:flag",
-      "//third_party/abseil-cpp/absl/flags:parse",
-    ]
-    if (is_win) {
-      deps += [
-        "../rtc_base:win32_socket_init",
-      ]
-    }
   }
 }

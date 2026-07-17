@@ -2,17 +2,38 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <iomanip>
 #include <ios>
+#include <iostream>
 #include <locale>
 #include <sstream>
+#include <sys/stat.h>
 
 #include "api/stats/rtcstats_objects.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
 
 namespace {
-constexpr int kAverageStatsIntervalMs = 200;
+constexpr int kAverageStatsIntervalMs = 1000;
+
+// Check if CSV logging is enabled via environment variable
+// Default is true for backward compatibility
+bool IsCSVLoggingEnabled() {
+    static bool checked = false;
+    static bool enabled = true;
+    if (!checked) {
+        const char* env_value = std::getenv("ENABLE_CSV_LOGGING");
+        if (env_value != nullptr) {
+            std::string value(env_value);
+            enabled = (value == "yes" || value == "YES" || value == "1" || value == "true" || value == "TRUE");
+            RTC_LOG(LS_INFO) << "[CSV-LOGGING] CSV logging " << (enabled ? "ENABLED" : "DISABLED")
+                             << " via ENABLE_CSV_LOGGING=" << value;
+        }
+        checked = true;
+    }
+    return enabled;
+}
 
 std::string SanitizeForFilename(const std::string& input) {
     if (input.empty()) {
@@ -47,6 +68,30 @@ std::string JoinPath(const std::string& base, const std::string& leaf) {
     return path;
 }
 
+// Ensure directory exists, creating it if necessary
+bool EnsureDirectoryExists(const std::string& path) {
+    if (path.empty()) {
+        return true;
+    }
+    // Use mkdir -p equivalent logic
+    std::string dir = path;
+    // Remove trailing slash if present
+    while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\')) {
+        dir.pop_back();
+    }
+    if (dir.empty()) {
+        return true;
+    }
+    // Try to create directory (and parents)
+    std::string cmd = "mkdir -p \"" + dir + "\" 2>/dev/null";
+    if (system(cmd.c_str()) != 0) {
+        return false;
+    }
+    // Make world-writable so both sender (root) and receiver (user) can create files
+    chmod(dir.c_str(), 0777);
+    return true;
+}
+
 std::string MakeDataChannelKey(
     const webrtc::RTCDataChannelStats& data_stats) {
     std::string label = data_stats.label.has_value() ? *data_stats.label : "";
@@ -71,7 +116,7 @@ std::string MakeDataChannelKey(
 
 }  // namespace
 
-RTCStatsCollectorCallback::RTCStatsCollectorCallback(
+VanillaRTCStatsCallback::VanillaRTCStatsCallback(
     std::ofstream& per_frame_stats_file,
     std::ofstream& average_stats_file,
     std::mutex& stats_mutex,
@@ -83,12 +128,12 @@ RTCStatsCollectorCallback::RTCStatsCollectorCallback(
     RTC_LOG(LS_INFO) << "RTCStatsCollectorCallback created.";
 }
 
-RTCStatsCollectorCallback::~RTCStatsCollectorCallback() {
+VanillaRTCStatsCallback::~VanillaRTCStatsCallback() {
     RTC_LOG(LS_INFO) << "RTCStatsCollectorCallback destroyed.";
 }
 
-void RTCStatsCollectorCallback::OnStatsDelivered(
-    const rtc::scoped_refptr<const webrtc::RTCStatsReport>& report) {
+void VanillaRTCStatsCallback::OnStatsDelivered(
+    const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) {
     RTC_LOG(LS_INFO) << "OnStatsDelivered called. Posting task to signaling thread.";
     OnStatsDeliveredOnSignalingThread(report);
 }
@@ -149,7 +194,7 @@ bool ParseTimingFrameInfo(const std::string& timing_info_str, webrtc::TimingFram
     return true;
 }
 
-void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& stats) {
+void VanillaRTCStatsCallback::ProcessInboundRTPStats(const webrtc::RTCStats& stats) {
     std::vector<webrtc::Attribute> attributes = stats.Attributes();
     auto find_attribute = [&attributes](const std::string& name) -> const webrtc::Attribute* {
         for (const auto& attribute : attributes) {
@@ -225,7 +270,7 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
             // Log the frame timings to the file
             {
                 if (per_frame_stats_file_.is_open()) {
-                    per_frame_stats_file_ << rtc::TimeMillis() << "," << timing_info.rtp_timestamp << ","
+                    per_frame_stats_file_ << webrtc::TimeMillis() << "," << timing_info.rtp_timestamp << ","
                                         << encoding_ms << ","
                                         << network_ms << ","
                                         << decoding_ms << ","
@@ -233,7 +278,7 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
                                         << e2e_ms << ","
                                         << inter_frame_ms << ","
                                         << intra_construction_ms << "\n";
-                    per_frame_stats_file_.flush();
+per_frame_stats_file_.flush();
                 }
             }
             // Update the last processed timestamp
@@ -269,7 +314,17 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
     int64_t freeze_count = static_cast<int64_t>(get_numeric("freezeCount"));
     double total_freezes_duration_ms = get_numeric("totalFreezesDuration") * 1000.0;
 
-    int64_t current_time_ms = rtc::TimeMillis();
+    // RTCP feedback / keyframe ground-truth counters (cumulative, as reported
+    // by GetStats). These are the reference labels for the RIC observability
+    // classifier (PLI/FIR/NACK counts sent by this receiver, keyframes
+    // decoded, retransmissions received).
+    int64_t pli_count = static_cast<int64_t>(get_numeric("pliCount"));
+    int64_t fir_count = static_cast<int64_t>(get_numeric("firCount"));
+    int64_t nack_count = static_cast<int64_t>(get_numeric("nackCount"));
+    int64_t key_frames_decoded =
+        static_cast<int64_t>(get_numeric("keyFramesDecoded"));
+
+    int64_t current_time_ms = webrtc::TimeMillis();
 
     // Initialize first stats time if not set
     if (persistent_stats_.first_stats_time_ms_ == -1) {
@@ -334,6 +389,18 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
         if (period_time_sec > 0) {
             period_average_bitrate = (period_bytes_delta * 8.0) / period_time_sec;  // bits per second
         }
+
+        // Store latest video throughput for UI graph
+        persistent_stats_.latest_video_mbps_.store(
+            static_cast<float>(period_average_bitrate / 1000000.0),
+            std::memory_order_relaxed);
+
+        // Real-time console output for debugging
+        std::cout << "[RX] Bitrate: " << (period_average_bitrate / 1000000.0) << " Mbps | "
+                  << "FPS: " << framerate << " | "
+                  << "Resolution: " << width << "x" << height << " | "
+                  << "Decoded: " << frames_decoded << " frames"
+                  << std::endl;
 
         // Calculate averages
         double avg_frames_decoded = static_cast<double>(persistent_stats_.acc_frames_decoded_) / persistent_stats_.acc_count_;
@@ -455,8 +522,56 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
             decoder_implementation = "unknown";
         }
 
+        // Calculate aggregated SCTP receiver throughput.
+        // Prefer the direct receiver byte counter when available, because
+        // RTCDataChannelStats can temporarily disappear for negotiated
+        // multi-flow channels and produce false zero-throughput rows.
+        if (persistent_stats_.external_sctp_bytes_getter_) {
+            uint64_t external_total =
+                persistent_stats_.external_sctp_bytes_getter_();
+            if (external_total >= persistent_stats_.total_sctp_bytes_received_) {
+                persistent_stats_.total_sctp_bytes_received_ = external_total;
+                if (persistent_stats_.first_sctp_stats_time_ms_ == -1 &&
+                    external_total > 0) {
+                    persistent_stats_.first_sctp_stats_time_ms_ = current_time_ms;
+                    persistent_stats_.period_start_sctp_bytes_received_ = 0;
+                }
+            }
+        }
+
+        // Calculate aggregated SCTP receiver throughput
+        double sctp_period_throughput_mbps = 0.0;
+        double sctp_overall_throughput_mbps = 0.0;
+        if (persistent_stats_.first_sctp_stats_time_ms_ != -1) {
+            // Period throughput
+            uint64_t sctp_period_bytes_delta =
+                persistent_stats_.total_sctp_bytes_received_ -
+                persistent_stats_.period_start_sctp_bytes_received_;
+            if (period_time_sec > 0) {
+                sctp_period_throughput_mbps =
+                    (sctp_period_bytes_delta * 8.0) / period_time_sec / 1000000.0;
+            }
+
+            // Overall throughput
+            double sctp_overall_time_sec =
+                (current_time_ms - persistent_stats_.first_sctp_stats_time_ms_) / 1000.0;
+            if (sctp_overall_time_sec > 0) {
+                sctp_overall_throughput_mbps =
+                    (persistent_stats_.total_sctp_bytes_received_ * 8.0) /
+                    sctp_overall_time_sec / 1000000.0;
+            }
+
+            // Store latest SCTP throughput for UI graph
+            persistent_stats_.latest_sctp_mbps_.store(
+                static_cast<float>(sctp_period_throughput_mbps),
+                std::memory_order_relaxed);
+        }
+
         // Write stats to file with mutex protection
-        if (average_stats_file_.is_open() && avg_frames_decoded > 0) {
+        // Also write for SCTP-only scenarios (no video frames but has SCTP data)
+        bool has_video_stats = avg_frames_decoded > 0;
+        bool has_sctp_stats = persistent_stats_.total_sctp_bytes_received_ > 0;
+        if (average_stats_file_.is_open() && (has_video_stats || has_sctp_stats)) {
             average_stats_file_ << current_time_ms << ","
                 << avg_frames_decoded << ","
                 << avg_frames_dropped << ","
@@ -490,8 +605,15 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
                 << retransmission_ratio << ","
                 << period_freeze_count << ","
                 << period_freeze_duration_ms << ","
-                << freeze_time_ratio << "\n";
-                average_stats_file_.flush();
+                << freeze_time_ratio << ","
+                << sctp_period_throughput_mbps << ","
+                << sctp_overall_throughput_mbps << ","
+                << pli_count << ","
+                << fir_count << ","
+                << nack_count << ","
+                << key_frames_decoded << ","
+                << retx_pkts_recv << "\n";
+average_stats_file_.flush();
         }
 
         // Reset accumulators
@@ -518,10 +640,12 @@ void RTCStatsCollectorCallback::ProcessInboundRTPStats(const webrtc::RTCStats& s
         persistent_stats_.period_remote_start_retx_pkts_sent_  = persistent_stats_.last_remote_retx_pkts_sent_;
         persistent_stats_.period_remote_start_retx_bytes_sent_ = persistent_stats_.last_remote_retx_bytes_sent_;
 
+        // Reset SCTP period accumulator
+        persistent_stats_.period_start_sctp_bytes_received_ = persistent_stats_.total_sctp_bytes_received_;
     }
 }
 
-void RTCStatsCollectorCallback::ProcessRemoteOutboundRTPStats(
+void VanillaRTCStatsCallback::ProcessRemoteOutboundRTPStats(
     const webrtc::RTCStats& stats) {
 
   std::vector<webrtc::Attribute> attributes = stats.Attributes();
@@ -542,7 +666,7 @@ void RTCStatsCollectorCallback::ProcessRemoteOutboundRTPStats(
   std::lock_guard<std::mutex> lock(stats_mutex_);
 
   int64_t bytes_sent = static_cast<int64_t>(get_numeric("bytesSent"));
-  int64_t now_ms     = rtc::TimeMillis();
+  int64_t now_ms     = webrtc::TimeMillis();
 
   if (persistent_stats_.first_remote_stats_time_ms_ == -1) {
       persistent_stats_.first_remote_stats_time_ms_ = now_ms;
@@ -568,7 +692,119 @@ void RTCStatsCollectorCallback::ProcessRemoteOutboundRTPStats(
     persistent_stats_.last_remote_retx_bytes_sent_ = retx_bytes_sent;
 }
 
-void RTCStatsCollectorCallback::ProcessDataChannelStats(
+void VanillaRTCStatsCallback::ProcessOutboundRTPStats(
+    const webrtc::RTCStats& stats) {
+  std::vector<webrtc::Attribute> attributes = stats.Attributes();
+  auto find_attribute = [&attributes](const std::string& name) -> const webrtc::Attribute* {
+      for (const auto& a : attributes)
+          if (a.name() == name) return &a;
+      return nullptr;
+  };
+  auto get_numeric = [&find_attribute](const std::string& name,
+                                       double def = 0) -> double {
+      const auto* attr = find_attribute(name);
+      if (!attr || attr->ToString() == "null") return def;
+      char* end; const std::string& s = attr->ToString();
+      double v = std::strtod(s.c_str(), &end);
+      return (end == s.c_str()) ? def : v;
+  };
+
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+
+  int64_t bytes_sent = static_cast<int64_t>(get_numeric("bytesSent"));
+  int64_t packets_sent = static_cast<int64_t>(get_numeric("packetsSent"));
+  int64_t frames_encoded = static_cast<int64_t>(get_numeric("framesEncoded"));
+  int64_t now_ms = webrtc::TimeMillis();
+
+  // RTCP feedback received by this sender + keyframe/retransmission ground
+  // truth (cumulative). Reference labels for the RIC observability classifier.
+  int64_t pli_received = static_cast<int64_t>(get_numeric("pliCount"));
+  int64_t fir_received = static_cast<int64_t>(get_numeric("firCount"));
+  int64_t nack_received = static_cast<int64_t>(get_numeric("nackCount"));
+  int64_t key_frames_encoded =
+      static_cast<int64_t>(get_numeric("keyFramesEncoded"));
+  int64_t retx_packets_sent =
+      static_cast<int64_t>(get_numeric("retransmittedPacketsSent"));
+  const auto* quality_limitation_attr =
+      find_attribute("qualityLimitationReason");
+  std::string quality_limitation_reason =
+      quality_limitation_attr ? quality_limitation_attr->ToString() : "null";
+  if (quality_limitation_reason.empty() ||
+      quality_limitation_reason == "null") {
+      quality_limitation_reason = "unknown";
+  }
+  // Keep the CSV well-formed even if the reason string ever contains a comma.
+  std::replace(quality_limitation_reason.begin(),
+               quality_limitation_reason.end(), ',', ';');
+
+  // Initialize on first stats
+  if (persistent_stats_.first_outbound_stats_time_ms_ == -1) {
+      persistent_stats_.first_outbound_stats_time_ms_ = now_ms;
+      persistent_stats_.period_start_outbound_bytes_ = bytes_sent;
+      persistent_stats_.period_start_outbound_time_ms_ = now_ms;
+
+      // Open sender_stats.csv file
+      if (!persistent_stats_.log_directory_.empty() &&
+          !persistent_stats_.sender_stats_file_.is_open()) {
+          std::string filepath = persistent_stats_.log_directory_ + "/sender_stats.csv";
+          persistent_stats_.sender_stats_file_.open(filepath);
+          if (persistent_stats_.sender_stats_file_.is_open()) {
+              chmod(filepath.c_str(), 0666);
+              persistent_stats_.sender_stats_file_
+                  << "timestamp_ms,bytes_sent,packets_sent,frames_encoded,"
+                  << "period_bitrate_mbps,overall_bitrate_mbps,"
+                  << "pli_received,fir_received,nack_received,"
+                  << "key_frames_encoded,retx_packets_sent,"
+                  << "quality_limitation_reason\n";
+              RTC_LOG(LS_INFO) << "[SENDER] Opened sender_stats.csv: " << filepath;
+          }
+      }
+  }
+
+  persistent_stats_.outbound_bytes_sent_ = bytes_sent;
+  persistent_stats_.outbound_packets_sent_ = packets_sent;
+  persistent_stats_.outbound_frames_encoded_ = frames_encoded;
+
+  // Calculate bitrates
+  double overall_time_sec = (now_ms - persistent_stats_.first_outbound_stats_time_ms_) / 1000.0;
+  double period_time_sec = (now_ms - persistent_stats_.period_start_outbound_time_ms_) / 1000.0;
+
+  double overall_bitrate_mbps = 0.0;
+  double period_bitrate_mbps = 0.0;
+
+  if (overall_time_sec > 0) {
+      overall_bitrate_mbps = (bytes_sent * 8.0) / overall_time_sec / 1000000.0;
+  }
+
+  if (period_time_sec > 0) {
+      int64_t period_bytes = bytes_sent - persistent_stats_.period_start_outbound_bytes_;
+      period_bitrate_mbps = (period_bytes * 8.0) / period_time_sec / 1000000.0;
+  }
+
+  // Write to sender_stats.csv every ~200ms
+  if (persistent_stats_.sender_stats_file_.is_open() && period_time_sec >= 0.2) {
+      persistent_stats_.sender_stats_file_
+          << now_ms << ","
+          << bytes_sent << ","
+          << packets_sent << ","
+          << frames_encoded << ","
+          << period_bitrate_mbps << ","
+          << overall_bitrate_mbps << ","
+          << pli_received << ","
+          << fir_received << ","
+          << nack_received << ","
+          << key_frames_encoded << ","
+          << retx_packets_sent << ","
+          << quality_limitation_reason << "\n";
+      persistent_stats_.sender_stats_file_.flush();
+
+      // Reset period
+      persistent_stats_.period_start_outbound_bytes_ = bytes_sent;
+      persistent_stats_.period_start_outbound_time_ms_ = now_ms;
+  }
+}
+
+void VanillaRTCStatsCallback::ProcessDataChannelStats(
     const webrtc::RTCStats& stats) {
     const auto& data_stats = stats.cast_to<webrtc::RTCDataChannelStats>();
 
@@ -612,19 +848,24 @@ void RTCStatsCollectorCallback::ProcessDataChannelStats(
             data_stats.data_channel_identifier.value();
     }
 
-    if (!channel_state.csv_file.is_open()) {
+    if (!channel_state.csv_file.is_open() && IsCSVLoggingEnabled()) {
         // Use only the sanitized label for the filename to avoid duplication
         std::string filename = channel_state.sanitized_label;
         if (channel_state.data_channel_id >= 0) {
             filename += "_dc" + std::to_string(channel_state.data_channel_id);
         }
         filename += "_throughput.csv";
-        std::string path = JoinPath(persistent_stats_.log_directory_, filename);
+        // Store per-channel throughput logs in detailed/per_channel/ subdirectory
+        std::string detailed_dir = JoinPath(persistent_stats_.log_directory_, "detailed/per_channel");
+        EnsureDirectoryExists(detailed_dir);
+        std::string path = JoinPath(detailed_dir, filename);
         channel_state.csv_file.open(path, std::ios::out | std::ios::trunc);
-        if (!channel_state.csv_file.is_open()) {
+        if (channel_state.csv_file.is_open()) {
+            chmod(path.c_str(), 0666);
+        } else {
             RTC_LOG(LS_WARNING)
                 << "Failed to open SCTP throughput log file: " << path;
-            return;
+            // Don't return — still accumulate total_sctp_bytes_received_
         }
         RTC_LOG(LS_INFO) << "Logging SCTP throughput for '" << label
                           << "' (key: '" << channel_state.unique_key
@@ -634,7 +875,7 @@ void RTCStatsCollectorCallback::ProcessDataChannelStats(
                "receive_throughput_bps,receive_throughput_mbps,"
                "bytes_sent,total_bytes_sent,send_throughput_bps,"
                "send_throughput_mbps\n";
-        channel_state.csv_file.flush();
+channel_state.csv_file.flush();
     }
 
     if (channel_state.first_timestamp_ms == -1) {
@@ -665,6 +906,14 @@ void RTCStatsCollectorCallback::ProcessDataChannelStats(
         }
     }
 
+    // Accumulate for aggregated SCTP throughput in average_stats.csv
+    // Use webrtc::TimeMillis() for consistent time base with ProcessInboundRTPStats
+    persistent_stats_.total_sctp_bytes_received_ += delta_bytes_received;
+    if (persistent_stats_.first_sctp_stats_time_ms_ == -1) {
+        persistent_stats_.first_sctp_stats_time_ms_ = webrtc::TimeMillis();
+        persistent_stats_.period_start_sctp_bytes_received_ = 0;
+    }
+
     double recv_throughput_bps = 0.0;
     double send_throughput_bps = 0.0;
     if (interval_ms > 0) {
@@ -689,7 +938,7 @@ void RTCStatsCollectorCallback::ProcessDataChannelStats(
          << std::setprecision(6) << send_throughput_mbps;
 
     channel_state.csv_file << line.str() << "\n";
-    channel_state.csv_file.flush();
+channel_state.csv_file.flush();
 
     channel_state.last_timestamp_ms = timestamp_ms;
     channel_state.last_bytes_received = total_bytes_received;
@@ -697,130 +946,15 @@ void RTCStatsCollectorCallback::ProcessDataChannelStats(
 }
 
 
-void RTCStatsCollectorCallback::ProcessTransportStats(
-    const webrtc::RTCStats& stats) {
-    const auto& transport_stats = stats.cast_to<webrtc::RTCTransportStats>();
-
-    uint64_t total_bytes_received = transport_stats.bytes_received.value_or(0);
-    uint64_t total_bytes_sent = transport_stats.bytes_sent.value_or(0);
-
-    std::lock_guard<std::mutex> lock(stats_mutex_);
-
-    if (persistent_stats_.log_directory_.empty()) {
-        RTC_LOG(LS_WARNING)
-            << "SCTP transport throughput logging skipped: log directory not set.";
-        return;
-    }
-
-    const std::string& transport_id = transport_stats.id();
-
-    // Log all transport stats to capture SCTP throughput at transport level
-    TransportLogState& transport_state =
-        persistent_stats_.transport_logs_[transport_id];
-
-    if (transport_state.transport_id.empty()) {
-        transport_state.transport_id = transport_id;
-    }
-
-    if (transport_state.sanitized_id.empty()) {
-        transport_state.sanitized_id =
-            SanitizeForFilename(transport_state.transport_id);
-        if (transport_state.sanitized_id.empty()) {
-            transport_state.sanitized_id = "sctp_transport";
-        }
-    }
-
-    if (!transport_state.csv_file.is_open()) {
-        std::string filename;
-        if (!persistent_stats_.sctp_flow_name_.empty()) {
-            filename = persistent_stats_.sctp_flow_name_ + "_throughput.csv";
-        } else {
-            filename = transport_state.sanitized_id + "_throughput.csv";
-        }
-        std::string path = JoinPath(persistent_stats_.log_directory_, filename);
-        transport_state.csv_file.open(path, std::ios::out | std::ios::trunc);
-        if (!transport_state.csv_file.is_open()) {
-            RTC_LOG(LS_WARNING)
-                << "Failed to open SCTP transport throughput log file: " << path;
-            persistent_stats_.transport_logs_.erase(transport_id);
-            return;
-        }
-        RTC_LOG(LS_INFO) << "Logging SCTP transport throughput for '"
-                          << transport_state.transport_id << "' to " << path;
-        transport_state.csv_file
-            << "timestamp_ms,interval_ms,bytes_received,total_bytes_received,"
-               "receive_throughput_bps,receive_throughput_mbps,bytes_sent,"
-               "total_bytes_sent,send_throughput_bps,send_throughput_mbps\n";
-        transport_state.csv_file.flush();
-    }
-
-    // Initialize period start if needed
-    int64_t current_time_ms = rtc::TimeMillis();
-    if (transport_state.period_start_time_ms == -1) {
-        transport_state.period_start_time_ms = current_time_ms;
-        transport_state.period_start_bytes_received = total_bytes_received;
-        transport_state.period_start_bytes_sent = total_bytes_sent;
-        transport_state.last_log_time_ms = current_time_ms;
-        return;
-    }
-
-    // Accumulate bytes received/sent in this collection cycle
-    if (total_bytes_received >= transport_state.period_start_bytes_received) {
-        uint64_t delta = total_bytes_received - transport_state.period_start_bytes_received;
-        transport_state.accumulated_bytes_received += delta;
-    }
-    if (total_bytes_sent >= transport_state.period_start_bytes_sent) {
-        uint64_t delta = total_bytes_sent - transport_state.period_start_bytes_sent;
-        transport_state.accumulated_bytes_sent += delta;
-    }
-    transport_state.period_start_bytes_received = total_bytes_received;
-    transport_state.period_start_bytes_sent = total_bytes_sent;
-
-    // Check if we should log (every 200ms)
-    int64_t time_since_last_log = current_time_ms - transport_state.last_log_time_ms;
-    constexpr int kLogIntervalMs = 200;
-
-    if (time_since_last_log >= kLogIntervalMs) {
-        // Calculate throughput over the 200ms interval
-        double interval_sec = static_cast<double>(time_since_last_log) / 1000.0;
-        double recv_throughput_bps = 0.0;
-        double send_throughput_bps = 0.0;
-
-        if (interval_sec > 0) {
-            recv_throughput_bps = (transport_state.accumulated_bytes_received * 8.0) / interval_sec;
-            send_throughput_bps = (transport_state.accumulated_bytes_sent * 8.0) / interval_sec;
-        }
-
-        double recv_throughput_mbps = recv_throughput_bps / 1'000'000.0;
-        double send_throughput_mbps = send_throughput_bps / 1'000'000.0;
-
-        std::ostringstream line;
-        line.imbue(std::locale::classic());
-        line << current_time_ms << ","
-             << time_since_last_log << ","
-             << transport_state.accumulated_bytes_received << ","
-             << total_bytes_received << ","
-             << recv_throughput_bps << ","
-             << std::fixed << std::setprecision(6) << recv_throughput_mbps << ","
-             << std::defaultfloat
-             << transport_state.accumulated_bytes_sent << ","
-             << total_bytes_sent << ","
-             << send_throughput_bps << ","
-             << std::fixed << std::setprecision(6) << send_throughput_mbps;
-
-        transport_state.csv_file << line.str() << "\n";
-        transport_state.csv_file.flush();
-
-        // Reset accumulators for next period
-        transport_state.accumulated_bytes_received = 0;
-        transport_state.accumulated_bytes_sent = 0;
-        transport_state.last_log_time_ms = current_time_ms;
-    }
-}
+// NOTE: ProcessTransportStats() has been removed.
+// Throughput logging is now handled directly in RtpSctpCoordinator,
+// which tracks RTP and SCTP packets at the send path for accurate,
+// configurable-interval throughput measurements.
+// See: pc/rtp_sctp_coordinator.cc - LogThroughput()
 
 
-void RTCStatsCollectorCallback::OnStatsDeliveredOnSignalingThread(
-    rtc::scoped_refptr<const webrtc::RTCStatsReport> report) {
+void VanillaRTCStatsCallback::OnStatsDeliveredOnSignalingThread(
+    webrtc::scoped_refptr<const webrtc::RTCStatsReport> report) {
     RTC_LOG(LS_INFO) << "OnStatsDeliveredOnSignalingThread called.";
 
     if (!report) {
@@ -834,10 +968,11 @@ void RTCStatsCollectorCallback::OnStatsDeliveredOnSignalingThread(
             ProcessDataChannelStats(stats);
             continue;
         }
-        if (stats_type == webrtc::RTCTransportStats::kType) {
-            ProcessTransportStats(stats);
-            continue;
-        }
+        // NOTE: ProcessTransportStats() removed - throughput logging moved to coordinator
+        // if (stats_type == webrtc::RTCTransportStats::kType) {
+        //     ProcessTransportStats(stats);
+        //     continue;
+        // }
 
         std::vector<webrtc::Attribute> attributes = stats.Attributes();
         auto find_attribute = [&attributes](const std::string& name) -> const webrtc::Attribute* {
@@ -868,6 +1003,10 @@ void RTCStatsCollectorCallback::OnStatsDeliveredOnSignalingThread(
             RTC_LOG(LS_INFO) << "Processing remote-outbound-rtp stats: " << stats.id();
             ProcessRemoteOutboundRTPStats(stats);
         }
+        if (std::string(stats.type()) == "outbound-rtp") {
+            RTC_LOG(LS_INFO) << "Processing outbound-rtp stats: " << stats.id();
+            ProcessOutboundRTPStats(stats);
+        }
     }
 }
 
@@ -890,7 +1029,7 @@ RTCStatsCollector::~RTCStatsCollector() {
 
 bool RTCStatsCollector::Start(
     const std::string& foldername,
-    rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection) {
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection) {
 
 
     RTC_LOG(LS_INFO) << "RTCStatsCollector starts.";
@@ -935,13 +1074,26 @@ bool RTCStatsCollector::OpenStatsFile(const std::string& foldername) {
     std::string per_frame_filename = foldername + "/per_frame_stats.csv";
     std::string average_filename = foldername + "/average_stats.csv";
 
+    // Open per-frame stats file
+    if (IsCSVLoggingEnabled()) {
+        per_frame_stats_file_.open(per_frame_filename);
+        if (per_frame_stats_file_.is_open()) {
+            // Make world-writable so both sender (root) and receiver (user) can write
+            chmod(per_frame_filename.c_str(), 0666);
+            per_frame_stats_file_ << "timestamp_ms,rtp_timestamp,encoding_ms,network_ms,decoding_ms,rendering_ms,e2e_ms,inter_frame_ms,intra_construction_ms\n";
+            RTC_LOG(LS_INFO) << "Per-frame stats file opened: " << per_frame_filename;
+        }
+    }
+
     // Open average stats file
-    average_stats_file_.open(average_filename);
+    if (IsCSVLoggingEnabled()) { average_stats_file_.open(average_filename); }
     if (!average_stats_file_.is_open()) {
         RTC_LOG(LS_ERROR) << "Failed to open average stats file: " << average_filename;
         per_frame_stats_file_.close();  // Cleanup already opened file
         return false;
     }
+    // Make world-writable so both sender (root) and receiver (user) can write
+    chmod(average_filename.c_str(), 0666);
     RTC_LOG(LS_INFO) << "Average stats file opened successfully: " << average_filename;
     average_stats_file_ << "timestamp_ms,frames_decoded,frames_dropped,frames_received,"
                        "framerate,jitter_buffer_delay_ms,min_playout_delay_ms,video_width,video_height,"
@@ -956,8 +1108,11 @@ bool RTCStatsCollector::OpenStatsFile(const std::string& foldername) {
                        "period_retx_pkts_sent,period_retx_bytes_sent,"
                        "retransmission_ratio,"
                        "period_freeze_count,period_freeze_duration_ms,"
-                       "freeze_time_ratio\n";
-    average_stats_file_.flush();
+                       "freeze_time_ratio,"
+                       "sctp_period_throughput_mbps,sctp_overall_throughput_mbps,"
+                       "pli_count,fir_count,nack_count,"
+                       "key_frames_decoded,retx_packets_received_total\n";
+average_stats_file_.flush();
 
     // Prepare SCTP throughput logging
     for (auto& entry : persistent_stats_.data_channel_logs_) {
@@ -980,25 +1135,25 @@ bool RTCStatsCollector::OpenStatsFile(const std::string& foldername) {
 void RTCStatsCollector::CloseStatsFile() {
     if (per_frame_stats_file_.is_open()) {
         RTC_LOG(LS_INFO) << "Closing per-frame stats file.";
-        per_frame_stats_file_.flush();
+per_frame_stats_file_.flush();
         per_frame_stats_file_.close();
     }
 
     if (average_stats_file_.is_open()) {
         RTC_LOG(LS_INFO) << "Closing average stats file.";
-        average_stats_file_.flush();
+average_stats_file_.flush();
         average_stats_file_.close();
     }
 
     for (auto& entry : persistent_stats_.data_channel_logs_) {
         if (entry.second.csv_file.is_open()) {
-            entry.second.csv_file.flush();
+entry.second.csv_file.flush();
             entry.second.csv_file.close();
         }
     }
     for (auto& entry : persistent_stats_.transport_logs_) {
         if (entry.second.csv_file.is_open()) {
-            entry.second.csv_file.flush();
+entry.second.csv_file.flush();
             entry.second.csv_file.close();
         }
     }
@@ -1025,7 +1180,7 @@ void RTCStatsCollector::CollectStats() {
         return;
     }
 
-    auto stats_callback = rtc::make_ref_counted<RTCStatsCollectorCallback>(
+    auto stats_callback = webrtc::make_ref_counted<VanillaRTCStatsCallback>(
         per_frame_stats_file_,
         average_stats_file_,
         stats_mutex_,

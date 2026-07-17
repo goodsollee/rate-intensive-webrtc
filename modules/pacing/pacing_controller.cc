@@ -20,7 +20,6 @@
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"
-#include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
 #include "api/array_view.h"
 #include "api/field_trials_view.h"
@@ -43,15 +42,6 @@ constexpr TimeDelta kCongestedPacketInterval = TimeDelta::Millis(500);
 // The maximum debt level, in terms of time, capped when sending packets.
 constexpr TimeDelta kMaxDebtInTime = TimeDelta::Millis(500);
 constexpr TimeDelta kMaxElapsedTime = TimeDelta::Seconds(2);
-
-bool IsDisabled(const FieldTrialsView& field_trials, absl::string_view key) {
-  return absl::StartsWith(field_trials.Lookup(key), "Disabled");
-}
-
-bool IsEnabled(const FieldTrialsView& field_trials, absl::string_view key) {
-  return absl::StartsWith(field_trials.Lookup(key), "Enabled");
-}
-
 }  // namespace
 
 const TimeDelta PacingController::kPausedProcessInterval =
@@ -63,26 +53,42 @@ const TimeDelta PacingController::kMaxPaddingReplayDuration =
 const TimeDelta PacingController::kMaxEarlyProbeProcessing =
     TimeDelta::Millis(1);
 
+// Pudica static members
+bool PacingController::pudica_probing_enabled_ = false;
+int PacingController::pudica_num_probes_ = 4;
+double PacingController::pudica_rho_override_ = 0;
+
+void PacingController::SetPudicaProbing(bool enabled, int num_probes) {
+  pudica_probing_enabled_ = enabled;
+  pudica_num_probes_ = num_probes;
+  if (enabled) {
+    RTC_LOG(LS_INFO) << "[PUDICA] Probe injection enabled: num_probes="
+                     << num_probes;
+  }
+}
+
+void PacingController::SetPudicaRho(double rho) {
+  pudica_rho_override_ = rho;
+}
+
 PacingController::PacingController(Clock* clock,
                                    PacketSender* packet_sender,
                                    const FieldTrialsView& field_trials,
                                    Configuration configuration)
     : clock_(clock),
       packet_sender_(packet_sender),
-      field_trials_(field_trials),
-      drain_large_queues_(
-          configuration.drain_large_queues &&
-          !IsDisabled(field_trials_, "WebRTC-Pacer-DrainQueue")),
+      drain_large_queues_(configuration.drain_large_queues &&
+                          !field_trials.IsDisabled("WebRTC-Pacer-DrainQueue")),
       send_padding_if_silent_(
-          IsEnabled(field_trials_, "WebRTC-Pacer-PadInSilence")),
-      pace_audio_(IsEnabled(field_trials_, "WebRTC-Pacer-BlockAudio")),
+          field_trials.IsEnabled("WebRTC-Pacer-PadInSilence")),
+      pace_audio_(field_trials.IsEnabled("WebRTC-Pacer-BlockAudio")),
       ignore_transport_overhead_(
-          IsEnabled(field_trials_, "WebRTC-Pacer-IgnoreTransportOverhead")),
+          field_trials.IsEnabled("WebRTC-Pacer-IgnoreTransportOverhead")),
       fast_retransmissions_(
-          IsEnabled(field_trials_, "WebRTC-Pacer-FastRetransmissions")),
+          field_trials.IsEnabled("WebRTC-Pacer-FastRetransmissions")),
       keyframe_flushing_(
           configuration.keyframe_flushing ||
-          IsEnabled(field_trials_, "WebRTC-Pacer-KeyframeFlushing")),
+          field_trials.IsEnabled("WebRTC-Pacer-KeyframeFlushing")),
       transport_overhead_per_packet_(DataSize::Zero()),
       send_burst_interval_(configuration.send_burst_interval),
       last_timestamp_(clock_->CurrentTime()),
@@ -92,7 +98,7 @@ PacingController::PacingController(Clock* clock,
       pacing_rate_(DataRate::Zero()),
       adjusted_media_rate_(DataRate::Zero()),
       padding_rate_(DataRate::Zero()),
-      prober_(field_trials_),
+      prober_(field_trials),
       probing_send_failure_(false),
       last_process_time_(clock->CurrentTime()),
       last_send_time_(last_process_time_),
@@ -114,7 +120,7 @@ PacingController::PacingController(Clock* clock,
 PacingController::~PacingController() = default;
 
 void PacingController::CreateProbeClusters(
-    rtc::ArrayView<const ProbeClusterConfig> probe_cluster_configs) {
+    ArrayView<const ProbeClusterConfig> probe_cluster_configs) {
   for (const ProbeClusterConfig probe_cluster_config : probe_cluster_configs) {
     prober_.CreateProbeCluster(probe_cluster_config);
   }
@@ -177,28 +183,28 @@ void PacingController::SetProbingEnabled(bool enabled) {
 
 void PacingController::SetPacingRates(DataRate pacing_rate,
                                       DataRate padding_rate) {
-  RTC_CHECK_GT(pacing_rate, DataRate::Zero());
-  RTC_CHECK_GE(padding_rate, DataRate::Zero());
-  if (padding_rate > pacing_rate) {
-    RTC_LOG(LS_WARNING) << "Padding rate " << padding_rate.kbps()
+  SetPacerConfig(PacerConfig::Create(Timestamp::Zero(), pacing_rate,
+                                     padding_rate, send_burst_interval_));
+}
+
+void PacingController::SetPacerConfig(PacerConfig pacer_config) {
+  RTC_DCHECK(pacer_config.time_window.IsFinite());
+  if (pacer_config.pad_rate() > pacer_config.data_rate()) {
+    RTC_LOG(LS_WARNING) << "Padding rate " << pacer_config.pad_rate().kbps()
                         << "kbps is higher than the pacing rate "
-                        << pacing_rate.kbps() << "kbps, capping.";
-    padding_rate = pacing_rate;
+                        << padding_rate_.kbps() << "kbps, capping.";
+    padding_rate_ = pacer_config.data_rate();
+  } else {
+    padding_rate_ = pacer_config.pad_rate();
   }
 
-  if (pacing_rate > max_rate || padding_rate > max_rate) {
-    RTC_LOG(LS_WARNING) << "Very high pacing rates ( > " << max_rate.kbps()
-                        << " kbps) configured: pacing = " << pacing_rate.kbps()
-                        << " kbps, padding = " << padding_rate.kbps()
-                        << " kbps.";
-    max_rate = std::max(pacing_rate, padding_rate) * 1.1;
-  }
-  pacing_rate_ = pacing_rate;
-  padding_rate_ = padding_rate;
+  pacing_rate_ = pacer_config.data_rate();
+  send_burst_interval_ = pacer_config.time_window;
+
   MaybeUpdateMediaRateDueToLongQueue(CurrentTime());
 
   RTC_LOG(LS_VERBOSE) << "bwe:pacer_updated pacing_kbps=" << pacing_rate_.kbps()
-                      << " padding_budget_kbps=" << padding_rate.kbps();
+                      << " padding_budget_kbps=" << padding_rate_.kbps();
 }
 
 void PacingController::EnqueuePacket(std::unique_ptr<RtpPacketToSend> packet) {
@@ -221,7 +227,7 @@ void PacingController::EnqueuePacket(std::unique_ptr<RtpPacketToSend> packet) {
     }
   }
 
-  prober_.OnIncomingPacket(DataSize::Bytes(packet->payload_size()));
+  prober_.OnIncomingPacket(DataSize::Bytes(packet->size()));
 
   const Timestamp now = CurrentTime();
   if (packet_queue_.Empty()) {
@@ -272,7 +278,7 @@ TimeDelta PacingController::ExpectedQueueTime() const {
 }
 
 size_t PacingController::QueueSizePackets() const {
-  return rtc::checked_cast<size_t>(packet_queue_.SizeInPackets());
+  return checked_cast<size_t>(packet_queue_.SizeInPackets());
 }
 
 const std::array<int, kNumMediaTypes>&
@@ -394,6 +400,16 @@ Timestamp PacingController::NextSendTime() const {
         std::min(next_send_time, last_send_time_ + kPausedProcessInterval);
   }
 
+  // Pudica: wake up for deferred probe sending or gap end
+  if (pudica_probing_enabled_) {
+    if (pudica_probes_remaining_ > 0 && pudica_next_probe_time_.IsFinite()) {
+      next_send_time = std::min(next_send_time, pudica_next_probe_time_);
+    }
+    if (now < pudica_gap_end_time_ && pudica_gap_end_time_.IsFinite()) {
+      next_send_time = std::min(next_send_time, pudica_gap_end_time_);
+    }
+  }
+
   return next_send_time;
 }
 
@@ -415,8 +431,8 @@ void PacingController::ProcessPackets() {
         keepalive_data_sent +=
             DataSize::Bytes(packet->payload_size() + packet->padding_size());
         packet_sender_->SendPacket(std::move(packet), PacedPacketInfo());
-        for (auto& packet : packet_sender_->FetchFec()) {
-          EnqueuePacket(std::move(packet));
+        for (auto& fec_packet : packet_sender_->FetchFec()) {
+          EnqueuePacket(std::move(fec_packet));
         }
       }
     }
@@ -510,12 +526,63 @@ void PacingController::ProcessPackets() {
                        transport_overhead_per_packet_;
       }
 
+      // Pudica: track frame send start (first video pkt after gap)
+      if (pudica_probing_enabled_ &&
+          packet_type == RtpPacketMediaType::kVideo &&
+          pudica_frame_send_start_.IsMinusInfinity()) {
+        pudica_frame_send_start_ = now;
+      }
+
+      // Pudica: detect video frame end (marker bit) before packet is moved
+      bool pudica_frame_ended = false;
+      if (pudica_probing_enabled_ &&
+          packet_type == RtpPacketMediaType::kVideo &&
+          rtp_packet->Marker()) {
+        pudica_frame_ended = true;
+      }
+
       packet_sender_->SendPacket(std::move(rtp_packet), pacing_info);
       for (auto& packet : packet_sender_->FetchFec()) {
         EnqueuePacket(std::move(packet));
       }
       data_sent += packet_size;
       ++packets_sent;
+
+      // Pudica: schedule deferred probe packets after frame ends
+      if (pudica_frame_ended) {
+        static int marker_count = 0;
+        marker_count++;
+        // Compute T_packet = (1-1/ρ) × L / (N+1)
+        double rho = pudica_rho_override_ > 1.0 ? pudica_rho_override_ : 2.0;
+        constexpr double kL_us = 33333.0;  // 30fps frame interval in μs
+        double T_packet_us = (1.0 - 1.0 / rho) * kL_us /
+                             (pudica_num_probes_ + 1);
+        T_packet_us = std::max(T_packet_us, 500.0);  // min 0.5ms
+
+        pudica_probes_remaining_ = pudica_num_probes_;
+        pudica_probe_interval_ = TimeDelta::Micros(
+            static_cast<int64_t>(T_packet_us));
+        pudica_frame_end_time_ = now;
+        pudica_next_probe_time_ = now + pudica_probe_interval_;
+
+        // ρ-based gap: hold video for remaining time in frame interval.
+        // gap = min((1-1/ρ)×L, L - frame_send_time) — never exceeds frame interval.
+        double desired_gap_us = (1.0 - 1.0 / rho) * kL_us;
+        double frame_send_us = pudica_frame_send_start_.IsFinite()
+            ? static_cast<double>((now - pudica_frame_send_start_).us())
+            : 0.0;
+        double remaining_us = std::max(0.0, kL_us - frame_send_us);
+        double gap_us = std::min(desired_gap_us, remaining_us);
+        pudica_gap_end_time_ = now + TimeDelta::Micros(
+            static_cast<int64_t>(gap_us));
+        pudica_frame_send_start_ = Timestamp::MinusInfinity();  // reset for next frame
+
+        if (marker_count % 100 == 0) {
+          fprintf(stderr, "[PUDICA-MARKER] markers=%d T_pkt=%.1fms gap=%.1f/%.1fms rho=%.1f send=%.1fms\n",
+                  marker_count, T_packet_us / 1000.0, gap_us / 1000.0,
+                  desired_gap_us / 1000.0, rho, frame_send_us / 1000.0);
+        }
+      }
 
       // Send done, update send time.
       OnPacketSent(packet_type, packet_size, now);
@@ -540,6 +607,28 @@ void PacingController::ProcessPackets() {
         target_send_time = now;
       }
       UpdateBudgetWithElapsedTime(UpdateTimeAndGetElapsed(target_send_time));
+    }
+  }
+
+  // Pudica: deferred probe sending at T_packet intervals
+  if (pudica_probing_enabled_ && pudica_probes_remaining_ > 0) {
+    while (pudica_probes_remaining_ > 0 && now >= pudica_next_probe_time_) {
+      auto padding = packet_sender_->GeneratePadding(DataSize::Bytes(50));
+      if (padding.empty()) break;
+      for (auto& p : padding) {
+        PacedPacketInfo pudica_info;
+        pudica_info.probe_cluster_id = kPudicaProbeClusterId;
+        packet_sender_->SendPacket(std::move(p), pudica_info);
+      }
+      pudica_probes_remaining_--;
+      pudica_next_probe_time_ += pudica_probe_interval_;
+
+      static int total_probes = 0;
+      total_probes++;
+      if (total_probes % 400 == 0) {
+        fprintf(stderr, "[PUDICA-PROBE] total=%d interval_us=%lld\n",
+                total_probes, (long long)pudica_probe_interval_.us());
+      }
     }
   }
 
@@ -632,6 +721,15 @@ std::unique_ptr<RtpPacketToSend> PacingController::GetPendingPacket(
 
   if (packet_queue_.Empty()) {
     return nullptr;
+  }
+
+  // Pudica gap enforcement: hold video/FEC packets during agnostic period.
+  // Audio (prio 0) and retransmissions (prio 1-2) pass through.
+  if (pudica_probing_enabled_ && now < pudica_gap_end_time_) {
+    int prio = packet_queue_.TopActivePriorityLevel();
+    if (prio == 3) {  // video/FEC — hold during agnostic period
+      return nullptr;
+    }
   }
 
   // First, check if there is any reason _not_ to send the next queued packet.

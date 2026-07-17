@@ -17,6 +17,9 @@
 #include <utility>
 #include <vector>
 
+#include "pc/rtp_sctp_coordinator.h"
+#include "modules/pacing/pacing_controller.h"
+
 #include "api/field_trials_view.h"
 #include "api/network_state_predictor.h"
 #include "api/rtc_event_log/rtc_event_log.h"
@@ -47,8 +50,6 @@ constexpr TimeDelta kSendTimeGroupLength = TimeDelta::Millis(5);
 constexpr uint32_t kFixedSsrc = 0;
 }  // namespace
 
-constexpr char BweSeparateAudioPacketsSettings::kKey[];
-
 BweSeparateAudioPacketsSettings::BweSeparateAudioPacketsSettings(
     const FieldTrialsView* key_value_config) {
   Parser()->Parse(
@@ -61,83 +62,6 @@ BweSeparateAudioPacketsSettings::Parser() {
       "enabled", &enabled,                    //
       "packet_threshold", &packet_threshold,  //
       "time_threshold", &time_threshold);
-}
-
-class DelayBasedCcLogger::Impl {
- public:
-  void SetLoggingFolder(const std::optional<std::string>& logging_folder) {
-    if (!logging_folder.has_value() || logging_folder->empty()) {
-      return;
-    }
-
-    std::string filename = *logging_folder + "/delay_cc_metrics.log";
-    log_file_.open(filename, std::ios_base::app);  // Append mode
-
-    if (log_file_.is_open()) {
-      LogHeader();
-      RTC_LOG(LS_INFO) << "DelayBasedCcLogger: Logging to " << filename;
-    } else {
-      RTC_LOG(LS_ERROR) << "DelayBasedCcLogger: Failed to open " << filename;
-    }
-  }
-
-  void LogMetrics(int64_t timestamp_ms,
-                int64_t bitrate_bps,
-                double delay_jitter_ms,
-                double threshold_ms,
-                BandwidthUsage state) {
-    if (!log_file_.is_open())
-      return;
-
-    int state_value;
-    switch (state) {
-      case BandwidthUsage::kBwNormal:
-        state_value = 0;
-        break;
-      case BandwidthUsage::kBwUnderusing:
-        state_value = -1;
-        break;
-      case BandwidthUsage::kBwOverusing:
-        state_value = 1;
-        break;
-      default:
-        state_value = 0;  // Default to normal state
-    }
-
-    log_file_ << timestamp_ms << ","
-              << bitrate_bps << ","
-              << delay_jitter_ms << ","
-              << threshold_ms << ","
-              << state_value
-              << std::endl;
-  }
-
- private:
-  void LogHeader() {
-    log_file_ << "Timestamp(ms),Bitrate(bps),DelayJitter(ms),"
-              << "Threshold(ms),CongestionState"
-              << std::endl;
-  }
-
-  std::ofstream log_file_;
-};
-
-DelayBasedCcLogger::DelayBasedCcLogger() : impl_(std::make_unique<Impl>()) {}
-
-DelayBasedCcLogger::~DelayBasedCcLogger() = default;
-
-void DelayBasedCcLogger::SetLoggingFolder(
-    const std::optional<std::string>& logging_folder) {
-  impl_->SetLoggingFolder(logging_folder);
-}
-
-void DelayBasedCcLogger::LogMetrics(int64_t timestamp_ms,
-                                   int64_t bitrate_bps,
-                                   double delay_jitter_ms,
-                                   double threshold_ms,
-                                   BandwidthUsage state) {
-  impl_->LogMetrics(timestamp_ms, bitrate_bps, delay_jitter_ms, threshold_ms,
-                    state);
 }
 
 DelayBasedBwe::Result::Result()
@@ -157,16 +81,15 @@ DelayBasedBwe::DelayBasedBwe(const FieldTrialsView* key_value_config,
       last_video_packet_recv_time_(Timestamp::MinusInfinity()),
       network_state_predictor_(network_state_predictor),
       video_delay_detector_(
-          new TrendlineEstimator(key_value_config_, network_state_predictor_)),
+          new TrendlineEstimator(*key_value_config_, network_state_predictor_)),
       audio_delay_detector_(
-          new TrendlineEstimator(key_value_config_, network_state_predictor_)),
+          new TrendlineEstimator(*key_value_config_, network_state_predictor_)),
       active_delay_detector_(video_delay_detector_.get()),
       last_seen_packet_(Timestamp::MinusInfinity()),
       uma_recorded_(false),
       rate_control_(*key_value_config, /*send_side=*/true),
       prev_bitrate_(DataRate::Zero()),
-      prev_state_(BandwidthUsage::kBwNormal),
-      delay_cc_logger_(std::make_unique<DelayBasedCcLogger>()) {
+      prev_state_(BandwidthUsage::kBwNormal) {
   RTC_LOG(LS_INFO)
       << "Initialized DelayBasedBwe with separate audio overuse detection"
       << separate_audio_.Parser()->Encode();
@@ -215,6 +138,16 @@ DelayBasedBwe::Result DelayBasedBwe::IncomingPacketFeedbackVector(
     // against building very large network queues.
     return Result();
   }
+  // TWCC feedback complete → BUR coordinator interval trigger [V13]
+  {
+    int64_t total_bytes = 0;
+    for (const auto& pkt : packet_feedback_vector) {
+      total_bytes += pkt.sent_packet.size.bytes();
+    }
+    RtpSctpCoordinator::OnTwccFeedbackComplete(
+        total_bytes, msg.feedback_time.ms(), max_data_rate_bps_);
+  }
+
   rate_control_.SetInApplicationLimitedRegion(in_alr);
   rate_control_.SetNetworkStateEstimate(network_estimate);
   return MaybeUpdateEstimate(acked_bitrate, probe_bitrate,
@@ -233,9 +166,9 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
         std::make_unique<InterArrivalDelta>(kSendTimeGroupLength);
 
     video_delay_detector_.reset(
-        new TrendlineEstimator(key_value_config_, network_state_predictor_));
+        new TrendlineEstimator(*key_value_config_, network_state_predictor_));
     audio_delay_detector_.reset(
-        new TrendlineEstimator(key_value_config_, network_state_predictor_));
+        new TrendlineEstimator(*key_value_config_, network_state_predictor_));
     active_delay_detector_ = video_delay_detector_.get();
   }
   last_seen_packet_ = at_time;
@@ -280,16 +213,22 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
                                     packet_feedback.receive_time.ms(),
                                     packet_size.bytes(), calculated_deltas);
 
-  double delay_jitter_ms = recv_delta.ms<double>() - send_delta.ms<double>();
-  double threshold_ms = delay_detector_for_packet->GetThreshold();
-  BandwidthUsage detector_state = delay_detector_for_packet->State();
-  // Log the current state
-  delay_cc_logger_->LogMetrics(
-      at_time.ms(),
-      prev_bitrate_.bps(),
-      delay_jitter_ms,
-      threshold_ms,
-      detector_state);
+  // Pudica: per-packet OWD feedback for frame-level BUR measurement
+  if (packet_feedback.receive_time.IsFinite()) {
+    // Detect frame boundary: calculated_deltas means a new send-time group
+    // (frame) was completed. The current packet starts the next frame.
+    // Pudica probes are identified by their probe_cluster_id (set in PacingController).
+    bool is_probe = (packet_feedback.sent_packet.pacing_info.probe_cluster_id
+                     == PacingController::kPudicaProbeClusterId);
+    // Frame last = when InterArrivalDelta computed deltas (previous frame ended)
+    bool is_frame_last = calculated_deltas;
+    RtpSctpCoordinator::OnPudicaPacketFeedback(
+        packet_feedback.sent_packet.sequence_number,
+        packet_feedback.sent_packet.send_time.us(),
+        packet_feedback.receive_time.us(),
+        is_probe,
+        is_frame_last);
+  }
 }
 
 DataRate DelayBasedBwe::TriggerOveruse(Timestamp at_time,
@@ -351,6 +290,56 @@ DelayBasedBwe::Result DelayBasedBwe::MaybeUpdateEstimate(
   }
 
   result.delay_detector_state = detector_state;
+
+  // FSEv2 mode: GCC runs independently and reports its CC_R to FSE.
+  // FSE only overrides GCC output when SCTP is actively sending.
+  // When SCTP is idle, GCC runs freely (no override).
+  if (RtpSctpCoordinator::IsFseMode()) {
+    // Always report GCC's natural estimate to FSE for S_CR computation
+    RtpSctpCoordinator::OnGccRateUpdated(result.target_bitrate.bps());
+    int64_t fse_override = RtpSctpCoordinator::GetRtpFseOverride();
+    if (fse_override > 0) {
+      // SCTP active: override output to FSE_R_rtp allocation
+      result.target_bitrate = DataRate::BitsPerSec(fse_override);
+      result.updated = true;
+      return result;
+    }
+    // SCTP idle: GCC runs freely, no override
+  }
+
+  // FSEv2-lite mode: lightweight RTP override (no SCTP CC interaction).
+  // Override is stored in OnSackReceived at 1 Hz, applied here every BWE update.
+  if (RtpSctpCoordinator::IsFseV2Mode()) {
+    int64_t fse_override = RtpSctpCoordinator::GetRtpFseOverride();
+    if (fse_override > 0) {
+      result.target_bitrate = DataRate::BitsPerSec(fse_override);
+      result.updated = true;
+      return result;
+    }
+  }
+
+  // Pudica mode (Apollo): BUR-driven RTP target override. Mirrors FSE — the
+  // coordinator recomputes the target per frame; apply it as the delay-based
+  // estimate so Pudica owns the RTP-video rate.
+  if (RtpSctpCoordinator::IsPudicaMode()) {
+    int64_t pud_override = RtpSctpCoordinator::GetPudicaRtpOverride();
+    if (pud_override > 0) {
+      result.target_bitrate = DataRate::BitsPerSec(pud_override);
+      result.updated = true;
+      return result;
+    }
+  }
+
+  // UNIFIED_RTP_RATE_CTRL: apply coordinator's rtp_floor to delay-based estimate
+  int64_t rtp_floor = RtpSctpCoordinator::GetRtpTargetFloor();
+  if (rtp_floor > 0) {
+    DataRate floor_rate = DataRate::BitsPerSec(rtp_floor);
+    if (floor_rate > result.target_bitrate) {
+      result.target_bitrate = floor_rate;
+      result.updated = true;
+    }
+  }
+
   return result;
 }
 

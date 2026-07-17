@@ -11,6 +11,9 @@
 #include <glib.h>
 #include <gtk/gtk.h>
 #include <stdio.h>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #include "absl/flags/parse.h"
 #include "api/scoped_refptr.h"
@@ -18,6 +21,7 @@
 #include "examples/peerconnection/client/flag_defs.h"
 #include "examples/peerconnection/client/linux/headless_wnd.h"
 #include "examples/peerconnection/client/peer_connection_client.h"
+#include "pc/rtp_sctp_coordinator.h"
 #include "rtc_base/physical_socket_server.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
@@ -74,6 +78,25 @@ int main(int argc, char* argv[]) {
   const std::string forced_field_trials = absl::GetFlag(FLAGS_force_fieldtrials);
   webrtc::field_trial::InitFieldTrialsFromString(forced_field_trials.c_str());
 
+  // Detect and set peer role (sender/receiver) for file filtering
+  std::string role = absl::GetFlag(FLAGS_role);
+  if (role.empty()) {
+    // Auto-detect role: if queries_csv, sctp_csv or rtp_csv is specified, assume sender
+    const std::string queries_csv = absl::GetFlag(FLAGS_queries_csv);
+    const std::string sctp_csv = absl::GetFlag(FLAGS_sctp_csv);
+    const std::string rtp_csv = absl::GetFlag(FLAGS_rtp_csv);
+    if (!queries_csv.empty() || !sctp_csv.empty() || !rtp_csv.empty()) {
+      role = "sender";
+      RTC_LOG(LS_INFO) << "Auto-detected role: sender (has traffic profiles)";
+    } else {
+      role = "receiver";
+      RTC_LOG(LS_INFO) << "Auto-detected role: receiver (no traffic profiles)";
+    }
+  } else {
+    RTC_LOG(LS_INFO) << "Role explicitly set to: " << role;
+  }
+  webrtc::RtpSctpCoordinator::SetGlobalRole(role);
+
   // Validate port
   if ((absl::GetFlag(FLAGS_port) < 1) || (absl::GetFlag(FLAGS_port) > 65535)) {
     RTC_LOG(LS_ERROR) << "Error: " << absl::GetFlag(FLAGS_port) << " is not a valid port.";
@@ -103,9 +126,35 @@ int main(int argc, char* argv[]) {
 
   // Create peer connection client and conductor
   PeerConnectionClient client;
-  auto conductor = rtc::make_ref_counted<Conductor>(&client, &wnd);
+  auto conductor = rtc::make_ref_counted<Conductor>(&client, &wnd, true);  // true = headless
   socket_server.set_client(&client);
   socket_server.set_conductor(conductor.get());
+
+  // Apply max bitrate from --max_bitrate_kbps flag or rtp.csv
+  int max_bitrate_kbps = absl::GetFlag(FLAGS_max_bitrate_kbps);
+  const std::string rtp_csv_path = absl::GetFlag(FLAGS_rtp_csv);
+  if (!rtp_csv_path.empty()) {
+    std::ifstream rtp_file(rtp_csv_path);
+    if (rtp_file.is_open()) {
+      std::string header_line, data_line;
+      std::getline(rtp_file, header_line);  // skip header
+      if (std::getline(rtp_file, data_line) && !data_line.empty()) {
+        // CSV col 6 (0-indexed) = "Max bitrate (If RTP)" in bps
+        std::istringstream ss(data_line);
+        std::string field;
+        for (int col = 0; col <= 6 && std::getline(ss, field, ','); ++col) {
+          if (col == 6 && !field.empty()) {
+            int max_bps = std::stoi(field);
+            max_bitrate_kbps = max_bps / 1000;
+            fprintf(stderr, "[RTP] Max bitrate from rtp.csv: %d kbps\n",
+                    max_bitrate_kbps);
+          }
+        }
+      }
+    }
+  }
+  conductor->SetMaxBitrateKbps(max_bitrate_kbps);
+  fprintf(stderr, "[RTP] Applied max bitrate: %d kbps\n", max_bitrate_kbps);
 
   RTC_LOG(LS_INFO) << "Starting message loop...";
   

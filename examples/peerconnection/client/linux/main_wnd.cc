@@ -18,12 +18,12 @@
 #include <glibconfig.h>
 #include <gobject/gclosure.h>
 #include <gtk/gtk.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#include <iostream>
+#include <chrono>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 
 #include "api/media_stream_interface.h"
@@ -31,7 +31,6 @@
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_frame_buffer.h"
-#include "api/video/video_frame_type.h"
 #include "api/video/video_rotation.h"
 #include "api/video/video_source_interface.h"
 #include "examples/peerconnection/client/main_wnd.h"
@@ -47,19 +46,6 @@ namespace {
 // GtkMainWnd instance.
 //
 
-static const char* ToCString(webrtc::VideoFrameType t) {
-  switch (t) {
-    case webrtc::VideoFrameType::kEmptyFrame:
-      return "empty";
-    case webrtc::VideoFrameType::kVideoFrameKey:
-      return "key";
-    case webrtc::VideoFrameType::kVideoFrameDelta:
-      return "delta";
-    default:
-      return "unknown";
-  }
-}
-
 gboolean OnDestroyedCallback(GtkWidget* widget,
                              GdkEvent* event,
                              gpointer data) {
@@ -69,10 +55,6 @@ gboolean OnDestroyedCallback(GtkWidget* widget,
 
 void OnClickedCallback(GtkWidget* widget, gpointer data) {
   reinterpret_cast<GtkMainWnd*>(data)->OnClicked(widget);
-}
-
-void OnBulkClickedCallback(GtkWidget* widget, gpointer data) {
-  reinterpret_cast<GtkMainWnd*>(data)->OnBulkClicked(widget);
 }
 
 gboolean SimulateButtonClick(gpointer button) {
@@ -99,7 +81,7 @@ gboolean SimulateLastRowActivated(gpointer data) {
   GtkTreeModel* model = gtk_tree_view_get_model(tree_view);
 
   // "if iter is NULL, then the number of toplevel nodes is returned."
-  int rows = gtk_tree_model_iter_n_children(model, NULL);
+  int rows = gtk_tree_model_iter_n_children(model, nullptr);
   GtkTreePath* lastpath = gtk_tree_path_new_from_indices(rows - 1, -1);
 
   // Select the last item in the list
@@ -157,6 +139,40 @@ gboolean Redraw(gpointer data) {
   return false;
 }
 
+void OnSendClickedCallback(GtkWidget* widget, gpointer data) {
+  reinterpret_cast<GtkMainWnd*>(data)->OnSendClicked(widget);
+}
+
+struct ChatMessageData {
+  GtkMainWnd* wnd;
+  std::string role;
+  std::string text;
+};
+
+struct ContextDocsData {
+  GtkMainWnd* wnd;
+  std::vector<std::string> texts;
+};
+
+gboolean HandleContextDocsCallback(gpointer data) {
+  ContextDocsData* d = reinterpret_cast<ContextDocsData*>(data);
+  d->wnd->LoadContextDocumentsImpl(d->texts);
+  delete d;
+  return FALSE;
+}
+
+gboolean SampleThroughputCallback(gpointer data) {
+  reinterpret_cast<GtkMainWnd*>(data)->SampleThroughput();
+  return TRUE;  // Keep timer running
+}
+
+gboolean HandleChatMessageCallback(gpointer data) {
+  ChatMessageData* msg = reinterpret_cast<ChatMessageData*>(data);
+  msg->wnd->AppendChatMessageImpl(msg->role, msg->text);
+  delete msg;
+  return FALSE;
+}
+
 gboolean Draw(GtkWidget* widget, cairo_t* cr, gpointer data) {
   GtkMainWnd* wnd = reinterpret_cast<GtkMainWnd*>(data);
   wnd->Draw(widget, cr);
@@ -173,20 +189,20 @@ GtkMainWnd::GtkMainWnd(const char* server,
                        int port,
                        bool autoconnect,
                        bool autocall,
-                       bool headless)
-    : window_(NULL),
-      overlay_(NULL),
-      draw_area_(NULL),
-      vbox_(NULL),
-      server_edit_(NULL),
-      port_edit_(NULL),
-      peer_list_(NULL),
-      bulk_button_(NULL),
-      callback_(NULL),
+                       bool headless,
+                       bool demo_mode)
+    : window_(nullptr),
+      draw_area_(nullptr),
+      vbox_(nullptr),
+      server_edit_(nullptr),
+      port_edit_(nullptr),
+      peer_list_(nullptr),
+      callback_(nullptr),
       server_(server),
       autoconnect_(autoconnect),
       autocall_(autocall),
-      headless_(headless) {
+      headless_(headless),
+      demo_mode_(demo_mode) {
   char buffer[10];
   snprintf(buffer, sizeof(buffer), "%i", port);
   port_ = buffer;
@@ -198,24 +214,22 @@ GtkMainWnd::~GtkMainWnd() {
 
 void GtkMainWnd::RegisterObserver(MainWndCallback* callback) {
   callback_ = callback;
-  // juheon added: in headless mode, call SwitchToConnectUI() once more for
-  // autoconnection
-  if (headless_) {
-    SwitchToConnectUI();
-  }
 }
 
 bool GtkMainWnd::IsWindow() {
-  // juheon added: in headless mode, always return true
-  if (headless_)
-    return true;
-  else
-    return window_ != NULL && GTK_IS_WINDOW(window_);
+  if (headless_) {
+    return true;  // Always "windowed" in headless mode
+  }
+  return window_ != nullptr && GTK_IS_WINDOW(window_);
 }
 
 void GtkMainWnd::MessageBox(const char* caption,
                             const char* text,
                             bool is_error) {
+  if (headless_) {
+    printf("[%s] %s: %s\n", is_error ? "ERROR" : "INFO", caption, text);
+    return;
+  }
   GtkWidget* dialog = gtk_message_dialog_new(
       GTK_WINDOW(window_), GTK_DIALOG_DESTROY_WITH_PARENT,
       is_error ? GTK_MESSAGE_ERROR : GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE, "%s",
@@ -236,9 +250,10 @@ MainWindow::UI GtkMainWnd::current_ui() {
 }
 
 void GtkMainWnd::StartLocalRenderer(webrtc::VideoTrackInterface* local_video) {
+  if (headless_) {
+    return;  // Skip renderer in headless mode
+  }
   local_renderer_.reset(new VideoRenderer(this, local_video));
-  // juheon added: set renderer in headless mode
-  local_renderer_->SetHeadless(headless_);
 }
 
 void GtkMainWnd::StopLocalRenderer() {
@@ -247,250 +262,453 @@ void GtkMainWnd::StopLocalRenderer() {
 
 void GtkMainWnd::StartRemoteRenderer(
     webrtc::VideoTrackInterface* remote_video) {
+  if (headless_) {
+    // In headless mode, create lightweight sink for frame delay measurement
+    fprintf(stderr, "[FrameDelay] StartRemoteRenderer called in headless mode\n");
+    frame_delay_sink_.reset(new FrameDelaySink(remote_video));
+    return;
+  }
   remote_renderer_.reset(new VideoRenderer(this, remote_video));
-  // juheon added: sent renderer in headless mode
-  remote_renderer_->SetHeadless(headless_);
 }
 
 void GtkMainWnd::StopRemoteRenderer() {
   remote_renderer_.reset();
+  frame_delay_sink_.reset();
 }
 
 void GtkMainWnd::QueueUIThreadCallback(int msg_id, void* data) {
+  if (headless_) {
+    // In headless mode, directly invoke the callback
+    if (callback_) {
+      callback_->UIThreadCallback(msg_id, data);
+    }
+    return;
+  }
   g_idle_add(HandleUIThreadCallback,
              new UIThreadCallbackData(callback_, msg_id, data));
 }
 
 bool GtkMainWnd::Create() {
-  // juheon added: trigger this only when not in headless mode
   if (headless_) {
-    RTC_LOG(LS_INFO) << "headless mode, do not create window!\n";
-    // SwitchToConnectUI(); // no use doing this here.. don't have callback now
-    return true;
-  } else {
-    RTC_DCHECK(window_ == NULL);
-
-    window_ = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    if (window_) {
-      gtk_window_set_position(GTK_WINDOW(window_), GTK_WIN_POS_CENTER);
-      gtk_window_set_default_size(GTK_WINDOW(window_), 640, 480);
-      gtk_window_set_title(GTK_WINDOW(window_), "PeerConnection client");
-      g_signal_connect(G_OBJECT(window_), "delete-event",
-                       G_CALLBACK(&OnDestroyedCallback), this);
-      g_signal_connect(window_, "key-press-event",
-                       G_CALLBACK(OnKeyPressCallback), this);
-
-      SwitchToConnectUI();
+    // In headless mode, skip GTK window creation
+    printf("[Headless] Window creation skipped\n");
+    if (autoconnect_ && callback_) {
+      // Auto-connect in headless mode
+      callback_->StartLogin(server_, atoi(port_.c_str()));
     }
-
-    return window_ != NULL;
+    return true;
   }
+
+  RTC_DCHECK(window_ == nullptr);
+
+  window_ = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+  if (window_) {
+    gtk_window_set_position(GTK_WINDOW(window_), GTK_WIN_POS_CENTER);
+    gtk_window_set_default_size(GTK_WINDOW(window_), 640, 480);
+    gtk_window_set_title(GTK_WINDOW(window_), "PeerConnection client");
+    g_signal_connect(G_OBJECT(window_), "delete-event",
+                     G_CALLBACK(&OnDestroyedCallback), this);
+    g_signal_connect(window_, "key-press-event", G_CALLBACK(OnKeyPressCallback),
+                     this);
+
+    SwitchToConnectUI();
+  }
+
+  return window_ != nullptr;
 }
 
 bool GtkMainWnd::Destroy() {
-  // juheon added: skip in headless mode
   if (headless_) {
     return true;
-  } else {
-    if (!IsWindow())
-      return false;
-
-    gtk_widget_destroy(window_);
-    window_ = NULL;
-
-    return true;
   }
+  if (!IsWindow())
+    return false;
+
+  gtk_widget_destroy(window_);
+  window_ = nullptr;
+
+  return true;
 }
 
 void GtkMainWnd::SwitchToConnectUI() {
-  if (headless_) {  // juheon added: in headless mode: make connection right
-                    // away
-    int port = port_.length() ? atoi(port_.c_str()) : 0;
-    RTC_LOG(LS_INFO) << "server: " << server_ << "port: " << port << "\n";
-    if (callback_) {
-      callback_->StartLogin(server_, port);
-    } else {
-      RTC_LOG(LS_INFO) << "null callback!\n";
+  RTC_LOG(LS_INFO) << __FUNCTION__;
+
+  if (headless_) {
+    // In headless mode, auto-connect if configured
+    if (autoconnect_ && callback_) {
+      callback_->StartLogin(server_, atoi(port_.c_str()));
     }
-  } else {
-    RTC_LOG(LS_INFO) << __FUNCTION__;
-
-    RTC_DCHECK(IsWindow());
-    RTC_DCHECK(vbox_ == NULL);
-
-    gtk_container_set_border_width(GTK_CONTAINER(window_), 10);
-
-    if (peer_list_) {
-      gtk_widget_destroy(peer_list_);
-      peer_list_ = NULL;
-    } else if (overlay_) {
-      gtk_widget_destroy(overlay_);
-      overlay_ = NULL;
-      draw_area_ = NULL;
-      bulk_button_ = NULL;
-      draw_buffer_.SetSize(0);
-      bulk_started_ = false;
-    }
-
-    vbox_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    GtkWidget* valign = gtk_alignment_new(0, 1, 0, 0);
-    gtk_container_add(GTK_CONTAINER(vbox_), valign);
-    gtk_container_add(GTK_CONTAINER(window_), vbox_);
-
-    GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-
-    GtkWidget* label = gtk_label_new("Server");
-    gtk_container_add(GTK_CONTAINER(hbox), label);
-
-    server_edit_ = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(server_edit_), server_.c_str());
-    gtk_widget_set_size_request(server_edit_, 400, 30);
-    gtk_container_add(GTK_CONTAINER(hbox), server_edit_);
-
-    port_edit_ = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(port_edit_), port_.c_str());
-    gtk_widget_set_size_request(port_edit_, 70, 30);
-    gtk_container_add(GTK_CONTAINER(hbox), port_edit_);
-
-    GtkWidget* button = gtk_button_new_with_label("Connect");
-    gtk_widget_set_size_request(button, 70, 30);
-    g_signal_connect(button, "clicked", G_CALLBACK(OnClickedCallback), this);
-    gtk_container_add(GTK_CONTAINER(hbox), button);
-
-    GtkWidget* halign = gtk_alignment_new(1, 0, 0, 0);
-    gtk_container_add(GTK_CONTAINER(halign), hbox);
-    gtk_box_pack_start(GTK_BOX(vbox_), halign, FALSE, FALSE, 0);
-
-    gtk_widget_show_all(window_);
-
-    if (autoconnect_)
-      g_idle_add(SimulateButtonClick, button);
+    return;
   }
+
+  RTC_DCHECK(IsWindow());
+  RTC_DCHECK(vbox_ == nullptr);
+
+  gtk_container_set_border_width(GTK_CONTAINER(window_), 10);
+
+  if (peer_list_) {
+    gtk_widget_destroy(peer_list_);
+    peer_list_ = nullptr;
+  }
+
+  vbox_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+  GtkWidget* valign = gtk_alignment_new(0, 1, 0, 0);
+  gtk_container_add(GTK_CONTAINER(vbox_), valign);
+  gtk_container_add(GTK_CONTAINER(window_), vbox_);
+
+  GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+
+  GtkWidget* label = gtk_label_new("Server");
+  gtk_container_add(GTK_CONTAINER(hbox), label);
+
+  server_edit_ = gtk_entry_new();
+  gtk_entry_set_text(GTK_ENTRY(server_edit_), server_.c_str());
+  gtk_widget_set_size_request(server_edit_, 400, 30);
+  gtk_container_add(GTK_CONTAINER(hbox), server_edit_);
+
+  port_edit_ = gtk_entry_new();
+  gtk_entry_set_text(GTK_ENTRY(port_edit_), port_.c_str());
+  gtk_widget_set_size_request(port_edit_, 70, 30);
+  gtk_container_add(GTK_CONTAINER(hbox), port_edit_);
+
+  GtkWidget* button = gtk_button_new_with_label("Connect");
+  gtk_widget_set_size_request(button, 70, 30);
+  g_signal_connect(button, "clicked", G_CALLBACK(OnClickedCallback), this);
+  gtk_container_add(GTK_CONTAINER(hbox), button);
+
+  GtkWidget* halign = gtk_alignment_new(1, 0, 0, 0);
+  gtk_container_add(GTK_CONTAINER(halign), hbox);
+  gtk_box_pack_start(GTK_BOX(vbox_), halign, FALSE, FALSE, 0);
+
+  gtk_widget_show_all(window_);
+
+  if (autoconnect_)
+    g_idle_add(SimulateButtonClick, button);
 }
 
 void GtkMainWnd::SwitchToPeerList(const Peers& peers) {
+  RTC_LOG(LS_INFO) << __FUNCTION__;
+
   if (headless_) {
-    if (peers.begin() != peers.end()) {
-      if (autocall_) {
-        // juheon added: in headless mode, make connection from peers right away
-        int id = 2;  // temp: this should be replaced with the output of
-                     // gtk_tree_model_get(model, &iter, 0, &text, 1, &id, -1);
-        RTC_LOG(LS_INFO) << "(headless) Connect to peer " << id << "\n";
-        callback_->ConnectToPeer(id);
-      }  // else{
-      //  RTC_LOG(LS_INFO) << "not in autocall mode\n";
-      //}
-    } else {
-      RTC_LOG(LS_INFO) << "no peers to connect!\n";
+    printf("[Headless] Peer list: %zu peers\n", peers.size());
+    for (const auto& peer : peers) {
+      printf("[Headless]   Peer %d: %s\n", peer.first, peer.second.c_str());
     }
-  } else {
-    RTC_LOG(LS_INFO) << __FUNCTION__;
-
-    if (!peer_list_) {
-      gtk_container_set_border_width(GTK_CONTAINER(window_), 0);
-      if (vbox_) {
-        gtk_widget_destroy(vbox_);
-        vbox_ = NULL;
-        server_edit_ = NULL;
-        port_edit_ = NULL;
-      } else if (overlay_) {
-        gtk_widget_destroy(overlay_);
-        overlay_ = NULL;
-        draw_area_ = NULL;
-        bulk_button_ = NULL;
-        draw_buffer_.SetSize(0);
-        bulk_started_ = false;
-      }
-
-      peer_list_ = gtk_tree_view_new();
-      g_signal_connect(peer_list_, "row-activated",
-                       G_CALLBACK(OnRowActivatedCallback), this);
-      gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(peer_list_), FALSE);
-      InitializeList(peer_list_);
-      gtk_container_add(GTK_CONTAINER(window_), peer_list_);
-      gtk_widget_show_all(window_);
-    } else {
-      GtkListStore* store =
-          GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(peer_list_)));
-      gtk_list_store_clear(store);
+    // In headless mode with autocall, call the first peer
+    if (autocall_ && !peers.empty() && callback_) {
+      int first_peer_id = peers.begin()->first;
+      printf("[Headless] Auto-calling peer %d\n", first_peer_id);
+      callback_->ConnectToPeer(first_peer_id);
     }
-
-    AddToList(peer_list_, "List of currently connected peers:", -1);
-    for (Peers::const_iterator i = peers.begin(); i != peers.end(); ++i)
-      AddToList(peer_list_, i->second.c_str(), i->first);
-
-    if (autocall_ && peers.begin() != peers.end())
-      g_idle_add(SimulateLastRowActivated, peer_list_);
+    return;
   }
+
+  if (!peer_list_) {
+    gtk_container_set_border_width(GTK_CONTAINER(window_), 0);
+    if (vbox_) {
+      gtk_widget_destroy(vbox_);
+      vbox_ = nullptr;
+      server_edit_ = nullptr;
+      port_edit_ = nullptr;
+    } else if (main_hbox_) {
+      if (throughput_sample_timer_id_ != 0) {
+        g_source_remove(throughput_sample_timer_id_);
+        throughput_sample_timer_id_ = 0;
+      }
+      gtk_widget_destroy(main_hbox_);
+      main_hbox_ = nullptr;
+      draw_area_ = nullptr;
+      chat_box_ = nullptr;
+      response_view_ = nullptr;
+      query_entry_ = nullptr;
+      send_button_ = nullptr;
+      docs_box_ = nullptr;
+      docs_scroll_ = nullptr;
+      docs_view_ = nullptr;
+      draw_buffer_.SetSize(0);
+    } else if (draw_area_) {
+      gtk_widget_destroy(draw_area_);
+      draw_area_ = nullptr;
+      draw_buffer_.SetSize(0);
+    }
+
+    peer_list_ = gtk_tree_view_new();
+    g_signal_connect(peer_list_, "row-activated",
+                     G_CALLBACK(OnRowActivatedCallback), this);
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(peer_list_), FALSE);
+    InitializeList(peer_list_);
+    gtk_container_add(GTK_CONTAINER(window_), peer_list_);
+    gtk_widget_show_all(window_);
+  } else {
+    GtkListStore* store =
+        GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(peer_list_)));
+    gtk_list_store_clear(store);
+  }
+
+  AddToList(peer_list_, "List of currently connected peers:", -1);
+  for (Peers::const_iterator i = peers.begin(); i != peers.end(); ++i)
+    AddToList(peer_list_, i->second.c_str(), i->first);
+
+  if (autocall_ && peers.begin() != peers.end())
+    g_idle_add(SimulateLastRowActivated, peer_list_);
 }
 
 void GtkMainWnd::SwitchToStreamingUI() {
-  RTC_LOG(LS_INFO) << "SwitchToStreamingUI: Current UI state=" << current_ui()
-                   << ", draw_area_=" << (draw_area_ ? "exists" : "null");
+  RTC_LOG(LS_INFO) << __FUNCTION__;
+
   if (headless_) {
-    RTC_LOG(LS_INFO) << "headless mode, skip!";
-  } else {
-    // First clean up any existing UI elements
-    if (vbox_) {
-      gtk_container_remove(GTK_CONTAINER(window_), vbox_);
-      gtk_widget_destroy(vbox_);
-      vbox_ = NULL;
-      server_edit_ = NULL;
-      port_edit_ = NULL;
-    }
+    printf("[Headless] Switched to streaming mode\n");
+    return;
+  }
 
-    if (overlay_) {
-      gtk_widget_destroy(overlay_);
-      overlay_ = NULL;
-      draw_area_ = NULL;
-      bulk_button_ = NULL;
-      bulk_started_ = false;
-    }
+  // Already in streaming mode
+  if (draw_area_ != nullptr)
+    return;
 
-    if (peer_list_) {
-      gtk_container_remove(GTK_CONTAINER(window_), peer_list_);
-      gtk_widget_destroy(peer_list_);
-      peer_list_ = NULL;
-    }
+  gtk_container_set_border_width(GTK_CONTAINER(window_), 0);
 
-    gtk_container_set_border_width(GTK_CONTAINER(window_), 0);
+  // Remove the connect UI vbox (Server/Port/Connect button)
+  if (vbox_) {
+    gtk_widget_destroy(vbox_);
+    vbox_ = nullptr;
+    server_edit_ = nullptr;
+    port_edit_ = nullptr;
+  }
 
-    // Set fixed window size
-    desired_width_ = 1280;  // Set your desired fixed width
-    desired_height_ = 720;  // Set your desired fixed height
-    gtk_window_set_resizable(GTK_WINDOW(window_), FALSE);  // Prevent resizing
+  if (peer_list_) {
+    gtk_widget_destroy(peer_list_);
+    peer_list_ = nullptr;
+  }
 
-    overlay_ = gtk_overlay_new();
+  if (demo_mode_) {
+    // =================================================================
+    // V11: Compact sidebar (900x680) — for PPT side-by-side
+    // Left: Video+Graph (480px) | Right: Docs + Status + Chat (418px)
+    // =================================================================
+    main_hbox_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_container_add(GTK_CONTAINER(window_), main_hbox_);
+
+    // Left: Video+Graph (480px)
     draw_area_ = gtk_drawing_area_new();
-    gtk_widget_set_size_request(draw_area_, desired_width_, desired_height_);
-    gtk_container_add(GTK_CONTAINER(overlay_), draw_area_);
+    gtk_widget_set_size_request(draw_area_, 480, 680);
+    g_signal_connect(G_OBJECT(draw_area_), "draw", G_CALLBACK(&::Draw), this);
+    gtk_box_pack_start(GTK_BOX(main_hbox_), draw_area_, FALSE, FALSE, 0);
+
+    // Separator
+    gtk_box_pack_start(GTK_BOX(main_hbox_), gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 0);
+
+    // Right sidebar (418px)
+    GtkWidget* sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(sidebar, 418, -1);
+    gtk_box_pack_start(GTK_BOX(main_hbox_), sidebar, TRUE, TRUE, 0);
+
+    // -- Documents section (top ~50%) --
+    docs_box_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar), docs_box_, TRUE, TRUE, 0);
+
+    GtkWidget* docs_label = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(docs_label),
+        "<span font_desc='9'><b>Context Documents</b></span>");
+    gtk_widget_set_halign(docs_label, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(docs_label, 8);
+    gtk_widget_set_margin_top(docs_label, 2);
+    gtk_box_pack_start(GTK_BOX(docs_box_), docs_label, FALSE, FALSE, 0);
+
+    docs_scroll_ = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(docs_scroll_),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    docs_view_ = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(docs_view_), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(docs_view_), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(docs_view_), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(docs_view_), 8);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(docs_view_), 8);
+
+    GtkTextBuffer* docs_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(docs_view_));
+    gtk_text_buffer_create_tag(docs_buf, "context0", "foreground", "#2196F3", NULL);
+    gtk_text_buffer_create_tag(docs_buf, "context1", "foreground", "#4CAF50", NULL);
+    gtk_text_buffer_create_tag(docs_buf, "context2", "foreground", "#FF9800", NULL);
+    gtk_text_buffer_create_tag(docs_buf, "doc_header",
+                               "weight", PANGO_WEIGHT_BOLD, "scale", 1.1, NULL);
+
+    gtk_container_add(GTK_CONTAINER(docs_scroll_), docs_view_);
+    gtk_box_pack_start(GTK_BOX(docs_box_), docs_scroll_, TRUE, TRUE, 0);
+
+    // -- Separator --
+    gtk_box_pack_start(GTK_BOX(sidebar), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
+    // -- Status bar (elapsed + phase) --
+    GtkWidget* status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(status_bar, 8);
+    gtk_widget_set_margin_end(status_bar, 8);
+    gtk_widget_set_margin_top(status_bar, 4);
+    gtk_widget_set_margin_bottom(status_bar, 4);
+
+    elapsed_label_ = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(elapsed_label_),
+        "<span font_desc='10' weight='bold' foreground='#4FC3F7'>⏱ Ready</span>");
+    gtk_widget_set_halign(elapsed_label_, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(status_bar), elapsed_label_, FALSE, FALSE, 0);
+
+    phase_label_ = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(phase_label_),
+        "<span font_desc='9' foreground='#888888'>Waiting for query...</span>");
+    gtk_widget_set_halign(phase_label_, GTK_ALIGN_END);
+    gtk_box_pack_end(GTK_BOX(status_bar), phase_label_, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(sidebar), status_bar, FALSE, FALSE, 0);
+
+    // -- Separator --
+    gtk_box_pack_start(GTK_BOX(sidebar), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
+    // -- Chat section (bottom ~45%) --
+    chat_box_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_box_pack_start(GTK_BOX(sidebar), chat_box_, TRUE, TRUE, 0);
+
+    GtkWidget* chat_label = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(chat_label),
+        "<span font_desc='9'><b>LLM Response</b></span>");
+    gtk_widget_set_halign(chat_label, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(chat_label, 8);
+    gtk_widget_set_margin_top(chat_label, 2);
+    gtk_box_pack_start(GTK_BOX(chat_box_), chat_label, FALSE, FALSE, 0);
+
+    GtkWidget* scrolled = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    response_view_ = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(response_view_), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(response_view_), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(response_view_), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(response_view_), 8);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(response_view_), 8);
+    gtk_container_add(GTK_CONTAINER(scrolled), response_view_);
+    gtk_box_pack_start(GTK_BOX(chat_box_), scrolled, TRUE, TRUE, 0);
+
+    // Input row
+    GtkWidget* input_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(input_row), 4);
+    query_entry_ = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(query_entry_), "Ask a question...");
+    gtk_box_pack_start(GTK_BOX(input_row), query_entry_, TRUE, TRUE, 0);
+    g_signal_connect(query_entry_, "activate", G_CALLBACK(OnSendClickedCallback), this);
+    send_button_ = gtk_button_new_with_label("Send");
+    g_signal_connect(send_button_, "clicked", G_CALLBACK(OnSendClickedCallback), this);
+    gtk_box_pack_start(GTK_BOX(input_row), send_button_, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(chat_box_), input_row, FALSE, FALSE, 0);
+
+    // Window size: 900x680
+    gtk_window_set_default_size(GTK_WINDOW(window_), 900, 680);
+    gtk_widget_show_all(window_);
+
+    throughput_sample_timer_id_ = g_timeout_add(1000, SampleThroughputCallback, this);
+
+    // Elapsed timer: update every 200ms
+    elapsed_timer_id_ = g_timeout_add(200, [](gpointer data) -> gboolean {
+      auto* wnd = static_cast<GtkMainWnd*>(data);
+      int64_t start = wnd->query_start_ms_.load(std::memory_order_relaxed);
+      if (start > 0 && wnd->elapsed_label_) {
+        int64_t now = g_get_monotonic_time() / 1000;  // ms
+        double elapsed = (now - start) / 1000.0;
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "<span font_desc='10' weight='bold' foreground='#4FC3F7'>"
+                 "⏱ %.1fs</span>", elapsed);
+        gtk_label_set_markup(GTK_LABEL(wnd->elapsed_label_), buf);
+      }
+      return TRUE;
+    }, this);
+
+    printf("[GTK] Demo UI v11: Compact sidebar 900x680\n");
+    fflush(stdout);
+  } else {
+    // Standard mode: video only
+    draw_area_ = gtk_drawing_area_new();
+    gtk_container_add(GTK_CONTAINER(window_), draw_area_);
     g_signal_connect(G_OBJECT(draw_area_), "draw", G_CALLBACK(&::Draw), this);
 
-    bulk_button_ = gtk_button_new_with_label("Start Bulk");
-    gtk_widget_set_halign(bulk_button_, GTK_ALIGN_START);
-    gtk_widget_set_valign(bulk_button_, GTK_ALIGN_START);
-    g_signal_connect(bulk_button_, "clicked", G_CALLBACK(OnBulkClickedCallback),
-                     this);
-    gtk_overlay_add_overlay(GTK_OVERLAY(overlay_), bulk_button_);
-    bulk_started_ = false;
-
-    gtk_container_add(GTK_CONTAINER(window_), overlay_);
-
     gtk_widget_show_all(window_);
+    printf("[GTK] Switched to streaming UI\n");
+    fflush(stdout);
   }
 }
 
+void GtkMainWnd::OnSendClicked(GtkWidget* widget) {
+  if (!query_entry_ || !callback_)
+    return;
+
+  const char* text = gtk_entry_get_text(GTK_ENTRY(query_entry_));
+  if (!text || strlen(text) == 0)
+    return;
+
+  std::string query(text);
+  gtk_entry_set_text(GTK_ENTRY(query_entry_), "");
+
+  // Show user message in chat
+  AppendChatMessageImpl("You", query);
+
+  // Notify conductor
+  callback_->OnQuerySubmitted(query);
+}
+
+void GtkMainWnd::AppendChatMessage(const std::string& role,
+                                    const std::string& text) {
+  if (headless_) {
+    printf("[Chat] [%s] %s\n", role.c_str(), text.c_str());
+    fflush(stdout);
+    return;
+  }
+  // Thread-safe: post to GTK main loop
+  auto* data = new ChatMessageData{this, role, text};
+  g_idle_add(HandleChatMessageCallback, data);
+}
+
+void GtkMainWnd::AppendChatMessageImpl(const std::string& role,
+                                        const std::string& text) {
+  if (!response_view_)
+    return;
+
+  GtkTextBuffer* buffer =
+      gtk_text_view_get_buffer(GTK_TEXT_VIEW(response_view_));
+  GtkTextIter end;
+  gtk_text_buffer_get_end_iter(buffer, &end);
+
+  if (role.empty()) {
+    // Empty role = append token to current line (streaming mode)
+    gtk_text_buffer_insert(buffer, &end, text.c_str(), -1);
+  } else {
+    // Normal message with role prefix
+    std::string line = "[" + role + "] " + text + "\n";
+    gtk_text_buffer_insert(buffer, &end, line.c_str(), -1);
+  }
+
+  // Auto-scroll to bottom
+  GtkTextMark* mark = gtk_text_buffer_get_insert(buffer);
+  gtk_text_buffer_get_end_iter(buffer, &end);
+  gtk_text_buffer_move_mark(buffer, mark, &end);
+  gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(response_view_), mark);
+}
+
 void GtkMainWnd::OnDestroyed(GtkWidget* widget, GdkEvent* event) {
+  if (throughput_sample_timer_id_ != 0) {
+    g_source_remove(throughput_sample_timer_id_);
+    throughput_sample_timer_id_ = 0;
+  }
   callback_->Close();
-  window_ = NULL;
-  overlay_ = NULL;
-  draw_area_ = NULL;
-  vbox_ = NULL;
-  server_edit_ = NULL;
-  port_edit_ = NULL;
-  peer_list_ = NULL;
-  bulk_button_ = NULL;
-  bulk_started_ = false;
+  window_ = nullptr;
+  draw_area_ = nullptr;
+  vbox_ = nullptr;
+  server_edit_ = nullptr;
+  port_edit_ = nullptr;
+  peer_list_ = nullptr;
+  main_hbox_ = nullptr;
+  chat_box_ = nullptr;
+  response_view_ = nullptr;
+  query_entry_ = nullptr;
+  send_button_ = nullptr;
+  docs_box_ = nullptr;
+  docs_scroll_ = nullptr;
+  docs_view_ = nullptr;
 }
 
 void GtkMainWnd::OnClicked(GtkWidget* widget) {
@@ -500,20 +718,8 @@ void GtkMainWnd::OnClicked(GtkWidget* widget) {
   gtk_widget_set_sensitive(widget, false);
   server_ = gtk_entry_get_text(GTK_ENTRY(server_edit_));
   port_ = gtk_entry_get_text(GTK_ENTRY(port_edit_));
-  int port = port_.length() ? atoi(port_.c_str()) : 0;
+  int port = !port_.empty() ? atoi(port_.c_str()) : 0;
   callback_->StartLogin(server_, port);
-}
-
-void GtkMainWnd::OnBulkClicked(GtkWidget* widget) {
-  if (!bulk_started_) {
-    callback_->StartBulkSctp();
-    bulk_started_ = true;
-    gtk_button_set_label(GTK_BUTTON(widget), "Stop Bulk");
-  } else {
-    callback_->StopBulkSctp();
-    bulk_started_ = false;
-    gtk_button_set_label(GTK_BUTTON(widget), "Start Bulk");
-  }
 }
 
 void GtkMainWnd::OnKeyPress(GtkWidget* widget, GdkEventKey* key) {
@@ -530,7 +736,7 @@ void GtkMainWnd::OnKeyPress(GtkWidget* widget, GdkEventKey* key) {
       case GDK_KEY_KP_Enter:
       case GDK_KEY_Return:
         if (vbox_) {
-          OnClicked(NULL);
+          OnClicked(nullptr);
         } else if (peer_list_) {
           // OnRowActivated will be called automatically when the user
           // presses enter.
@@ -546,7 +752,7 @@ void GtkMainWnd::OnKeyPress(GtkWidget* widget, GdkEventKey* key) {
 void GtkMainWnd::OnRowActivated(GtkTreeView* tree_view,
                                 GtkTreePath* path,
                                 GtkTreeViewColumn* column) {
-  RTC_DCHECK(peer_list_ != NULL);
+  RTC_DCHECK(peer_list_ != nullptr);
   GtkTreeIter iter;
   GtkTreeModel* model;
   GtkTreeSelection* selection =
@@ -566,13 +772,13 @@ void GtkMainWnd::OnRedraw() {
 
   VideoRenderer* remote_renderer = remote_renderer_.get();
   if (remote_renderer && !remote_renderer->image().empty() &&
-      draw_area_ != NULL) {
+      draw_area_ != nullptr) {
     if (width_ != remote_renderer->width() ||
         height_ != remote_renderer->height()) {
       width_ = remote_renderer->width();
       height_ = remote_renderer->height();
-      gtk_widget_set_size_request(draw_area_, remote_renderer->width(),
-                                  remote_renderer->height());
+      // Don't resize draw_area to original resolution - keep fixed size
+      // and let Draw() scale the video to fit
     }
     draw_buffer_.SetData(remote_renderer->image());
     gtk_widget_queue_draw(draw_area_);
@@ -582,106 +788,339 @@ void GtkMainWnd::OnRedraw() {
 }
 
 void GtkMainWnd::Draw(GtkWidget* widget, cairo_t* cr) {
-  if (!draw_buffer_.data())
-    return;
+  int alloc_w = gtk_widget_get_allocated_width(widget);
+  int alloc_h = gtk_widget_get_allocated_height(widget);
 
-  // Draw video content first
-  double scale_x = static_cast<double>(desired_width_) / width_;
-  double scale_y = static_cast<double>(desired_height_) / height_;
-  double scale = std::min(scale_x, scale_y);
+  // Clear background
+  cairo_set_source_rgb(cr, 0, 0, 0);
+  cairo_paint(cr);
 
-  double x = (desired_width_ - (width_ * scale)) / 2;
-  double y = (desired_height_ - (height_ * scale)) / 2;
+  if (demo_mode_) {
+    // Demo mode: graph area + optional video below
+    int graph_h = std::min(kGraphHeight, alloc_h);
+    int video_area_h = alloc_h - graph_h;
 
-  cairo_translate(cr, x, y);
-  cairo_scale(cr, scale, scale);
+    // Draw performance graph at top (or full area if no room for video)
+    cairo_save(cr);
+    if (video_area_h < 50) {
+      // Graph-only mode (e.g., thin top bar)
+      DrawPerformanceGraph(cr, alloc_w, alloc_h);
+    } else {
+      DrawPerformanceGraph(cr, alloc_w, graph_h);
+    }
+    cairo_restore(cr);
 
-  cairo_format_t format = CAIRO_FORMAT_ARGB32;
-  cairo_surface_t* surface = cairo_image_surface_create_for_data(
-      draw_buffer_.data(), format, width_, height_,
-      cairo_format_stride_for_width(format, width_));
+    // Draw video below graph (only if enough space)
+    if (video_area_h >= 50 && width_ > 0 && height_ > 0 && draw_buffer_.data()) {
+      cairo_save(cr);
+      cairo_translate(cr, 0, graph_h);
 
-  cairo_set_source_surface(cr, surface, 0, 0);
-  cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
-  cairo_rectangle(cr, 0, 0, width_, height_);
-  cairo_fill(cr);
+      double scale_x = static_cast<double>(alloc_w) / width_;
+      double scale_y = static_cast<double>(video_area_h) / height_;
+      double scale = std::min(scale_x, scale_y);
 
-  cairo_surface_destroy(surface);
+      double video_w = width_ * scale;
+      double video_h = height_ * scale;
+      double offset_x = (alloc_w - video_w) / 2.0;
+      double offset_y = (video_area_h - video_h) / 2.0;
 
-  // Reset transform for text overlay
-  cairo_identity_matrix(cr);
+      cairo_translate(cr, offset_x, offset_y);
+      cairo_scale(cr, scale, scale);
 
-  // Draw stats overlay
-  cairo_select_font_face(cr, "monospace", CAIRO_FONT_SLANT_NORMAL,
-                         CAIRO_FONT_WEIGHT_BOLD);
-  cairo_set_font_size(cr, 14.0);
-  cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);  // White text
-
-  float fps = remote_renderer_ ? remote_renderer_->fps() : 0.0f;
-  float bitrate = remote_renderer_ ? remote_renderer_->bitrate() : 0.0f;
-
-  char stats_text[128];
-  snprintf(stats_text, sizeof(stats_text),
-           "Resolution: %dx%d  FPS: %.1f  Bitrate: %.3f Mbps", width_, height_,
-           fps, bitrate / 1000.0f);
-
-  // Add black background for better readability
-  cairo_text_extents_t extents;
-  cairo_text_extents(cr, stats_text, &extents);
-
-  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.5);  // Semi-transparent black
-  cairo_rectangle(cr, 8, 8, extents.width + 4, extents.height + 4);
-  cairo_fill(cr);
-
-  // Draw text
-  cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-  cairo_move_to(cr, 10, 20);
-  cairo_show_text(cr, stats_text);
-}
-
-// In the anonymous namespace where other callbacks are defined
-gboolean GtkMainWnd::OnConfigureCallback(GtkWidget* widget,
-                                         GdkEventConfigure* event,
-                                         gpointer data) {
-  reinterpret_cast<GtkMainWnd*>(data)->OnConfigure(widget, event);
-  return FALSE;
-}
-
-void GtkMainWnd::OnConfigure(GtkWidget* widget, GdkEventConfigure* event) {
-  if (!window_resizing_) {
-    ResizeWindow(event->width, event->height);
-  }
-}
-
-void GtkMainWnd::ResizeWindow(int width, int height) {
-  if (window_resizing_)
-    return;
-
-  window_resizing_ = true;
-
-  // Calculate scale to fit video in window while maintaining aspect ratio
-  double video_aspect = static_cast<double>(width_) / height_;
-  double window_aspect = static_cast<double>(width) / height;
-
-  if (video_aspect > window_aspect) {
-    // Video is wider than window - scale to fit width
-    scale_ = static_cast<double>(width) / width_;
-    desired_width_ = width;
-    desired_height_ = height_ * scale_;
+      cairo_format_t format = CAIRO_FORMAT_ARGB32;
+      cairo_surface_t* surface = cairo_image_surface_create_for_data(
+          draw_buffer_.data(), format, width_, height_,
+          cairo_format_stride_for_width(format, width_));
+      cairo_set_source_surface(cr, surface, 0, 0);
+      cairo_rectangle(cr, 0, 0, width_, height_);
+      cairo_fill(cr);
+      cairo_surface_destroy(surface);
+      cairo_restore(cr);
+    }
   } else {
-    // Video is taller than window - scale to fit height
-    scale_ = static_cast<double>(height) / height_;
-    desired_height_ = height;
-    desired_width_ = width_ * scale_;
-  }
+    // Standard mode: video only
+    if (width_ <= 0 || height_ <= 0 || !draw_buffer_.data())
+      return;
 
-  // gtk_window_resize(GTK_WINDOW(window_), desired_width_, desired_height_);
-  window_resizing_ = false;
+    double scale_x = static_cast<double>(alloc_w) / width_;
+    double scale_y = static_cast<double>(alloc_h) / height_;
+    double scale = std::min(scale_x, scale_y);
+
+    double video_w = width_ * scale;
+    double video_h = height_ * scale;
+    double offset_x = (alloc_w - video_w) / 2.0;
+    double offset_y = (alloc_h - video_h) / 2.0;
+
+    cairo_save(cr);
+    cairo_translate(cr, offset_x, offset_y);
+    cairo_scale(cr, scale, scale);
+
+    cairo_format_t format = CAIRO_FORMAT_ARGB32;
+    cairo_surface_t* surface = cairo_image_surface_create_for_data(
+        draw_buffer_.data(), format, width_, height_,
+        cairo_format_stride_for_width(format, width_));
+    cairo_set_source_surface(cr, surface, 0, 0);
+    cairo_rectangle(cr, 0, 0, width_, height_);
+    cairo_fill(cr);
+    cairo_surface_destroy(surface);
+    cairo_restore(cr);
+  }
 }
 
-std::string GtkMainWnd::GetLogFolder() const {
-  return callback_->GetLogFolder();  // callback_ is MainWndCallback which
-                                     // Conductor implements
+void GtkMainWnd::DrawPerformanceGraph(cairo_t* cr, int width, int height) {
+  // Dark background for graph area
+  cairo_set_source_rgb(cr, 0.1, 0.1, 0.15);
+  cairo_rectangle(cr, 0, 0, width, height);
+  cairo_fill(cr);
+
+  // Graph margins
+  const int margin_l = 60;
+  const int margin_r = 60;
+  const int margin_t = 20;
+  const int margin_b = 25;
+  int gw = width - margin_l - margin_r;
+  int gh = height - margin_t - margin_b;
+
+  if (gw <= 0 || gh <= 0)
+    return;
+
+  // Draw grid lines (horizontal)
+  cairo_set_source_rgba(cr, 0.3, 0.3, 0.3, 0.5);
+  cairo_set_line_width(cr, 0.5);
+  for (int i = 0; i <= 4; ++i) {
+    double y = margin_t + gh * (1.0 - i / 4.0);
+    cairo_move_to(cr, margin_l, y);
+    cairo_line_to(cr, margin_l + gw, y);
+    cairo_stroke(cr);
+  }
+
+  // Left Y-axis labels (Video, blue)
+  cairo_set_source_rgb(cr, 0.13, 0.59, 0.95);  // #2196F3
+  cairo_select_font_face(cr, "monospace", CAIRO_FONT_SLANT_NORMAL,
+                         CAIRO_FONT_WEIGHT_NORMAL);
+  cairo_set_font_size(cr, 10);
+  for (int i = 0; i <= 4; ++i) {
+    double y = margin_t + gh * (1.0 - i / 4.0);
+    char label[16];
+    snprintf(label, sizeof(label), "%.0f", kVideoMaxMbps * i / 4.0);
+    cairo_move_to(cr, 5, y + 4);
+    cairo_show_text(cr, label);
+  }
+  // Left axis title
+  cairo_move_to(cr, 5, margin_t - 5);
+  cairo_show_text(cr, "Video Mbps");
+
+  // Right Y-axis labels (SCTP, orange)
+  cairo_set_source_rgb(cr, 1.0, 0.6, 0.0);  // #FF9800
+  for (int i = 0; i <= 4; ++i) {
+    double y = margin_t + gh * (1.0 - i / 4.0);
+    char label[16];
+    snprintf(label, sizeof(label), "%.0f", kSctpMaxMbps * i / 4.0);
+    cairo_move_to(cr, margin_l + gw + 5, y + 4);
+    cairo_show_text(cr, label);
+  }
+  // Right axis title
+  cairo_move_to(cr, margin_l + gw + 5, margin_t - 5);
+  cairo_show_text(cr, "Context Mbps");
+
+  // Draw video throughput line (blue)
+  if (video_throughput_history_.size() > 1) {
+    cairo_set_source_rgba(cr, 0.13, 0.59, 0.95, 0.9);
+    cairo_set_line_width(cr, 2.0);
+    size_t n = video_throughput_history_.size();
+    for (size_t i = 0; i < n; ++i) {
+      double x = margin_l + gw * static_cast<double>(i) / (n - 1);
+      double val = std::min(video_throughput_history_[i] / kVideoMaxMbps, 1.0f);
+      double y = margin_t + gh * (1.0 - val);
+      if (i == 0)
+        cairo_move_to(cr, x, y);
+      else
+        cairo_line_to(cr, x, y);
+    }
+    cairo_stroke(cr);
+  }
+
+  // Draw SCTP throughput line (orange)
+  if (sctp_throughput_history_.size() > 1) {
+    cairo_set_source_rgba(cr, 1.0, 0.6, 0.0, 0.9);
+    cairo_set_line_width(cr, 2.0);
+    size_t n = sctp_throughput_history_.size();
+    for (size_t i = 0; i < n; ++i) {
+      double x = margin_l + gw * static_cast<double>(i) / (n - 1);
+      double val = std::min(sctp_throughput_history_[i] / kSctpMaxMbps, 1.0f);
+      double y = margin_t + gh * (1.0 - val);
+      if (i == 0)
+        cairo_move_to(cr, x, y);
+      else
+        cairo_line_to(cr, x, y);
+    }
+    cairo_stroke(cr);
+  }
+
+  // Legend
+  cairo_set_font_size(cr, 11);
+  // Video legend
+  cairo_set_source_rgb(cr, 0.13, 0.59, 0.95);
+  cairo_rectangle(cr, margin_l + 10, margin_t + 5, 12, 12);
+  cairo_fill(cr);
+  cairo_set_source_rgb(cr, 0.8, 0.8, 0.8);
+  cairo_move_to(cr, margin_l + 26, margin_t + 15);
+  cairo_show_text(cr, "Video");
+  // SCTP legend
+  cairo_set_source_rgb(cr, 1.0, 0.6, 0.0);
+  cairo_rectangle(cr, margin_l + 80, margin_t + 5, 12, 12);
+  cairo_fill(cr);
+  cairo_set_source_rgb(cr, 0.8, 0.8, 0.8);
+  cairo_move_to(cr, margin_l + 96, margin_t + 15);
+  cairo_show_text(cr, "Context (SCTP)");
+
+  // Show current values
+  if (!video_throughput_history_.empty() || !sctp_throughput_history_.empty()) {
+    char info[128];
+    float v = video_throughput_history_.empty() ? 0.0f : video_throughput_history_.back();
+    float s = sctp_throughput_history_.empty() ? 0.0f : sctp_throughput_history_.back();
+    snprintf(info, sizeof(info), "Video: %.1f Mbps  |  Context: %.1f Mbps", v, s);
+    cairo_set_source_rgb(cr, 0.9, 0.9, 0.9);
+    cairo_set_font_size(cr, 12);
+    cairo_move_to(cr, margin_l + gw / 2 - 100, height - 5);
+    cairo_show_text(cr, info);
+  }
+}
+
+void GtkMainWnd::SetCurrentQueryPath(const std::string& path) {
+  // Currently unused — reserved for future query-specific behavior
+}
+
+void GtkMainWnd::OnSctpDataReceived(size_t bytes) {
+  sctp_bytes_received_.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void GtkMainWnd::UpdateThroughput(float video_mbps, float sctp_mbps) {
+  stats_video_mbps_.store(video_mbps, std::memory_order_relaxed);
+  stats_sctp_mbps_.store(sctp_mbps, std::memory_order_relaxed);
+}
+
+void GtkMainWnd::LoadContextDocuments(const std::vector<std::string>& texts) {
+  if (headless_) {
+    printf("[Docs] Received %zu context documents\n", texts.size());
+    for (size_t i = 0; i < texts.size(); ++i) {
+      printf("[Docs]   [%zu] %zu bytes\n", i, texts[i].size());
+    }
+    fflush(stdout);
+    return;
+  }
+  // Thread-safe: post to GTK main loop
+  auto* data = new ContextDocsData{this, texts};
+  g_idle_add(HandleContextDocsCallback, data);
+}
+
+void GtkMainWnd::LoadContextDocumentsImpl(const std::vector<std::string>& texts) {
+  if (!docs_view_)
+    return;
+
+  GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(docs_view_));
+  gtk_text_buffer_set_text(buffer, "", 0);  // Clear existing
+
+  GtkTextIter end;
+  for (size_t i = 0; i < texts.size(); ++i) {
+    // Document header
+    gtk_text_buffer_get_end_iter(buffer, &end);
+    char header[64];
+    snprintf(header, sizeof(header), "--- Context %zu ---\n", i);
+    gtk_text_buffer_insert_with_tags_by_name(buffer, &end, header, -1,
+                                              "doc_header", NULL);
+
+    // Document body with color tag
+    gtk_text_buffer_get_end_iter(buffer, &end);
+    char tag_name[16];
+    snprintf(tag_name, sizeof(tag_name), "context%zu", i % 3);
+    gtk_text_buffer_insert_with_tags_by_name(buffer, &end,
+                                              texts[i].c_str(), -1,
+                                              tag_name, NULL);
+
+    // Separator
+    gtk_text_buffer_get_end_iter(buffer, &end);
+    gtk_text_buffer_insert(buffer, &end, "\n\n", -1);
+  }
+
+  printf("[GTK] Loaded %zu context documents into Documents panel\n",
+         texts.size());
+  fflush(stdout);
+}
+
+void GtkMainWnd::SampleThroughput() {
+  // Use RTCStats-reported throughput for video (actual RTP bitrate)
+  float video_mbps = stats_video_mbps_.load(std::memory_order_relaxed);
+
+  // SCTP: always use direct byte counter from OnSctpDataReceived().
+  // RTCStats averages poorly over burst MAFS transfers (showed 6 Mbps
+  // when actual aggregate was ~140 Mbps). The byte counter captures
+  // every received byte in real-time, giving accurate 1-second deltas.
+  size_t current_sctp = sctp_bytes_received_.load(std::memory_order_relaxed);
+  size_t delta_sctp = current_sctp - last_sctp_bytes_;
+  last_sctp_bytes_ = current_sctp;
+  float sctp_mbps = static_cast<float>(delta_sctp * 8) / 1e6f;
+
+  // Keep 60 samples (1 minute of history)
+  constexpr size_t kMaxSamples = 60;
+  sctp_throughput_history_.push_back(sctp_mbps);
+  if (sctp_throughput_history_.size() > kMaxSamples)
+    sctp_throughput_history_.pop_front();
+
+  video_throughput_history_.push_back(video_mbps);
+  if (video_throughput_history_.size() > kMaxSamples)
+    video_throughput_history_.pop_front();
+
+  // Trigger redraw of the graph
+  if (draw_area_)
+    gtk_widget_queue_draw(draw_area_);
+}
+
+void GtkMainWnd::OnQueryStarted() {
+  query_start_ms_.store(g_get_monotonic_time() / 1000,
+                        std::memory_order_relaxed);
+  SetQueryPhase("Sending query...");
+}
+
+void GtkMainWnd::SetQueryPhase(const std::string& phase) {
+  if (!phase_label_)
+    return;
+  // Must run on GTK thread
+  std::string* copy = new std::string(phase);
+  g_idle_add(
+      [](gpointer data) -> gboolean {
+        auto* args = static_cast<std::pair<GtkMainWnd*, std::string*>*>(data);
+        args->first->SetQueryPhaseImpl(*args->second);
+        delete args->second;
+        delete args;
+        return FALSE;
+      },
+      new std::pair<GtkMainWnd*, std::string*>(this, copy));
+}
+
+void GtkMainWnd::SetQueryPhaseImpl(const std::string& phase) {
+  if (!phase_label_)
+    return;
+  // Color-code phases
+  const char* color = "#888888";
+  if (phase.find("Transfer") != std::string::npos ||
+      phase.find("Receiv") != std::string::npos)
+    color = "#FF9800";  // orange
+  else if (phase.find("Encod") != std::string::npos ||
+           phase.find("Load") != std::string::npos)
+    color = "#FFC107";  // amber
+  else if (phase.find("Generat") != std::string::npos)
+    color = "#4CAF50";  // green
+  else if (phase.find("Complete") != std::string::npos)
+    color = "#2196F3";  // blue
+  else if (phase.find("No context") != std::string::npos)
+    color = "#F44336";  // red
+
+  char buf[512];
+  snprintf(buf, sizeof(buf),
+           "<span font_desc='9' foreground='%s'>%s</span>",
+           color, phase.c_str());
+  gtk_label_set_markup(GTK_LABEL(phase_label_), buf);
 }
 
 GtkMainWnd::VideoRenderer::VideoRenderer(
@@ -691,10 +1130,7 @@ GtkMainWnd::VideoRenderer::VideoRenderer(
       height_(0),
       main_wnd_(main_wnd),
       rendered_track_(track_to_render) {
-  rendered_track_->AddOrUpdateSink(this, rtc::VideoSinkWants());
-
-  // Get log folder from Conductor through MainWnd
-  InitializeLogging(main_wnd_->GetLogFolder());
+  rendered_track_->AddOrUpdateSink(this, webrtc::VideoSinkWants());
 }
 
 GtkMainWnd::VideoRenderer::~VideoRenderer() {
@@ -715,204 +1151,151 @@ void GtkMainWnd::VideoRenderer::SetSize(int width, int height) {
   gdk_threads_leave();
 }
 
-// juheon added: print current time to check frame interval
-#include <sys/time.h>
-
-#include <ctime>
-
-void print_current_time() {
-  struct timeval time_now{};
-  gettimeofday(&time_now, nullptr);
-
-  long int sec = static_cast<long int>(time_now.tv_sec) % 86400;
-  long int usec = static_cast<long int>(time_now.tv_usec);
-
-  long int hour = (sec / 3600 + 9) % 24;
-  long int min = (sec % 3600) / 60;
-  long int s = (sec % 3600) % 60;
-  long int ms = usec / 1000;
-
-  // std::cout<<hour<<":"<<min<<":"<<s<<"."<<ms<<", ";
-  printf("%ld:%ld:%ld.%ld, ", hour, min, s, ms);
-}
-
 void GtkMainWnd::VideoRenderer::OnFrame(const webrtc::VideoFrame& video_frame) {
   gdk_threads_enter();
 
-  int64_t current_time = rtc::TimeMillis();
-
-  // Initialize start time with first frame
-  if (start_time_ == 0) {
-    start_time_ = current_time;
+  webrtc::scoped_refptr<webrtc::I420BufferInterface> buffer(
+      video_frame.video_frame_buffer()->ToI420());
+  if (video_frame.rotation() != webrtc::kVideoRotation_0) {
+    buffer = webrtc::I420Buffer::Rotate(*buffer, video_frame.rotation());
   }
+  SetSize(buffer->width(), buffer->height());
 
-  // FPS Calculation
-  if (last_frame_time_ == 0) {
-    last_frame_time_ = current_time;
-  }
+  // TODO(bugs.webrtc.org/6857): This conversion is correct for little-endian
+  // only. Cairo ARGB32 treats pixels as 32-bit values in *native* byte order,
+  // with B in the least significant byte of the 32-bit value. Which on
+  // little-endian means that memory layout is BGRA, with the B byte stored at
+  // lowest address. Libyuv's ARGB format (surprisingly?) uses the same
+  // little-endian format, with B in the first byte in memory, regardless of
+  // native endianness.
+  libyuv::I420ToARGB(buffer->DataY(), buffer->StrideY(), buffer->DataU(),
+                     buffer->StrideU(), buffer->DataV(), buffer->StrideV(),
+                     image_.data(), width_ * 4, buffer->width(),
+                     buffer->height());
 
-  frame_count_++;
+  gdk_threads_leave();
 
-  // Calculate bitrate
-  size_t frame_size =
-      video_frame.frame_timing().encoded_size;  // Get frame size in bytes
-  total_bytes_ += frame_size;
-
-  // Update FPS and bitrate every second
-  if (current_time - last_frame_time_ >= 1000) {
-    // FPS calculation
-    current_fps_ = frame_count_ * 1000.0f / (current_time - last_frame_time_);
-
-    // Bitrate calculation (bits per second)
-    current_bitrate_ = (total_bytes_ * 8.0f / 1024) *
-                       (1000.0f / (current_time - last_frame_time_));
-
-    // Reset counters
-    frame_count_ = 0;
-    total_bytes_ = 0;
-    last_frame_time_ = current_time;
-
-    // Calculate elapsed time in seconds since start
-    double elapsed_seconds = (current_time - start_time_) / 1000.0;
-    std::cout << "Elapsed time: " << elapsed_seconds
-              << "s, Frame rate: " << current_fps_
-              << ", Bitrate: " << current_bitrate_ << std::endl;
-  }
-
-  // Log frame metrics
-  LogFrameMetrics(video_frame);
-
-  if (!headless_) {
-    rtc::scoped_refptr<webrtc::I420BufferInterface> buffer(
-        video_frame.video_frame_buffer()->ToI420());
-    if (video_frame.rotation() != webrtc::kVideoRotation_0) {
-      buffer = webrtc::I420Buffer::Rotate(*buffer, video_frame.rotation());
-    }
-
-    // Keep original video dimensions
-    SetSize(buffer->width(), buffer->height());
-
-    libyuv::I420ToARGB(buffer->DataY(), buffer->StrideY(), buffer->DataU(),
-                       buffer->StrideU(), buffer->DataV(), buffer->StrideV(),
-                       image_.data(), width_ * 4, buffer->width(),
-                       buffer->height());
-
-    gdk_threads_leave();
-
-    // This will trigger a redraw with the current scale
-    g_idle_add(Redraw, main_wnd_);
-  }
+  g_idle_add(Redraw, main_wnd_);
 }
 
-void GtkMainWnd::VideoRenderer::InitializeLogging(
-    const std::string& log_folder) {
-  if (logging_initialized_)
-    return;
+//
+// FrameDelaySink — lightweight sink for per-frame delay measurement
+//
 
-  log_folder_ = log_folder;
-  std::string log_path = log_folder_ + "/frame_metrics.csv";
-
-  frame_log_file_.open(log_path, std::ios::out);
-  if (frame_log_file_.is_open()) {
-    // Write CSV header
-    frame_log_file_
-        << "timestamp,rtp_timestamp,first_packet_departure,estimated_first_"
-           "packet_departure,first_packet_arrival,last_packet_arrival,render,"
-        << "encode_ms,pacing_ms,network_ms,estimated_network_ms,decode_ms,"
-        << "frame_construction_delay_ms,inter_frame_delay_ms,"
-        << "inter_frame_departure_ms,frame_jitter_ms,"  // New columns
-        << "encoded_size,height,width,min_rtt,avail_bw,"
-        << "is_keyframe,frame_type\n";
-    logging_initialized_ = true;
-  }
+GtkMainWnd::FrameDelaySink::FrameDelaySink(
+    webrtc::VideoTrackInterface* track)
+    : track_(track) {
+  track_->AddOrUpdateSink(this, webrtc::VideoSinkWants());
+  fprintf(stderr, "[FrameDelaySink] Registered as remote video sink\n");
 }
 
-void GtkMainWnd::VideoRenderer::LogFrameMetrics(
+GtkMainWnd::FrameDelaySink::~FrameDelaySink() {
+  track_->RemoveSink(this);
+  if (csv_.is_open())
+    csv_.close();
+  fprintf(stderr, "[FrameDelaySink] Removed\n");
+}
+
+void GtkMainWnd::FrameDelaySink::OnFrame(
     const webrtc::VideoFrame& frame) {
-  if (!logging_initialized_ || !frame_log_file_.is_open())
-    return;
+  auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
 
-  const webrtc::VideoFrame::FrameTiming& timing = frame.frame_timing();
-  int64_t current_time = rtc::TimeMillis();
+  const auto& ft = frame.frame_timing();
 
-  // Calculate RTP timestamp in milliseconds (90kHz clock -> ms)
-  int rtp_ms = (frame.rtp_timestamp() / 90);
+  // rtp_ms: sender capture time in ms (RTP clock = 90kHz)
+  int64_t rtp_ms = static_cast<int64_t>(frame.rtp_timestamp()) / 90;
 
-  // Calculate inter-frame departure time
-  int64_t inter_frame_departure_ms = 0;
-  if (!first_frame_ && last_departure_ts_ > 0) {
-    inter_frame_departure_ms =
-        timing.first_packet_departure_timestamp - last_departure_ts_;
+  // Compute inter-frame delay from consecutive receive_finish timestamps
+  int64_t inter_frame_delay_ms = 0;
+  if (last_receive_finish_ms_ > 0 && ft.receive_finish_ms > 0) {
+    inter_frame_delay_ms = ft.receive_finish_ms - last_receive_finish_ms_;
   }
-  last_departure_ts_ = timing.first_packet_departure_timestamp;
-
-  // Calculate frame-level jitter (difference between inter-arrival and
-  // inter-departure times)
-  int64_t frame_jitter_ms = 0;
-  if (!first_frame_ && last_arrival_ts_ > 0) {
-    int64_t inter_frame_arrival_ms =
-        timing.last_packet_arrival_timestamp - last_arrival_ts_;
-    frame_jitter_ms = inter_frame_arrival_ms - inter_frame_departure_ms;
-  }
-  last_arrival_ts_ = timing.last_packet_arrival_timestamp;
-
-  if (first_frame_) {
-    first_frame_ = false;
+  if (ft.receive_finish_ms > 0) {
+    last_receive_finish_ms_ = ft.receive_finish_ms;
   }
 
-  // Initialize offset using first frame's data
-  if (!offset_initialized_ && timing.network_delay_ms > 0) {
-    // Calculate offset using RTP timestamp and actual departure time
-    // Note: We don't include encode_ms in offset calculation as requested
-    rtp_time_offset_ = timing.first_packet_arrival_timestamp -
-                       (timing.network_delay_ms - 5) -
-                       (rtp_ms + timing.encode_ms);
-    offset_initialized_ = true;
-  }
-
-  if (offset_initialized_) {
-    // Calculate estimated departure and network delay
-    int estimated_departure =
-        rtp_ms + rtp_time_offset_ +
-        timing.encode_ms;  // rtp_ms + offset --> capture time
-    int estimated_network_ms =
-        timing.last_packet_arrival_timestamp - estimated_departure;
-
-    // Before the frame_log_file_ << line, add:
-    double avail_bw = 0.0;
-    if (timing.frame_construction_delay_ms + 0.5 > 0) {
-      // Convert bytes to bits (* 8)
-      // Convert ms to seconds (/ 1000)
-      // Convert to Mbps (/ 1000000)
-      // Final formula: (bytes * 8) / (ms / 1000) / 1000000
-      // Simplified: (bytes * 8 * 1000) / (ms * 1000000)
-      avail_bw =
-          (static_cast<double>(timing.encoded_size) * 8.0 * 1000.0) /
-          ((static_cast<double>(timing.frame_construction_delay_ms) + 0.5) *
-           1000000.0);
+  // RTT-based offset calibration (from original WebRTC headless_wnd.cc)
+  // Calibrate the clock offset between sender RTP clock and receiver clock.
+  // This allows estimating E2E delay for ALL subsequent frames.
+  // Sources of RTT (in priority order):
+  //   1. network_delay_ms from RTCP (bidirectional video)
+  //   2. NETWORK_LATENCY_MS env var (experiment config, one-way latency)
+  if (!offset_initialized_ && ft.receive_start_ms > 0) {
+    int64_t rtt_ms = ft.network_delay_ms;  // From RTCP (RTT)
+    if (rtt_ms <= 0) {
+      // Fallback: use env var NETWORK_LATENCY_MS (one-way latency → RTT = 2x)
+      const char* lat_env = std::getenv("NETWORK_LATENCY_MS");
+      if (lat_env && std::strlen(lat_env) > 0) {
+        rtt_ms = std::atol(lat_env) * 2;
+      }
     }
-
-    const bool is_keyframe = timing.is_keyframe;
-    const webrtc::VideoFrameType ftype = timing.frame_type;
-
-    frame_log_file_ << current_time << "," << frame.rtp_timestamp() << ","
-                    << timing.first_packet_departure_timestamp << ","
-                    << estimated_departure << ","
-                    << timing.first_packet_arrival_timestamp << ","
-                    << timing.last_packet_arrival_timestamp << ","
-                    << timing.render_ms << "," << timing.encode_ms << ","
-                    << timing.pacing_ms << "," << timing.network_ms << ","
-                    << estimated_network_ms << "," << timing.decode_ms << ","
-                    << timing.frame_construction_delay_ms << ","
-                    << timing.inter_frame_delay_ms << ","
-                    << inter_frame_departure_ms << ","  // New column
-                    << frame_jitter_ms << ","           // New column
-                    << timing.encoded_size << "," << frame.width() << ","
-                    << frame.height() << "," << timing.network_delay_ms << ","
-                    << avail_bw << "," << (is_keyframe ? 1 : 0) << ","
-                    << ToCString(ftype) << "\n";
+    if (rtt_ms > 0) {
+      // rtp_time_offset_ maps rtp_ms to receiver clock:
+      //   estimated_departure = rtp_ms + rtp_time_offset_ + encode_ms
+      //   estimated_network_ms = last_packet_arrival - estimated_departure
+      rtp_time_offset_ = ft.receive_start_ms -
+                         (rtt_ms / 2 - 5) -
+                         (rtp_ms + ft.encode_ms);
+      offset_initialized_ = true;
+      fprintf(stderr,
+              "[FrameDelaySink] Offset calibrated: rtp_time_offset=%lld "
+              "rtt_ms=%lld (network_delay_ms=%lld)\n",
+              (long long)rtp_time_offset_, (long long)rtt_ms,
+              (long long)ft.network_delay_ms);
+    }
   }
 
-  // Flush to ensure data is written immediately
-  frame_log_file_.flush();
+  // Estimate E2E delay using calibrated offset
+  int64_t estimated_network_ms = -1;
+  int64_t e2e_delay_ms = -1;
+  if (offset_initialized_) {
+    int64_t estimated_departure = rtp_ms + rtp_time_offset_ + ft.encode_ms;
+    estimated_network_ms = ft.receive_finish_ms - estimated_departure;
+    // E2E = encode + pacing + network + jitter_buffer + decode
+    e2e_delay_ms = ft.decode_finish_ms - (rtp_ms + rtp_time_offset_);
+  }
+
+  // Lazy-open CSV file
+  if (!csv_.is_open()) {
+    const char* dir = std::getenv("FRAME_DELAY_CSV_DIR");
+    if (!dir)
+      dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      std::string path = std::string(dir) + "/frame_delay.csv";
+      csv_.open(path, std::ios::out | std::ios::trunc);
+      if (csv_.is_open()) {
+        csv_ << "wall_ms,rtp_timestamp,width,height,"
+                "receive_start_ms,receive_finish_ms,"
+                "decode_start_ms,decode_finish_ms,"
+                "frame_construction_ms,jitter_buffer_ms,decode_ms,"
+                "inter_frame_delay_ms,"
+                "encode_ms,pacing_ms,"
+                "network_delay_ms,estimated_network_ms,e2e_delay_ms,"
+                "is_keyframe,timing_valid\n";
+        fprintf(stderr, "[FrameDelaySink] CSV opened: %s\n", path.c_str());
+      }
+    }
+  }
+
+  if (csv_.is_open()) {
+    csv_ << now_ms << ","
+         << frame.rtp_timestamp() << ","
+         << frame.width() << "," << frame.height() << ","
+         << ft.receive_start_ms << "," << ft.receive_finish_ms << ","
+         << ft.decode_start_ms << "," << ft.decode_finish_ms << ","
+         << ft.frame_construction_delay_ms << ","
+         << ft.jitter_buffer_ms << "," << ft.decode_ms << ","
+         << inter_frame_delay_ms << ","
+         << ft.encode_ms << "," << ft.pacing_ms << ","
+         << ft.network_delay_ms << "," << estimated_network_ms << ","
+         << e2e_delay_ms << ","
+         << (ft.is_keyframe ? 1 : 0) << ","
+         << (ft.timing_valid ? 1 : 0) << "\n";
+    if (++flush_counter_ >= 30) {
+      csv_.flush();
+      flush_counter_ = 0;
+    }
+  }
 }

@@ -1,22 +1,25 @@
 /*
  *  Copyright 2012 The WebRTC Project Authors. All rights reserved.
- *
- *  Use of this source code is governed by a BSD-style license
- *  that can be found in the LICENSE file in the root of the source
- *  tree. An additional intellectual property rights grant can be found
- *  in the file PATENTS.  All contributing project authors may
- *  be found in the AUTHORS file in the root of the source tree.
  */
 
-#include <glib.h>
 #include <gtk/gtk.h>
-#include <stdio.h>
-#include <filesystem>
-#include <system_error>
 
+#include <csignal>
+#include <cstdio>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <poll.h>
+
+#include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
-#include "absl/flags/usage.h"
+#include "api/environment/environment.h"
+#include "api/environment/environment_factory.h"
+#include "api/field_trials.h"
+#include "api/make_ref_counted.h"
 #include "api/scoped_refptr.h"
+#include "api/units/time_delta.h"
 #include "examples/peerconnection/client/conductor.h"
 #include "examples/peerconnection/client/flag_defs.h"
 #include "examples/peerconnection/client/linux/main_wnd.h"
@@ -24,167 +27,109 @@
 #include "rtc_base/physical_socket_server.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
-#include "system_wrappers/include/field_trial.h"
-#include "test/field_trial.h"
 
-#include "absl/flags/flag.h"
-
-// Define flags without the help flag (it's built into absl)
-ABSL_FLAG(std::string, experiment_mode, "real", 
-    "Experiment mode: 'real' for real-world or 'emulation' for network emulation");
-ABSL_FLAG(bool, is_sender, true, 
-    "Whether this peer is sender (true) or receiver (false)");
-ABSL_FLAG(std::string, network_interface, "",
-    "Network interface to use (empty for default)");
-ABSL_FLAG(std::string, y4m_path, "",
-    "Path to Y4M file to use as video source (empty for test pattern)");
-ABSL_FLAG(std::string, log_date, "", "Date for log folder (YYYY-MM-DD)");
-ABSL_FLAG(std::string,
-          log_root,
-          "webrtc_logs",
-          "Root directory used to store experiment logs");
-ABSL_FLAG(bool, record_remote, false,
-    "Record remote video track to an MP4 file");
-ABSL_FLAG(std::string, record_path, "remote.mp4",
-    "Destination path for remote MP4 recording");
-
-ABSL_FLAG(bool, headless, false,
-    "Whether to run in headless or not");
-
-ABSL_FLAG(std::string, server_scheme, "https",
-    "Signalling URL scheme: 'https' (external server, no port in URL) or "
-    "'http' (local signalling_server.py; --port is appended to the URL)");
-
-class CustomSocketServer : public rtc::PhysicalSocketServer {
+class CustomSocketServer : public webrtc::PhysicalSocketServer {
  public:
-  explicit CustomSocketServer(GtkMainWnd* wnd)
-      : wnd_(wnd), conductor_(NULL), client_(NULL) {}
-  virtual ~CustomSocketServer() {}
+  explicit CustomSocketServer(GtkMainWnd* wnd, bool headless, bool demo_mode)
+      : wnd_(wnd), conductor_(nullptr), client_(nullptr),
+        headless_(headless), demo_mode_(demo_mode) {}
+  ~CustomSocketServer() override {}
 
-  void SetMessageQueue(rtc::Thread* queue) override { message_queue_ = queue; }
+  void SetMessageQueue(webrtc::Thread* queue) override {
+    message_queue_ = queue;
+  }
 
   void set_client(PeerConnectionClient* client) { client_ = client; }
   void set_conductor(Conductor* conductor) { conductor_ = conductor; }
 
   bool Wait(webrtc::TimeDelta max_wait_duration, bool process_io) override {
-    while (gtk_events_pending())
-      gtk_main_iteration();
+    // Only pump GTK events if NOT in headless mode
+    if (!headless_) {
+      while (gtk_events_pending())
+        gtk_main_iteration();
+    }
 
+    // Headless demo mode: poll stdin for queries
+    if (headless_ && demo_mode_ && conductor_) {
+      struct pollfd pfd = {0, POLLIN, 0};
+      if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+        char buf[4096];
+        if (fgets(buf, sizeof(buf), stdin)) {
+          std::string query(buf);
+          // Trim trailing newline
+          while (!query.empty() && (query.back() == '\n' || query.back() == '\r'))
+            query.pop_back();
+          if (!query.empty()) {
+            printf("[DEMO] stdin query: %s\n", query.c_str());
+            fflush(stdout);
+            wnd_->AppendChatMessage("You", query);
+            // Call through MainWndCallback interface (public)
+            static_cast<MainWndCallback*>(conductor_)->OnQuerySubmitted(query);
+          }
+        }
+      }
+    }
+
+    // Service WebSocket if conductor has one
     if (conductor_) {
       conductor_->ServiceWebSocket();
     }
 
     if (!wnd_->IsWindow() && !conductor_->connection_active() &&
-        client_ != NULL && !client_->is_connected()) {
+        client_ != nullptr && !client_->is_connected()) {
       message_queue_->Quit();
     }
-    return rtc::PhysicalSocketServer::Wait(webrtc::TimeDelta::Zero(),
-                                           process_io);
+
+    webrtc::TimeDelta wait_time = headless_ ? webrtc::TimeDelta::Millis(10)
+                                            : webrtc::TimeDelta::Zero();
+    return webrtc::PhysicalSocketServer::Wait(wait_time, process_io);
   }
 
  protected:
-  rtc::Thread* message_queue_;
+  webrtc::Thread* message_queue_;
   GtkMainWnd* wnd_;
   Conductor* conductor_;
   PeerConnectionClient* client_;
+  bool headless_;
+  bool demo_mode_;
 };
 
+// Global conductor for signal handler (writes partial flow_completion.csv on SIGTERM)
+static Conductor* g_conductor_for_signal = nullptr;
+
+static void SignalHandler(int sig) {
+  if (g_conductor_for_signal) {
+    g_conductor_for_signal->WriteFlowCompletionCsv();
+  }
+  _exit(0);
+}
 
 int main(int argc, char* argv[]) {
-  // Set the program usage message
-  std::string usage_str = R"(WebRTC Peer Connection Client
-
-Basic Options:
-  --help                      Display this help message (built-in Abseil flag)
-  --server=<hostname>         Signaling server hostname (default: localhost)
-  --port=<port>              Server port (default: 8888)
-  --room_id=<id>             Room ID for the session
-
-Experiment Mode Options:
-  --experiment_mode=<mode>    Operation mode (default: real)
-                             - 'real': Normal bidirectional WebRTC
-                             - 'emulation': Network emulation mode
-
-  --is_sender=<bool>         Role in emulation mode (default: true)
-                             - true: Send video only
-                             - false: Receive video only
-
-  --network_interface=<name>  Network interface to use (required in emulation mode)
-                             Example: eth0, wlan0
-
-Video Source Options:
-  --y4m_path=<path>         Path to Y4M file to use as video source
-                            If not specified, uses test pattern
-
-Recording Options:
-  --record_remote=<bool>    Enable remote video recording (default: false)
-  --record_path=<path>      MP4 output path for remote recording (default: remote.mp4)
-
-SCTP Traffic Options:
-  --sctp_csv=<path>         Path to SCTP traffic CSV to drive traffic
-
-  --traffic_csv=<path>      Legacy alias for --sctp_csv
-
-RTP Traffic Options:
-  --rtp_csv=<path>          Path to RTP traffic CSV to configure media
-
-Example Commands:
-  # Run as video sender using Y4M file:
-  ./peerconnection_client --experiment_mode=emulation --is_sender=true \
-    --network_interface=eth0 --y4m_path=/path/to/video.y4m \
-    --sctp_csv=/path/to/traffic.csv \
-    --server=localhost --port=8888
-
-  # Run as video receiver:
-  ./peerconnection_client --experiment_mode=emulation --is_sender=false \
-      --sctp_csv=/path/to/traffic.csv \
-      --network_interface=eth0 --server=localhost --port=8888 
-)";
-
-  // Set the usage message
-  absl::SetProgramUsageMessage(usage_str);
-
   absl::ParseCommandLine(argc, argv);
 
-  gtk_init(&argc, &argv);
-  // juheon added: skip in headless mode
-  if(absl::GetFlag(FLAGS_headless)){
-    printf("headless mode, skip gtk init!\n");
-  }else{
-    printf("init gtk!\n");
+  bool headless = absl::GetFlag(FLAGS_headless);
+  bool demo_mode = absl::GetFlag(FLAGS_demo_mode);
+  std::string room_id = absl::GetFlag(FLAGS_room_id);
+  bool use_websocket = !room_id.empty();
+  
+  // Initialize GTK only if NOT in headless mode
+  if (!headless) {
     gtk_init(&argc, &argv);
-  // g_type_init API is deprecated (and does nothing) since glib 2.35.0, see:
-  // https://mail.gnome.org/archives/commits-list/2012-November/msg07809.html
-  #if !GLIB_CHECK_VERSION(2, 35, 0)
-    g_type_init();
-  #endif
-  // g_thread_init API is deprecated since glib 2.31.0, see release note:
-  // http://mail.gnome.org/archives/gnome-announce-list/2011-October/msg00041.html
-  #if !GLIB_CHECK_VERSION(2, 31, 0)
-    g_thread_init(NULL);
-  #endif
+  } else {
+    printf("[Headless] Running without GTK UI\n");
   }
 
-  // Parse command line flags
-  std::vector<char*> remaining_args = absl::ParseCommandLine(argc, argv);
+  if (use_websocket) {
+    printf("[WebSocket] Using room_id: %s\n", room_id.c_str());
+  }
 
-  const std::string forced_field_trials = absl::GetFlag(FLAGS_force_fieldtrials);
-  webrtc::field_trial::InitFieldTrialsFromString(forced_field_trials.c_str());
+  webrtc::Environment env =
+      webrtc::CreateEnvironment(std::make_unique<webrtc::FieldTrials>(
+          absl::GetFlag(FLAGS_force_fieldtrials)));
 
-  // Validate port number
+  // Abort if the user specifies a port that is outside the allowed range
   if ((absl::GetFlag(FLAGS_port) < 1) || (absl::GetFlag(FLAGS_port) > 65535)) {
     printf("Error: %i is not a valid port.\n", absl::GetFlag(FLAGS_port));
-    printf("Use --help for usage information.\n");
-    return -1;
-  }
-
-  // Validate emulation mode settings
-  std::string experiment_mode = absl::GetFlag(FLAGS_experiment_mode);
-  bool is_emulation = (experiment_mode == "emulation");
-  
-  if (is_emulation && absl::GetFlag(FLAGS_network_interface).empty()) {
-    printf("Error: Network interface (--network_interface) is required in emulation mode.\n");
-    printf("Use --help for usage information.\n");
     return -1;
   }
 
@@ -192,99 +137,93 @@ Example Commands:
   GtkMainWnd wnd(server.c_str(), absl::GetFlag(FLAGS_port),
                  absl::GetFlag(FLAGS_autoconnect),
                  absl::GetFlag(FLAGS_autocall),
-                 absl::GetFlag(FLAGS_headless));
+                 headless, demo_mode);
 
-  wnd.Create();
+  CustomSocketServer socket_server(&wnd, headless, demo_mode);
+  webrtc::AutoSocketServerThread thread(&socket_server);
 
-  CustomSocketServer socket_server(&wnd);
-  rtc::AutoSocketServerThread thread(&socket_server);
-
-  rtc::InitializeSSL();
+  webrtc::InitializeSSL();
+  
   PeerConnectionClient client;
-  auto conductor = rtc::make_ref_counted<Conductor>(&client, &wnd, absl::GetFlag(FLAGS_headless));
-  conductor->SetSignaling(absl::GetFlag(FLAGS_server_scheme), absl::GetFlag(FLAGS_port));
-
-  if (absl::GetFlag(FLAGS_record_remote)) {
-    std::string record_path = absl::GetFlag(FLAGS_record_path);
-    bool enable_recording = true;
-    if (record_path.empty()) {
-      printf("Remote recording enabled but no output path provided. Disabling.\n");
-      enable_recording = false;
-    } else {
-      std::filesystem::path output_path(record_path);
-      std::error_code ec;
-      if (output_path.has_parent_path()) {
-        std::filesystem::create_directories(output_path.parent_path(), ec);
-      }
-      if (ec) {
-        printf("Failed to create directories for %s: %s. Recording disabled.\n",
-               record_path.c_str(), ec.message().c_str());
-        enable_recording = false;
-      } else {
-        conductor->SetRecordingPath(record_path);
-      }
-    }
-    conductor->EnableRecording(enable_recording);
-  }
-
-  std::string sctp_csv = absl::GetFlag(FLAGS_sctp_csv);
-  if (sctp_csv.empty()) {
-    sctp_csv = absl::GetFlag(FLAGS_traffic_csv);
-  }
-  if (!sctp_csv.empty()) {
-    conductor->SetSctpTrafficProfile(sctp_csv);
-  }
-
-  std::string rtp_csv = absl::GetFlag(FLAGS_rtp_csv);
-  if (!rtp_csv.empty()) {
-    conductor->SetRtpTrafficProfile(rtp_csv);
-  }
-
-  conductor->SetRoomId(absl::GetFlag(FLAGS_room_id));
-
-  // Get log date - if empty, use current date
-  std::string date = absl::GetFlag(FLAGS_log_date);
-  if (date.empty()) {
-      std::time_t now = std::time(nullptr);
-      char date_buf[20];  // Increased buffer size for full timestamp
-      std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
-      date = date_buf;
-  }
-    
-  // Create log directory path
-  std::string room_id = absl::GetFlag(FLAGS_room_id);
-  bool is_sender = absl::GetFlag(FLAGS_is_sender);
-  std::string role = is_sender ? "sender" : "receiver";
-  std::filesystem::path log_root = absl::GetFlag(FLAGS_log_root);
-  if (log_root.empty()) {
-    log_root = std::filesystem::path("webrtc_logs");
-  }
-
-  std::filesystem::path log_dir =
-      log_root / std::filesystem::path(date) / room_id / role;
-
-  // Create directory
-  std::filesystem::create_directories(log_dir);
-
-  // Pass log_dir to conductor
-  conductor->SetLogDirectory(log_dir.string());
-
-  // Configure experiment mode
-  conductor->SetEmulationMode(is_emulation, is_sender);
-  conductor->SetY4mPath(absl::GetFlag(FLAGS_y4m_path));
-
-  if (is_emulation) {
-    conductor->SetNetInterface(absl::GetFlag(FLAGS_network_interface));
-  }
-
+  auto conductor = webrtc::make_ref_counted<Conductor>(env, &client, &wnd);
   socket_server.set_client(&client);
   socket_server.set_conductor(conductor.get());
 
-  conductor->Start();
+  // Register signal handler to write partial flow_completion.csv on SIGTERM/SIGINT
+  g_conductor_for_signal = conductor.get();
+  std::signal(SIGTERM, SignalHandler);
+  std::signal(SIGINT, SignalHandler);
+
+  // Configure demo mode
+  if (demo_mode) {
+    conductor->SetDemoMode(true);
+    conductor->SetModelPath(absl::GetFlag(FLAGS_model_path));
+    conductor->SetContextPath(absl::GetFlag(FLAGS_context_path));
+    conductor->SetKVCachePath(absl::GetFlag(FLAGS_kvcache_path));
+    conductor->SetContextMethod(absl::GetFlag(FLAGS_context_method));
+    std::string context_dir = absl::GetFlag(FLAGS_context_dir);
+    if (!context_dir.empty()) {
+      conductor->SetContextDir(context_dir);
+    }
+  }
+
+  // Configure conductor
+  if (use_websocket) {
+    conductor->SetRoomId(room_id);
+    conductor->SetServer(absl::GetFlag(FLAGS_signaling_server));
+    conductor->SetIsSender(absl::GetFlag(FLAGS_is_sender));
+    conductor->SetY4mPath(absl::GetFlag(FLAGS_y4m_path));
+    // Apply max bitrate: rtp.csv overrides --max_bitrate_kbps flag
+    int max_bitrate_kbps = absl::GetFlag(FLAGS_max_bitrate_kbps);
+    const std::string rtp_csv_path = absl::GetFlag(FLAGS_rtp_csv);
+    if (!rtp_csv_path.empty()) {
+      std::ifstream rtp_file(rtp_csv_path);
+      if (rtp_file.is_open()) {
+        std::string header_line, data_line;
+        std::getline(rtp_file, header_line);
+        if (std::getline(rtp_file, data_line) && !data_line.empty()) {
+          std::istringstream ss(data_line);
+          std::string field;
+          for (int col = 0; col <= 6 && std::getline(ss, field, ','); ++col) {
+            if (col == 6 && !field.empty()) {
+              int max_bps = std::stoi(field);
+              max_bitrate_kbps = max_bps / 1000;
+              fprintf(stderr, "[RTP] Max bitrate from rtp.csv: %d kbps\n",
+                      max_bitrate_kbps);
+            }
+          }
+        }
+      }
+    }
+    conductor->SetMaxBitrateKbps(max_bitrate_kbps);
+    fprintf(stderr, "[RTP] Applied max bitrate: %d kbps\n", max_bitrate_kbps);
+    conductor->SetVideoFps(absl::GetFlag(FLAGS_video_fps));
+    conductor->SetLogDirectory(absl::GetFlag(FLAGS_log_root));
+
+    // MAFS multi-flow: pass traffic config to conductor
+    std::string queries_csv = absl::GetFlag(FLAGS_queries_csv);
+    if (!queries_csv.empty()) {
+      conductor->SetTrafficConfig(queries_csv);
+      printf("[MAFS] Traffic config: %s\n", queries_csv.c_str());
+    }
+
+    // Start WebSocket signaling
+    printf("[WebSocket] Starting signaling to %s...\n",
+           absl::GetFlag(FLAGS_signaling_server).c_str());
+    conductor->StartWebSocketSignaling();
+  }
+
+  // Create window AFTER conductor registers as observer
+  wnd.Create();
+
+  // In demo mode, switch directly to streaming UI (chat panel)
+  if (demo_mode && !headless) {
+    wnd.SwitchToStreamingUI();
+  }
 
   thread.Run();
-  wnd.Destroy();
 
-  rtc::CleanupSSL();
+  wnd.Destroy();
+  webrtc::CleanupSSL();
   return 0;
 }
