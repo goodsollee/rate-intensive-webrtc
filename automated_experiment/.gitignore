@@ -1,0 +1,6 @@
+*.csv
+!config/**/*.csv
+*.log
+results/*
+webrtc_logs/*
+plots/*

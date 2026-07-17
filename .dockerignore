@@ -1,0 +1,13 @@
+.git
+out
+webrtc_logs
+third_party
+.deps
+.cache
+node_modules
+depot_tools
+*.log
+*.tmp
+*.o
+*.a
+*.so

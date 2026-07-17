@@ -1,0 +1,17 @@
+# Start a connection with specific room number:
+curl -X POST http://localhost:5000/start \
+     -H "Content-Type: application/json" \
+     -d '{"url": "localhost", "room_number": "343522", "autoconnect": true}'
+
+# Start a connection with random room number:
+curl -X POST http://localhost:5000/start \
+     -H "Content-Type: application/json" \
+     -d '{"url": "localhost"}'
+
+# Check status:
+curl http://localhost:5000/status
+
+# Stop a connection:
+curl -X POST http://localhost:5000/stop \
+     -H "Content-Type: application/json" \
+     -d '{"room_number": "3435"}'

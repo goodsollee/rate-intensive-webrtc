@@ -1,0 +1,2 @@
+Traffic name,Protocol,Pattern,File size (B/If periodic/SCTP),Periodicity (ms/If periodic/SCTP),Custom traffic traces (If custom/SCTP),Max bitrate (If RTP),Frame rate (If RTP),Video file name (If RTP),SLO (ms)
+Video,RTP,Video,,,,8000000,30,,
