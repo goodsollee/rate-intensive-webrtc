@@ -699,7 +699,7 @@ void RtpTransportControllerSend::MaybeCreateControllers() {
   initial_config_.stream_based_config = streams_config_;
 
   // Logging
-  if (!logging_folder_->empty()) {
+  if (logging_folder_.has_value() && !logging_folder_->empty()) {
     initial_config_.logging_folder = logging_folder_;
   }
 
