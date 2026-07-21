@@ -11,14 +11,8 @@
 #ifndef EXAMPLES_PEERCONNECTION_CLIENT_CONDUCTOR_H_
 #define EXAMPLES_PEERCONNECTION_CLIENT_CONDUCTOR_H_
 
-<<<<<<< ours
 #include <atomic>
-=======
-#include <curl/curl.h>
-
-#include <chrono>
 #include <cstdint>
->>>>>>> theirs
 #include <deque>
 #include <map>
 #include <memory>
@@ -89,7 +83,6 @@ class Conductor : public webrtc::PeerConnectionObserver,
   void SetMaxBitrateKbps(int kbps) { max_bitrate_kbps_ = kbps; }
   void SetVideoFps(int fps) { video_fps_ = fps; }
   void SetLogDirectory(const std::string& log_dir) { log_dir_ = log_dir; }
-<<<<<<< ours
   std::string GetLogDirectory() const { return log_dir_; }
   void SetTrafficConfig(const std::string& queries_csv) {
     queries_csv_path_ = queries_csv;
@@ -101,41 +94,6 @@ class Conductor : public webrtc::PeerConnectionObserver,
   void SetContextMethod(const std::string& method) { context_method_ = method; }
   void SetContextDir(const std::string& dir) { context_dir_ = dir; }
   void StartWebSocketSignaling();
-=======
-
-  void SetTrafficProfile(const std::string& path) { SetSctpTrafficProfile(path); }
-  void SetSctpTrafficProfile(const std::string& path) { sctp_csv_path_ = path; }
-  void SetRtpTrafficProfile(const std::string& path) { rtp_csv_path_ = path; }
-  void SetRecordingPath(const std::string& path);
-  void EnableRecording(bool enable);
-
-  // If true, skip SCTP data-channel setup even when an SCTP/traffic CSV is
-  // configured; the run drives RTP video traffic only.
-  void SetRtpOnlyMode(bool rtp_only) { rtp_only_mode_ = rtp_only; }
-
-  // If > 0, the run auto-disconnects and signals termination this many
-  // seconds after Start(). Poll with ShouldAutoTerminate(); once it
-  // returns true, call AutoTerminateNow() to tear the call down.
-  void SetTestDurationSec(int seconds) { test_duration_s_ = seconds; }
-  bool ShouldAutoTerminate() const;
-  void AutoTerminateNow();
-
-  enum class TrafficKind {kKv, kMesh, kBulkTest, kControl};
-  using PayloadHandler = std::function<void(absl::Span<const uint8_t>)>;
-
-  bool AddSctpFlow(TrafficKind kind, const std::string& label, const webrtc::DataChannelInit& cfg);
-  bool SendPayload(TrafficKind kind, absl::Span<const uint8_t> data);
-  void RegisterPayloadHandler(TrafficKind kind, PayloadHandler handler);
-  void ConfigureBufferedAmountLowCallback(
-      TrafficKind kind,
-      uint64_t threshold_bytes,
-      std::function<void()> callback);
-
-  bool IsFlowOpen(TrafficKind kind) const;
-  uint64_t BufferedAmount(TrafficKind kind) const;
-  size_t MaxSctpMessageSize(TrafficKind kind) const;
-  rtc::Thread* signaling_thread() const { return signaling_thread_.get(); }
->>>>>>> theirs
 
  protected:
   ~Conductor() override;
@@ -244,7 +202,6 @@ class Conductor : public webrtc::PeerConnectionObserver,
   int max_bitrate_kbps_ = 20000;  // 20 Mbps default
   int video_fps_ = 30;
   std::string log_dir_;
-<<<<<<< ours
   std::unique_ptr<RTCStatsCollector> stats_collector_;
   std::string signaling_server_ = "goodsol.overlinkapp.org";
   int signaling_port_ = 443;
@@ -252,20 +209,6 @@ class Conductor : public webrtc::PeerConnectionObserver,
   bool is_sender_ = false;
   bool is_initiator_ = false;
   Json::Value initial_messages_;
-=======
-  bool record_remote_video_ = false;
-  std::string record_file_path_;
-  rtc::scoped_refptr<webrtc::VideoTrackInterface> recorded_track_;
-  std::unique_ptr<webrtc_example::RemoteMediaRecorder> remote_recorder_;
-
-  std::string sctp_csv_path_;
-  std::string rtp_csv_path_;
-  std::vector<TrafficProfile> sctp_profiles_;
-  std::optional<RtpTrafficConfig> rtp_config_;
-  bool rtp_only_mode_ = false;
-  int test_duration_s_ = 0;
-  std::chrono::steady_clock::time_point start_time_;
->>>>>>> theirs
 
   //
   // DataChannel throughput test members

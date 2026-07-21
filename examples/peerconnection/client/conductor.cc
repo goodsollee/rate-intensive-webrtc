@@ -15,11 +15,8 @@
 #include <ctime>
 #include <cstdlib>
 
-<<<<<<< ours
-=======
 #include <ifaddrs.h>
 #include <stddef.h>
->>>>>>> theirs
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -270,43 +267,6 @@ Conductor::Conductor(const webrtc::Environment& env,
 
 Conductor::~Conductor() {
   RTC_DCHECK(!peer_connection_);
-<<<<<<< ours
-=======
-  CleanupCurl();
-}
-
-void Conductor::Start () {
-  start_time_ = std::chrono::steady_clock::now();
-
-  if (!rtp_only_mode_ && !sctp_csv_path_.empty()) {
-    sctp_profiles_ = LoadSctpProfiles(sctp_csv_path_);
-  } else {
-    sctp_profiles_.clear();
-  }
-
-  if (!rtp_csv_path_.empty()) {
-    rtp_config_ = LoadRtpConfig(rtp_csv_path_);
-  } else {
-    rtp_config_.reset();
-  }
-  client_->RegisterObserver(this);
-  main_wnd_->RegisterObserver(this);
->>>>>>> theirs
-}
-
-bool Conductor::ShouldAutoTerminate() const {
-  if (test_duration_s_ <= 0) {
-    return false;
-  }
-  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-      std::chrono::steady_clock::now() - start_time_);
-  return elapsed.count() >= test_duration_s_;
-}
-
-void Conductor::AutoTerminateNow() {
-  RTC_LOG(LS_INFO) << "--test_duration elapsed, disconnecting";
-  DisconnectFromCurrentPeer();
-  DisconnectFromServer();
 }
 
 bool Conductor::connection_active() const {
@@ -335,7 +295,6 @@ bool Conductor::InitializePeerConnection() {
 
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-<<<<<<< ours
   deps.video_encoder_factory =
       std::make_unique<webrtc::VideoEncoderFactoryTemplate<
           webrtc::LibvpxVp8EncoderTemplateAdapter,
@@ -348,23 +307,6 @@ bool Conductor::InitializePeerConnection() {
           webrtc::LibvpxVp9DecoderTemplateAdapter,
           webrtc::OpenH264DecoderTemplateAdapter,
           webrtc::Dav1dDecoderTemplateAdapter>>();
-
-  // Don't create ADM - this will work without audio devices
-  // Same approach as Modified WebRTC
-  deps.audio_mixer = nullptr;
-  deps.adm = nullptr;
-  deps.audio_processing_builder = nullptr;
-
-=======
-
-  deps.video_encoder_factory =
-      std::make_unique<webrtc::VideoEncoderFactoryTemplate<
-          webrtc::LibvpxVp8EncoderTemplateAdapter,
-          webrtc::LibvpxVp9EncoderTemplateAdapter>>();
-  deps.video_decoder_factory =
-      std::make_unique<webrtc::VideoDecoderFactoryTemplate<
-          webrtc::LibvpxVp8DecoderTemplateAdapter,
-          webrtc::LibvpxVp9DecoderTemplateAdapter>>();
 
   // Audio is never sent/received by this client (no audio track is ever
   // added; see AddTracks() below). Leaving deps.adm null doesn't avoid
@@ -408,7 +350,6 @@ bool Conductor::InitializePeerConnection() {
     deps.network_manager = std::move(network_manager);
   }
 
->>>>>>> theirs
   webrtc::EnableMedia(deps);
   
   peer_connection_factory_ =
@@ -498,19 +439,10 @@ bool Conductor::CreatePeerConnection() {
 }
 
 void Conductor::DeletePeerConnection() {
-<<<<<<< ours
   // Stop stats collection before closing peer connection
   if (stats_collector_) {
     stats_collector_->Stop();
     stats_collector_.reset();
-=======
-  if (stats_collector_)
-    stats_collector_->Stop();
-
-  if (recorded_track_) {
-    recorded_track_->RemoveSink(remote_recorder_.get());
-    recorded_track_ = nullptr;
->>>>>>> theirs
   }
 
   // Clean up demo mode channels
@@ -825,26 +757,7 @@ void Conductor::OnMessageFromPeer(int peer_id, const std::string& message) {
       RTC_LOG(LS_WARNING) << "Failed to apply the received candidate";
       return;
     }
-<<<<<<< ours
     RTC_LOG(LS_INFO) << " Received candidate :" << message;
-=======
-    RTC_LOG(LS_INFO) << "Added ICE candidate";
-
-
-    // Set high quality bitrate for 4K
-    webrtc::BitrateSettings bitrate_settings;
-    const int pc_max_bitrate = PeerConnectionMaxBitrateBps();
-    const int start_bitrate = std::min(pc_max_bitrate, 30000000);
-    const int min_bitrate = std::min(pc_max_bitrate,
-                                     std::min(start_bitrate, 200000));
-    bitrate_settings.min_bitrate_bps = min_bitrate;
-    bitrate_settings.start_bitrate_bps = start_bitrate;
-    bitrate_settings.max_bitrate_bps = pc_max_bitrate;
-    peer_connection_->SetBitrate(bitrate_settings);
-
-
-    return;
->>>>>>> theirs
   }
 }
 
@@ -912,185 +825,6 @@ void Conductor::ConnectToPeer(int peer_id) {
       AddTracks();
     }
 
-<<<<<<< ours
-=======
-  if (!InitializeCurl()) {
-    RTC_LOG(LS_ERROR) << "Failed to initialize CURL";
-    return;
-  }
-
-  CURLcode res;
-  std::string read_buffer;
-
-  if(curl_) {
-    curl_easy_setopt(curl_, CURLOPT_URL, join_url.c_str());
-    curl_easy_setopt(curl_, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &read_buffer);
-
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "User-Agent: peerconnection-client/1.0");
-    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
-
-    Json::Value join_payload;
-    join_payload["room_id"] = room_id_;
-    Json::StreamWriterBuilder writer;
-    std::string payload = Json::writeString(writer, join_payload);
-    curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, payload.length());
-
-    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl_, CURLOPT_VERBOSE, 1L);
-
-    // Skip TLS verification on the join request, mirroring the message POST
-    // below. The signalling server may use a self-signed or expired cert.
-    curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
-
-    RTC_LOG(LS_INFO) << "Server Response: " << read_buffer;
-
-    res = curl_easy_perform(curl_);
-    if(res != CURLE_OK) {
-      RTC_LOG(LS_ERROR) << "curl_easy_perform() failed: " << curl_easy_strerror(res);
-      curl_slist_free_all(headers);
-      curl_easy_cleanup(curl_);
-      curl_ = nullptr;
-      return;
-    }
-    curl_slist_free_all(headers);
-    //curl_easy_cleanup(curl_);
-  }
-
-  /////
-  // Parse server response
-  Json::Value response;
-  Json::CharReaderBuilder reader;
-  std::istringstream response_stream(read_buffer);
-  std::string parse_errors;
-
-  if (!Json::parseFromStream(reader, response_stream, &response, &parse_errors)) {
-    RTC_LOG(LS_ERROR) << "Failed to parse join response: " << parse_errors;
-    return;
-  }
-
-  if (response["result"].asString() != "SUCCESS") {
-    RTC_LOG(LS_ERROR) << "Join failed: " << response["result"].asString();
-    return;
-  }
-
-  // Extract connection parameters
-  Json::Value params = response["params"];
-  is_initiator_ = params["is_initiator"].asString() == "true";
-  std::string wss_url = params["wss_url"].asString();
-  client_id_ = params["client_id"].asString();
-  room_id_ = params["room_id"].asString();
-
-  post_url_ = base_url + "/message/" + room_id_ + "/" + client_id_;
-  
-  // Store initial messages if any
-  if (params.isMember("messages") && params["messages"].isArray()) {
-    initial_messages_ = params["messages"];
-  }
-
-  // Connect to WebSocket server
-  ws_client_ = std::make_unique<WebSocketClient>();
-  ws_client_->SetMessageCallback(
-      std::bind(&Conductor::OnWebSocketMessage, this, std::placeholders::_1));
-  ws_client_->SetConnectionCallback(
-      std::bind(&Conductor::OnWebSocketConnection, this, std::placeholders::_1));
-
-  RTC_LOG(LS_INFO) << "Connecting to WebSocket server: " << wss_url << " is_initiator: " << is_initiator_;
-  ws_client_->Connect(wss_url);
-}
-
-void Conductor::OnWebSocketMessage(const std::string& message) {
-  Json::CharReaderBuilder reader;
-  Json::Value json_message;
-  std::string parse_errors;
-  std::istringstream message_stream(message);
-  
-  if (!Json::parseFromStream(reader, message_stream, &json_message, &parse_errors)) {
-    RTC_LOG(LS_WARNING) << "Failed to parse WebSocket message: " << parse_errors;
-    return;
-  }
-
-  std::string msg_data;
-  if (json_message.isMember("msg")) {
-    // Unwrap the message from the WebSocket envelope
-    msg_data = json_message["msg"].asString();
-  } else {
-    msg_data = message;
-  }
-
-  RTC_LOG(LS_INFO) << "WebSocket msg received "<<msg_data;
-  // Process the signaling message
-  OnMessageFromPeer(-1, msg_data);
-}
-
-
-void Conductor::OnWebSocketConnection(bool connected) {
-  if (connected) {
-    RTC_LOG(LS_INFO) << "WebSocket connected, registering...";
-
-    // Send registration message
-    Json::Value reg_message;
-    reg_message["cmd"] = "register";
-    reg_message["roomid"] = room_id_;
-    reg_message["clientid"] = client_id_;
-
-    Json::StreamWriterBuilder writer;
-    std::string message = Json::writeString(writer, reg_message);
-    ws_client_->SendMessage(message);
-
-    // Process any initial messages
-    if (!initial_messages_.empty()) {
-      for (const auto& msg : initial_messages_) {
-        OnMessageFromPeer(-1, msg.asString());
-      }
-      initial_messages_.clear();
-    }
-
-    // If we're the initiator, create and send an offer
-    if (is_initiator_) {
-      if (InitializePeerConnection()) {
-        peer_connection_->CreateOffer(
-            this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
-      } else {
-        RTC_LOG(LS_ERROR) << "Failed to initialize PeerConnection";
-      }
-    }
-  } else {
-    RTC_LOG(LS_WARNING) << "WebSocket disconnected";
-    main_wnd_->MessageBox("Error", "WebSocket connection failed", true);
-  }
-}
-
-void Conductor::DisconnectFromServer() {
-  if (ws_client_) {
-    // Send bye message
-    Json::Value bye_message;
-    bye_message["type"] = "bye";
-    SendMessage(rtc::JsonValueToString(bye_message));
-    
-    ws_client_->Close();
-    ws_client_.reset();
-  }
-}
-
-void Conductor::ConnectToPeer(int peer_id) {
-  RTC_DCHECK(peer_id_ == -1);
-  RTC_DCHECK(peer_id != -1);
-
-  if (peer_connection_.get()) {
-    main_wnd_->MessageBox(
-        "Error", "We only support connecting to one peer at a time", true);
-    return;
-  }
-
-  if (InitializePeerConnection()) {
-    peer_id_ = peer_id;
->>>>>>> theirs
     peer_connection_->CreateOffer(
         this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
   } else {
@@ -1129,53 +863,11 @@ void Conductor::AddTracks() {
     fflush(stdout);
   }
 
-<<<<<<< ours
   // Try Y4M file if specified
   if (!y4m_path_.empty()) {
     printf("[VIDEO] Using Y4M file: %s\n", y4m_path_.c_str());
     fflush(stdout);
-=======
-  bool use_camera = true;
-  const int target_frame_rate = TargetFrameRateFps();
-  const int encoder_max_bitrate_bps = EncoderMaxBitrateBps();
 
-  std::string video_source_path = y4m_path_;
-  if (video_source_path.empty() && rtp_config_ &&
-      !rtp_config_->video_file_name.empty()) {
-    video_source_path = rtp_config_->video_file_name;
-  }
-
-  // Before adding any tracks, create transceiver with RTP extensions configured
-  webrtc::RtpTransceiverInit init;
-  init.direction = webrtc::RtpTransceiverDirection::kSendRecv;
-  init.stream_ids.push_back(kStreamId);
-
-  webrtc::RtpEncodingParameters svc;
-  svc.scalability_mode = "L1T1";  // pick the mode you need
-  svc.max_bitrate_bps = encoder_max_bitrate_bps;
-  svc.max_framerate = target_frame_rate;
-  svc.scale_resolution_down_by = 1.0;
-  init.send_encodings.push_back(svc);
-
-  // Add transceiver first to configure extensions
-  auto transceiver_result = peer_connection_->AddTransceiver(
-      cricket::MEDIA_TYPE_VIDEO,
-      init);
-
-  if (transceiver_result.ok()) {
-    auto transceiver = transceiver_result.value();
-
-    auto caps = peer_connection_factory_->GetRtpSenderCapabilities(
-      cricket::MEDIA_TYPE_VIDEO);
-    std::vector<webrtc::RtpCodecCapability> vp8_prefs;
-    for (const auto& c : caps.codecs) {
-      if (absl::EqualsIgnoreCase(c.name, cricket::kVp8CodecName)) {
-        vp8_prefs.push_back(c);
-      }
-    }
-    transceiver->SetCodecPreferences(vp8_prefs);
->>>>>>> theirs
-    
     std::unique_ptr<webrtc::test::Y4mFrameGenerator> frame_generator(
         new webrtc::test::Y4mFrameGenerator(
             y4m_path_,

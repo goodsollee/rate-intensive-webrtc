@@ -229,15 +229,7 @@ void GtkMainWnd::MessageBox(const char* caption,
                             const char* text,
                             bool is_error) {
   if (headless_) {
-<<<<<<< ours
     printf("[%s] %s: %s\n", is_error ? "ERROR" : "INFO", caption, text);
-=======
-    if (is_error) {
-      RTC_LOG(LS_ERROR) << "MessageBox(" << caption << "): " << text;
-    } else {
-      RTC_LOG(LS_INFO) << "MessageBox(" << caption << "): " << text;
-    }
->>>>>>> theirs
     return;
   }
   GtkWidget* dialog = gtk_message_dialog_new(
