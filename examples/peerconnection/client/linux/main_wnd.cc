@@ -209,7 +209,9 @@ GtkMainWnd::GtkMainWnd(const char* server,
 }
 
 GtkMainWnd::~GtkMainWnd() {
-  RTC_DCHECK(!IsWindow());
+  // IsWindow() is hardcoded to always return true in headless mode (see
+  // below), so this invariant only applies to the real GTK window case.
+  RTC_DCHECK(headless_ || !IsWindow());
 }
 
 void GtkMainWnd::RegisterObserver(MainWndCallback* callback) {
@@ -227,7 +229,15 @@ void GtkMainWnd::MessageBox(const char* caption,
                             const char* text,
                             bool is_error) {
   if (headless_) {
+<<<<<<< ours
     printf("[%s] %s: %s\n", is_error ? "ERROR" : "INFO", caption, text);
+=======
+    if (is_error) {
+      RTC_LOG(LS_ERROR) << "MessageBox(" << caption << "): " << text;
+    } else {
+      RTC_LOG(LS_INFO) << "MessageBox(" << caption << "): " << text;
+    }
+>>>>>>> theirs
     return;
   }
   GtkWidget* dialog = gtk_message_dialog_new(

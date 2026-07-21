@@ -59,10 +59,27 @@ Experiments target **Linux** (the emulator uses network namespaces and `tc`).
 
 2. Generate the build directory and build the client:
    ```bash
-   gn gen out/Default
-   ninja -C out/Default peerconnection_client
+   gn gen out/Release --args="is_debug=false dcheck_always_on=true"
+   ninja -C out/Release peerconnection_client
    ```
-   The binary is produced at `out/Default/peerconnection_client`.
+   The binary is produced at `out/Release/peerconnection_client`.
+
+   > **Use a release build, not `gn gen out/Default` with no `--args`.** With no
+   > `--args`, GN defaults to `is_debug=true` (`-O0`, full DCHECKs), and the VP8
+   > software encoder can then fail to keep up with real-time 1080p30 encoding —
+   > this was root-caused to a spurious CPU/encode-time overuse adaptation
+   > (resolution downscale / bitrate step-down / framerate drop, all independent
+   > of network conditions) that only shows up in debug builds. Measured on a
+   > 14-core i9-10940X: `-O0` debug encode_ms ≈ 34–43ms/frame at 1080p (over the
+   > 33ms/frame budget for 30fps); `-O2` release encode_ms ≈ 19.5ms/frame (well
+   > under budget), and the spurious adaptation never triggers.
+   > `dcheck_always_on=true` keeps `RTC_DCHECK`/`RTC_CHECK` assertions live in the
+   > custom fork code (`examples/peerconnection/client/`, `automated_experiment/`,
+   > `analysis/`) at release speed, so bugs there still fail loudly instead of
+   > silently producing wrong experiment data. If you only ever touch the RAN
+   > side (`open-ran-emulator`) and not this fork's code, the DCHECK loss from a
+   > plain `is_debug=false` build is low-risk — but there is no reason not to
+   > keep `dcheck_always_on=true` either way, since it costs little at `-O2`.
 
 ## Signalling server
 

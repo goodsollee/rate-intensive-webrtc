@@ -69,6 +69,7 @@ ABSL_FLAG(std::string,
           "",
           "CSV file describing RTP traffic profile");
 
+<<<<<<< ours
 // --- Research testbed flags (transplanted client) -------------------------
 // Definitions for flags the transplanted conductor.cc / main.cc /
 // main_headless.cc reference via ABSL_DECLARE_FLAG or directly.
@@ -111,5 +112,14 @@ ABSL_FLAG(std::string,
           context_dir,
           "",
           "Directory with context documents 00.txt/01.txt/... (demo mode).");
+=======
+ABSL_FLAG(bool,
+          verbose_log,
+          false,
+          "Enable INFO-level WebRTC internal logging to stderr. Release builds "
+          "default to no logging (rtc_base/logging.cc: LS_NONE); this flips it "
+          "on at runtime via LogMessage::LogToDebug without needing a debug "
+          "(-O0) build.");
+>>>>>>> theirs
 
 #endif  // EXAMPLES_PEERCONNECTION_CLIENT_FLAG_DEFS_H_

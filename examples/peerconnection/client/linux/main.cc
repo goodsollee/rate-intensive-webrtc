@@ -24,9 +24,19 @@
 #include "examples/peerconnection/client/flag_defs.h"
 #include "examples/peerconnection/client/linux/main_wnd.h"
 #include "examples/peerconnection/client/peer_connection_client.h"
+#include "rtc_base/logging.h"
 #include "rtc_base/physical_socket_server.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
+
+ABSL_FLAG(int, test_duration, 0,
+    "If > 0, automatically hang up and quit this many seconds after "
+    "Start() (headless automation). 0 disables auto-termination; the "
+    "process then runs until killed.");
+
+ABSL_FLAG(bool, rtp_only_mode, false,
+    "If true, skip SCTP data-channel setup even when --sctp_csv/"
+    "--traffic_csv is set, so the run drives RTP video traffic only.");
 
 class CustomSocketServer : public rtc::PhysicalSocketServer {
  public:
@@ -75,8 +85,25 @@ class CustomSocketServer : public rtc::PhysicalSocketServer {
       conductor_->ServiceWebSocket();
     }
 
+<<<<<<< ours
     if (!wnd_->IsWindow() && !conductor_->connection_active() &&
         client_ != nullptr && !client_->is_connected()) {
+=======
+    // --test_duration: headless runs never satisfy the IsWindow() check
+    // below (it's forced true in headless mode), so without this the
+    // process would just run until externally killed. Trigger teardown
+    // once, then let the existing connection_active() check below quit
+    // the loop once DisconnectFromCurrentPeer() finishes.
+    if (conductor_ && !auto_terminate_triggered_ &&
+        conductor_->ShouldAutoTerminate()) {
+      auto_terminate_triggered_ = true;
+      conductor_->AutoTerminateNow();
+    }
+
+    if (((!wnd_->IsWindow() && client_ != NULL && !client_->is_connected()) ||
+         auto_terminate_triggered_) &&
+        !conductor_->connection_active()) {
+>>>>>>> theirs
       message_queue_->Quit();
     }
 
@@ -90,23 +117,90 @@ class CustomSocketServer : public rtc::PhysicalSocketServer {
   GtkMainWnd* wnd_;
   Conductor* conductor_;
   PeerConnectionClient* client_;
+<<<<<<< ours
   bool headless_;
   bool demo_mode_;
+=======
+  bool auto_terminate_triggered_ = false;
+>>>>>>> theirs
 };
 
 // Global conductor for signal handler (writes partial flow_completion.csv on SIGTERM)
 static Conductor* g_conductor_for_signal = nullptr;
 
+<<<<<<< ours
 static void SignalHandler(int sig) {
   if (g_conductor_for_signal) {
     g_conductor_for_signal->WriteFlowCompletionCsv();
   }
   _exit(0);
 }
+=======
+int main(int argc, char* argv[]) {
+  // Set the program usage message
+  std::string usage_str = R"(WebRTC Peer Connection Client
+
+Basic Options:
+  --help                      Display this help message (built-in Abseil flag)
+  --server=<hostname>         Signaling server hostname (default: localhost)
+  --port=<port>              Server port (default: 8888)
+  --room_id=<id>             Room ID for the session
+
+Experiment Mode Options:
+  --experiment_mode=<mode>    Operation mode (default: real)
+                             - 'real': Normal bidirectional WebRTC
+                             - 'emulation': Network emulation mode
+
+  --is_sender=<bool>         Role in emulation mode (default: true)
+                             - true: Send video only
+                             - false: Receive video only
+
+  --network_interface=<name>  Network interface to use (required in emulation mode)
+                             Example: eth0, wlan0
+
+Video Source Options:
+  --y4m_path=<path>         Path to Y4M file to use as video source
+                            If not specified, uses test pattern
+
+Recording Options:
+  --record_remote=<bool>    Enable remote video recording (default: false)
+  --record_path=<path>      MP4 output path for remote recording (default: remote.mp4)
+
+SCTP Traffic Options:
+  --sctp_csv=<path>         Path to SCTP traffic CSV to drive traffic
+
+  --traffic_csv=<path>      Legacy alias for --sctp_csv
+
+RTP Traffic Options:
+  --rtp_csv=<path>          Path to RTP traffic CSV to configure media
+  --rtp_only_mode=<bool>    Skip SCTP data-channel setup; RTP video only
+                            (default: false)
+
+Automation Options:
+  --test_duration=<secs>    Auto hang-up and quit this many seconds after
+                            start; 0 disables (default: 0)
+
+Example Commands:
+  # Run as video sender using Y4M file:
+  ./peerconnection_client --experiment_mode=emulation --is_sender=true \
+    --network_interface=eth0 --y4m_path=/path/to/video.y4m \
+    --sctp_csv=/path/to/traffic.csv \
+    --server=localhost --port=8888
+
+  # Run as video receiver:
+  ./peerconnection_client --experiment_mode=emulation --is_sender=false \
+      --sctp_csv=/path/to/traffic.csv \
+      --network_interface=eth0 --server=localhost --port=8888 
+)";
+
+  // Set the usage message
+  absl::SetProgramUsageMessage(usage_str);
+>>>>>>> theirs
 
 int main(int argc, char* argv[]) {
   absl::ParseCommandLine(argc, argv);
 
+<<<<<<< ours
   bool headless = absl::GetFlag(FLAGS_headless);
   bool demo_mode = absl::GetFlag(FLAGS_demo_mode);
   std::string room_id = absl::GetFlag(FLAGS_room_id);
@@ -114,6 +208,13 @@ int main(int argc, char* argv[]) {
   
   // Initialize GTK only if NOT in headless mode
   if (!headless) {
+=======
+  // juheon added: skip in headless mode
+  if(absl::GetFlag(FLAGS_headless)){
+    printf("headless mode, skip gtk init!\n");
+  }else{
+    printf("init gtk!\n");
+>>>>>>> theirs
     gtk_init(&argc, &argv);
   } else {
     printf("[Headless] Running without GTK UI\n");
@@ -127,7 +228,17 @@ int main(int argc, char* argv[]) {
       webrtc::CreateEnvironment(std::make_unique<webrtc::FieldTrials>(
           absl::GetFlag(FLAGS_force_fieldtrials)));
 
+<<<<<<< ours
   // Abort if the user specifies a port that is outside the allowed range
+=======
+  if (absl::GetFlag(FLAGS_verbose_log)) {
+    rtc::LogMessage::LogToDebug(rtc::LS_INFO);
+    rtc::LogMessage::LogTimestamps();
+    rtc::LogMessage::SetLogToStderr(true);
+  }
+
+  // Validate port number
+>>>>>>> theirs
   if ((absl::GetFlag(FLAGS_port) < 1) || (absl::GetFlag(FLAGS_port) > 65535)) {
     printf("Error: %i is not a valid port.\n", absl::GetFlag(FLAGS_port));
     return -1;
@@ -167,6 +278,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
+<<<<<<< ours
   // Configure conductor
   if (use_websocket) {
     conductor->SetRoomId(room_id);
@@ -206,6 +318,12 @@ int main(int argc, char* argv[]) {
       conductor->SetTrafficConfig(queries_csv);
       printf("[MAFS] Traffic config: %s\n", queries_csv.c_str());
     }
+=======
+  conductor->SetRtpOnlyMode(absl::GetFlag(FLAGS_rtp_only_mode));
+  conductor->SetTestDurationSec(absl::GetFlag(FLAGS_test_duration));
+
+  conductor->SetRoomId(absl::GetFlag(FLAGS_room_id));
+>>>>>>> theirs
 
     // Start WebSocket signaling
     printf("[WebSocket] Starting signaling to %s...\n",

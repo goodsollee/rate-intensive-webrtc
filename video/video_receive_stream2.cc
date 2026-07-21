@@ -393,6 +393,36 @@ void VideoReceiveStream2::Start() {
     RTC_DCHECK_RUN_ON(&packet_sequence_checker_);
     rtp_video_stream_receiver_.StartReceive();
   }
+
+  // --- Testbed knob: one-shot forced keyframe request at a fixed offset -----
+  // If FORCE_PLI_AT_MS=<ms-from-stream-Start> is set, schedule a single
+  // RequestKeyFrame() at that time. Intended to be timed to a bandwidth-dip
+  // end so the sender emits a fresh keyframe the instant the link recovers,
+  // instead of thrashing NACK/RTX during the dip and only recovering once the
+  // packet buffer overflows. Set the env only on the receiver; unset = no-op.
+  if (const char* force_pli_ms = getenv("FORCE_PLI_AT_MS")) {
+    int64_t delay_ms = atoll(force_pli_ms);
+    if (delay_ms >= 0) {
+      RTC_LOG(LS_WARNING) << "[testbed] FORCE_PLI_AT_MS=" << delay_ms
+                          << ": scheduling one-shot keyframe request.";
+      call_->worker_thread()->PostDelayedTask(
+          SafeTask(task_safety_.flag(),
+                   [this] {
+                     // packet_sequence_checker_ is bound to the worker thread
+                     // here (same pattern as the decode->worker repost), which
+                     // is what RequestKeyFrame() requires.
+                     RTC_DCHECK_RUN_ON(&packet_sequence_checker_);
+                     Timestamp now = env_.clock().CurrentTime();
+                     RTC_LOG(LS_WARNING)
+                         << "[testbed] FORCE_PLI firing RequestKeyFrame at "
+                         << now.ms() << " ms (monotonic).";
+                     RequestKeyFrame(now);
+                   }),
+          TimeDelta::Millis(delay_ms));
+    } else {
+      RTC_LOG(LS_ERROR) << "[testbed] FORCE_PLI_AT_MS invalid: " << force_pli_ms;
+    }
+  }
 }
 
 void VideoReceiveStream2::Stop() {
@@ -894,9 +924,6 @@ VideoReceiveStream2::HandleEncodedFrameOnDecodeQueue(
       force_request_key_frame = true;
   } else if (!frame_decoded_ || !keyframe_required || keyframe_request_is_due) {
     keyframe_required = true;
-    // TODO(philipel): Remove this keyframe request when downstream project
-    //                 has been fixed.
-    force_request_key_frame = true;
   }
 
   return DecodeFrameResult{
