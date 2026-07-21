@@ -863,6 +863,7 @@ rtc_library("sctp_traffic") {
       "../test:video_test_common",
       "//third_party/abseil-cpp/absl/flags:flag",
       "//third_party/abseil-cpp/absl/flags:parse",
+      "//third_party/abseil-cpp/absl/flags:usage",
       "//third_party/libyuv",
     ]
   }
@@ -1004,6 +1005,7 @@ rtc_library("sctp_traffic") {
       "../test:video_test_common",
       "//third_party/abseil-cpp/absl/flags:flag",
       "//third_party/abseil-cpp/absl/flags:parse",
+      "//third_party/abseil-cpp/absl/flags:usage",
       "//third_party/libyuv",
     ]
   }

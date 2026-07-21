@@ -79,6 +79,8 @@ class Conductor : public webrtc::PeerConnectionObserver,
   void SetServer(const std::string& server) { signaling_server_ = server; }
   void SetPort(int port) { signaling_port_ = port; }
   void SetIsSender(bool is_sender) { is_sender_ = is_sender; }
+  void SetEmulationMode(bool is_emulation, bool is_sender);
+  void SetNetInterface(std::string interface_name);
   void SetY4mPath(const std::string& path) { y4m_path_ = path; }
   void SetMaxBitrateKbps(int kbps) { max_bitrate_kbps_ = kbps; }
   void SetVideoFps(int fps) { video_fps_ = fps; }
@@ -198,6 +200,8 @@ class Conductor : public webrtc::PeerConnectionObserver,
   //
   std::unique_ptr<WebSocketClient> ws_client_;
   std::string room_id_;
+  std::string net_interface_;
+  bool is_emulation_ = false;
   std::string y4m_path_;
   int max_bitrate_kbps_ = 20000;  // 20 Mbps default
   int video_fps_ = 30;
