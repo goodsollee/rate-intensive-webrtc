@@ -81,6 +81,32 @@ Experiments target **Linux** (the emulator uses network namespaces and `tc`).
    > plain `is_debug=false` build is low-risk — but there is no reason not to
    > keep `dcheck_always_on=true` either way, since it costs little at `-O2`.
 
+   > **Two more one-time fixes are needed on a fresh `gclient sync` for this
+   > branch specifically** (both live under `third_party/`, which is
+   > gitignored, so they don't survive in the git history and must be redone
+   > on every fresh checkout):
+   > 1. `third_party/llamacpp-kvcache/llamacpp.gni` doesn't exist — the real
+   >    llama.cpp KV-cache integration was never vendored into this checkout.
+   >    `pc/BUILD.gn` imports it unconditionally. Create a stub:
+   >    ```gn
+   >    declare_args() {
+   >      enable_llama_inference = false
+   >    }
+   >    ```
+   > 2. `src/third_party/zstd/src` in `DEPS` is gated on `checkout_android`, so
+   >    a normal `gclient sync` skips it even though the demo-mode kvzip path
+   >    needs it unconditionally. Clone it manually at the pinned revision:
+   >    ```bash
+   >    git clone https://chromium.googlesource.com/external/github.com/facebook/zstd.git \
+   >        third_party/zstd/src
+   >    git -C third_party/zstd/src checkout 7fb5347e88f10472226c9aa1962a148e55d8c480
+   >    ```
+   >    That revision of zstd added `ZSTD_splitBlock` (in
+   >    `lib/compress/zstd_preSplit.c`), which `third_party/zstd/BUILD.gn`'s
+   >    `"compress"` `source_set` doesn't list (it predates that split).
+   >    Add `"src/lib/compress/zstd_preSplit.c"` and `.h` to that `sources`
+   >    list or the final link fails with `undefined symbol: ZSTD_splitBlock`.
+
 ## Signalling server
 
 The client uses an AppRTC-style signalling flow: an HTTP `POST /join/<room>` and
