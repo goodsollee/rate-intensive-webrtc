@@ -220,6 +220,13 @@ DelayBasedBwe::Result DelayBasedBwe::IncomingPacketFeedbackVector(
   }
   // TWCC feedback complete → BUR coordinator interval trigger [V13]
   {
+    // `acked_bitrate` is GoogCc's AcknowledgedBitrateEstimator: bytes that
+    // actually arrived, windowed on their TWCC receive timestamps. The
+    // coordinator prefers it over its own byte counter below, which measured
+    // 1.50x the rate the receiver counted (see GetRtpRecvRateBps). Stamping
+    // that counter with the batch's last receive time instead of the feedback
+    // arrival time was tried and reverted — it made the fixed-window divisor
+    // disagree with the sample spacing and moved 1.03x to 1.17x.
     int64_t total_bytes = 0;
     for (const auto& pkt : packet_feedback_vector) {
       total_bytes += pkt.sent_packet.size.bytes();
@@ -228,7 +235,8 @@ DelayBasedBwe::Result DelayBasedBwe::IncomingPacketFeedbackVector(
     // that has no producer anywhere in this tree; pass the coordinator's
     // documented default (-1, "unknown") which yields identical behavior.
     RtpSctpCoordinator::OnTwccFeedbackComplete(
-        total_bytes, msg.feedback_time.ms(), /*max_data_rate_bps=*/-1);
+        total_bytes, msg.feedback_time.ms(), /*max_data_rate_bps=*/-1,
+        acked_bitrate ? acked_bitrate->bps() : 0);
   }
 
   rate_control_.SetInApplicationLimitedRegion(in_alr);
@@ -309,13 +317,16 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
 
   // Pudica: per-packet OWD feedback for frame-level BUR measurement
   if (packet_feedback.receive_time.IsFinite()) {
-    // Detect frame boundary: calculated_deltas means a new send-time group
-    // (frame) was completed. The current packet starts the next frame.
     // Pudica probes are identified by their probe_cluster_id (set in PacingController).
     bool is_probe = (packet_feedback.sent_packet.pacing_info.probe_cluster_id
                      == PacingController::kPudicaProbeClusterId);
-    // Frame last = when InterArrivalDelta computed deltas (previous frame ended)
-    bool is_frame_last = calculated_deltas;
+    // Frame boundary comes from the RTP marker bit (tagged in
+    // TransportFeedbackAdapter::AddPacket), i.e. THIS packet is the frame's
+    // last packet. It used to be `calculated_deltas`, which is GCC's 5 ms
+    // send-time grouping — that made a "frame" a 5 ms fragment (measured 46.7
+    // boundaries/s against a real 30 fps), split Eq.1's D across fragments and
+    // scattered the 4 probes of one agnostic period over arbitrary fragments.
+    bool is_frame_last = packet_feedback.sent_packet.frame_last;
     RtpSctpCoordinator::OnPudicaPacketFeedback(
         packet_feedback.sent_packet.sequence_number,
         packet_feedback.sent_packet.send_time.us(),

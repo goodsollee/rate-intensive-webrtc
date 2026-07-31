@@ -87,6 +87,12 @@ struct CoordinatorFeatures {
   bool measure_only = false;         // BUR_MEASURE_ONLY: measure BUR but skip rate control
   int pudica_num_probes = 4;         // Number of probe packets per frame gap
   double pudica_gamma_rho = 1.25;    // Adaptive pacing multiplier γ_ρ
+  bool pudica_intra_frame_pacing = true;  // Eq.2: spread a frame's packets over
+                                          // L/ρ instead of burst-then-gap. Off
+                                          // reverts to the gap-only pacer.
+  bool pudica_recvrate_fixed_window = false;  // Divide acked bytes by the fixed
+                                              // prune window, not the observed
+                                              // sample span
 
   // SCTP frame-burst probing: burst SCTP at frame boundary for BUR measurement
   bool sctp_burst_probe = false;     // SCTP_BURST_PROBE: frame-sync burst pacing
@@ -227,7 +233,8 @@ class RtpSctpCoordinator {
   // This is the interval completion trigger (~50-100ms)
   static void OnTwccFeedbackComplete(int64_t rtp_bytes_acked,
                                       int64_t feedback_time_ms,
-                                      int64_t max_data_rate_bps = -1);
+                                      int64_t max_data_rate_bps = -1,
+                                      int64_t acked_bitrate_bps = 0);
 
   // ===== Pudica: per-packet OWD feedback (called from DelayBasedBwe) =====
   static void OnPudicaPacketFeedback(int64_t transport_seq,
@@ -436,6 +443,10 @@ class RtpSctpCoordinator {
   // === RTP ACK rate sliding window ===
   std::deque<AckSample> rtp_ack_samples_;
   int64_t rtp_samples_total_bytes_ = 0;
+  // GoogCc's AcknowledgedBitrateEstimator output — the delivered RTP rate,
+  // windowed on TWCC receive timestamps. Preferred over rtp_ack_samples_ above,
+  // which this fork rolled by hand; see GetRtpRecvRateBps. 0 until GCC has one.
+  std::atomic<int64_t> rtp_acked_bitrate_bps_{0};
 
   // === Throughput tracking ===
   int64_t receiving_rate_bps_ = 0;
@@ -475,7 +486,6 @@ class RtpSctpCoordinator {
   // Per-frame OWD tracking (all times in microseconds for sub-ms precision)
   struct PudicaFrameInfo {
     int64_t first_send_us = -1;   // first packet send time (μs)
-    int64_t last_send_us = -1;    // last packet send time (μs) — for SACK H_i clamping
     int64_t last_recv_us = -1;    // last packet receive time (μs)
     int frame_packets = 0;
   };
@@ -485,6 +495,12 @@ class RtpSctpCoordinator {
   double pudica_d_min_us_ = -1.0;
   std::deque<std::pair<int64_t, double>> pudica_owd_window_;  // (time_us, owd_us)
   static constexpr int64_t kPudicaDminWindowUs = 10'000'000;  // 10 seconds in μs
+  // A frame's packets all leave within L/rho <= L. Past this many frame
+  // intervals the marker that would close pudica_frame_ is not coming.
+  static constexpr double kFrameStaleFactor = 3.0;
+  // Frames discarded by that watchdog. Non-zero means markers are being lost
+  // (V7 ABANDON_DRB does exactly that), so Eq.1 is measuring fewer frames.
+  std::atomic<int64_t> pudica_stale_frames_{0};
 
   // SACK_AGG=diff state: previous frame's mean RTT (μs)
   double prev_frame_mean_rtt_us_ = -1.0;
@@ -498,7 +514,24 @@ class RtpSctpCoordinator {
   };
   std::deque<PudicaProbeResult> pudica_probe_results_;
   int64_t pudica_last_frame_recv_us_ = 0;  // last frame's last packet arrival (μs)
-  int64_t pudica_last_frame_send_us_ = 0;  // last frame's last packet send time (sender clock, μs)
+
+  // §4.3 short-term BUR control state.
+  // The persistent target, before any temporary fallback is applied. Keeping it
+  // separate is what makes the fallback transient: the published override may
+  // carry -zeta for one frame while this value is untouched.
+  int64_t pudica_base_target_bps_ = 0;
+  int pudica_consec_high_bur_ = 0;  // frames in a row with R > 1
+  bool pudica_draining_ = false;    // inside the Eq.11 queue-draining phase
+
+  // §4.2 state.
+  // tau: frames received since the last AI-step initialization. Grows the AI
+  // step; reset when R~ > 1 and, time-driven, every 5 s.
+  int64_t pudica_tau_ = 0;
+  int64_t pudica_tau_reset_us_ = 0;
+  // MI defers the next increase until the feedback for the previous one is in
+  // ("the next adjustment is postponed until the feedback regarding the current
+  // adjustment is received"), counted in frames.
+  int pudica_mi_hold_frames_ = 0;
   std::atomic<int64_t> frame_burst_start_us_{0};  // SCTP burst probe: frame boundary timestamp
   std::atomic<double> frame_jitter_mult_{1.0};    // SCTP jitter: per-frame random multiplier
 

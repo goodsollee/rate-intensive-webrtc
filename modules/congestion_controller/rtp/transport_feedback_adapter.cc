@@ -111,6 +111,11 @@ void TransportFeedbackAdapter::AddPacket(const RtpPacketToSend& packet_to_send,
   feedback.sent.size = DataSize::Bytes(packet_to_send.size() + overhead_bytes);
   feedback.sent.audio =
       packet_to_send.packet_type() == RtpPacketMediaType::kAudio;
+  // Real video frame boundary for Pudica. Restricted to kVideo so a
+  // retransmitted marker packet (kRetransmission) can't fake a frame end.
+  feedback.sent.frame_last =
+      packet_to_send.packet_type() == RtpPacketMediaType::kVideo &&
+      packet_to_send.Marker();
   feedback.network_route = network_route_;
   feedback.sent.pacing_info = pacing_info;
   feedback.ssrc = packet_to_send.Ssrc();

@@ -118,6 +118,10 @@ struct RTC_EXPORT SentPacket {
   PacedPacketInfo pacing_info;
   // True if the packet is an audio packet, false for video, padding, RTX etc.
   bool audio = false;
+  // True if this is the last packet of a video frame (RTP marker bit set on a
+  // kVideo packet — not RTX/padding/FEC). Pudica's Eq.1 needs the real frame
+  // boundary; GCC's 5 ms send-time grouping is not one.
+  bool frame_last = false;
   // Transport independent sequence number, any tracked packet should have a
   // sequence number that is unique over the whole call and increasing by 1 for
   // each packet.

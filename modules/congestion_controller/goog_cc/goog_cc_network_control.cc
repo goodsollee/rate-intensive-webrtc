@@ -39,6 +39,7 @@
 #include "modules/congestion_controller/goog_cc/probe_bitrate_estimator.h"
 #include "modules/congestion_controller/goog_cc/probe_controller.h"
 #include "modules/congestion_controller/goog_cc/send_side_bandwidth_estimation.h"
+#include "modules/pacing/pacing_controller.h"
 #include "modules/remote_bitrate_estimator/include/bwe_defines.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/experiments/field_trial_parser.h"
@@ -515,8 +516,18 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
   bandwidth_estimation_->SetAcknowledgedRate(acknowledged_bitrate,
                                              report.feedback_time);
   for (const auto& feedback : report.SortedByReceiveTime()) {
-    if (feedback.sent_packet.pacing_info.probe_cluster_id !=
-        PacedPacketInfo::kNotAProbe) {
+    // Pudica tags its inter-frame padding probes with a private cluster id
+    // (PacingController::kPudicaProbeClusterId = -100) purely so
+    // DelayBasedBwe can hand them to the coordinator's OWD measurement. They
+    // are NOT a GCC probe cluster and carry none of its metadata, so
+    // probe_cluster_min_probes/min_bytes are still at their -1 defaults and
+    // ProbeBitrateEstimator's RTC_DCHECK_GT(..., 0) aborts the sender the
+    // first time one is fed in (it did, immediately, the first run after
+    // PUDICA_PROBING was enabled). With DCHECKs off they would instead
+    // silently corrupt GCC's probe-based estimate. Skip them here.
+    const int cluster_id = feedback.sent_packet.pacing_info.probe_cluster_id;
+    if (cluster_id != PacedPacketInfo::kNotAProbe &&
+        cluster_id != PacingController::kPudicaProbeClusterId) {
       probe_bitrate_estimator_->HandleProbeAndEstimateBitrate(feedback);
     }
   }

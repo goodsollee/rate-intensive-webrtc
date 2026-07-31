@@ -292,18 +292,33 @@ class PacingController {
   static bool pudica_probing_enabled_;
   static int pudica_num_probes_;
   static double pudica_rho_override_;
+  // Eq.2 adaptive pacing: spread a frame's own packets so the last one leaves
+  // at L/rho, instead of bursting the frame and idling for (1-1/rho)L after it.
+  static bool pudica_intra_frame_pacing_;
+  // Media rate for the frame currently being sent (zero = not in a frame).
+  DataRate pudica_frame_rate_ = DataRate::Zero();
+  bool queue_over_limit_ = false;  // edge-trigger for the [PACER-QUEUE] log
   int pudica_probes_remaining_ = 0;
   Timestamp pudica_frame_end_time_ = Timestamp::MinusInfinity();
   Timestamp pudica_next_probe_time_ = Timestamp::MinusInfinity();
   TimeDelta pudica_probe_interval_ = TimeDelta::Zero();
   Timestamp pudica_gap_end_time_ = Timestamp::MinusInfinity();  // ρ-based video hold
   Timestamp pudica_frame_send_start_ = Timestamp::MinusInfinity();  // first video pkt of frame
+  // How many times a frame overran L and the Eq.2 rate was discarded — i.e. how
+  // often `packet_size + QueueSizeData()` under-measured the frame. Nonzero
+  // means the one-batch-enqueue assumption is not holding on this run.
+  int pudica_frame_deadline_hits_ = 0;
 
  public:
   static void SetPudicaProbing(bool enabled, int num_probes = 4);
   static void SetPudicaRho(double rho);
+  static void SetPudicaIntraFramePacing(bool enabled);
   // Pudica probe packets use this cluster ID for identification in TWCC feedback.
-  // GCC ProbeController only processes probe_cluster_id >= 0, so -100 is ignored.
+  // ProbeController does only look at ids >= 0, but ProbeBitrateEstimator is
+  // gated on `!= kNotAProbe` (-1), so -100 reaches it and trips its
+  // RTC_DCHECK_GT(probe_cluster_min_probes, 0) — these packets carry no
+  // cluster metadata. GoogCcNetworkController::OnTransportPacketsFeedback
+  // excludes this id explicitly; keep that exclusion if you add consumers.
   static constexpr int kPudicaProbeClusterId = -100;
 };
 }  // namespace webrtc

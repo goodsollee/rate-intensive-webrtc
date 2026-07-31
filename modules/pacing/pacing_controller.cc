@@ -67,6 +67,11 @@ const TimeDelta PacingController::kMaxEarlyProbeProcessing =
 bool PacingController::pudica_probing_enabled_ = false;
 int PacingController::pudica_num_probes_ = 4;
 double PacingController::pudica_rho_override_ = 0;
+bool PacingController::pudica_intra_frame_pacing_ = false;
+
+// L: frame sending interval (30 fps). Shared by the Eq.2 intra-frame pacing
+// span, the T_packet probe spacing and the agnostic-period hold below.
+constexpr double kPudicaFrameIntervalUs = 33333.0;
 
 void PacingController::SetPudicaProbing(bool enabled, int num_probes) {
   pudica_probing_enabled_ = enabled;
@@ -75,6 +80,12 @@ void PacingController::SetPudicaProbing(bool enabled, int num_probes) {
     RTC_LOG(LS_INFO) << "[PUDICA] Probe injection enabled: num_probes="
                      << num_probes;
   }
+}
+
+void PacingController::SetPudicaIntraFramePacing(bool enabled) {
+  pudica_intra_frame_pacing_ = enabled;
+  RTC_LOG(LS_INFO) << "[PUDICA] Intra-frame pacing (Eq.2) "
+                   << (enabled ? "enabled" : "disabled");
 }
 
 void PacingController::SetPudicaRho(double rho) {
@@ -382,8 +393,15 @@ Timestamp PacingController::NextSendTime() const {
     TimeDelta drain_time = media_debt_ / adjusted_media_rate_;
     // Ensure that a burst of sent packet is not larger than kMaxBurstSize in
     // order to not risk overfilling socket buffers at high bitrate.
+    // Pudica Eq.2: no burst allowance while spreading a frame. The default
+    // min(40ms, 63KB/rate) lets the whole median frame (55 pkts = 66KB, i.e.
+    // ~kMaxBurstSize) go out back-to-back, which bypasses pudica_frame_rate_
+    // entirely and leaves the send span at ~0 (observed: PUDICA-MARKER
+    // send=0.0ms, DU backlog p90 = 55 packets = exactly one burst).
     TimeDelta send_burst_interval =
-        std::min(send_burst_interval_, kMaxBurstSize / adjusted_media_rate_);
+        (pudica_frame_rate_ > DataRate::Zero())
+            ? TimeDelta::Zero()
+            : std::min(send_burst_interval_, kMaxBurstSize / adjusted_media_rate_);
     next_send_time =
         last_process_time_ +
         ((send_burst_interval > drain_time) ? TimeDelta::Zero() : drain_time);
@@ -453,6 +471,51 @@ void PacingController::ProcessPackets() {
 
   if (paused_) {
     return;
+  }
+
+  // Pudica Eq.2 deadline guard. pudica_frame_rate_ below is computed once, from
+  // `packet_size + QueueSizeData()` at the instant the frame's FIRST packet is
+  // dequeued, on the assumption that a frame is enqueued as one batch. That
+  // assumption breaks when the encoder is still delivering the frame — most
+  // reliably on a resolution step-up, where the keyframe is large and slow to
+  // packetize. The queue then holds a fraction of the frame, the rate is set
+  // from that fraction, and nothing corrects it: the rate is only recomputed at
+  // the next frame start, and pudica_frame_send_start_ is only cleared by the
+  // marker bit, which is the frame's LAST packet. So the frame cannot finish
+  // until it drains at the wrong rate, and the rate cannot be fixed until the
+  // frame finishes.
+  //
+  // Measured (run 1785486585, trace t=45.0s, 540p->720p->1080p ramp after the
+  // t=20s dip): ~9 packets seen where the keyframe was 224, giving 3.2 Mbps on
+  // an idle 40 Mbps link. The keyframe sat 637 ms in the pacer (its own
+  // pacing_ms), the RAN queue stayed under 5 packets, GCC saw no overuse, and
+  // Pudica's own target was 35.9 Mbps the whole time. The receiver got zero
+  // frames for 810 ms and then 33 in 400 ms.
+  //
+  // Eq.2's premise is that a frame leaves within L/rho, which is strictly less
+  // than L. Taking longer than L therefore means the size estimate was wrong.
+  // Drop it and let the next video packet re-arm from the queue as it stands by
+  // then — which holds the rest of the frame, so the recomputed rate is right.
+  // This bounds the damage to one frame interval instead of the whole frame.
+  //
+  // Note this is a DEADLINE, not a rate bound. An upper bound of B*rho was
+  // tried here before and reverted: anchored to B, it closed a positive
+  // feedback loop (B down -> bound down -> frame slower -> Eq.1's D counts it
+  // -> BUR up -> B down). A deadline is independent of B and cannot do that.
+  if (pudica_probing_enabled_ && pudica_intra_frame_pacing_ &&
+      pudica_frame_send_start_.IsFinite() &&
+      now - pudica_frame_send_start_ >
+          TimeDelta::Micros(static_cast<int64_t>(kPudicaFrameIntervalUs))) {
+    ++pudica_frame_deadline_hits_;
+    fprintf(stderr,
+            "[PUDICA-PACE-DEADLINE] frame overran L: held=%.0fms "
+            "rate=%.1fMbps queue=%.0fKB hits=%d\n",
+            (now - pudica_frame_send_start_).ms<double>(),
+            pudica_frame_rate_.bps() / 1e6, QueueSizeData().bytes<double>() / 1024.0,
+            pudica_frame_deadline_hits_);
+    pudica_frame_rate_ = DataRate::Zero();
+    adjusted_media_rate_ = pacing_rate_;
+    pudica_frame_send_start_ = Timestamp::MinusInfinity();
   }
 
   TimeDelta early_execute_margin =
@@ -543,6 +606,34 @@ void PacingController::ProcessPackets() {
           packet_type == RtpPacketMediaType::kVideo &&
           pudica_frame_send_start_.IsMinusInfinity()) {
         pudica_frame_send_start_ = now;
+        // Eq.2: spread this frame's packets evenly over L/rho so the last one
+        // leaves at L/rho. All packets of a frame are enqueued as one batch, so
+        // the queue at frame start plus this packet is the frame size. Without
+        // this the frame goes out as a burst at pacing_rate_ and the send span
+        // becomes proportional to the frame size, which contaminates the Eq.1
+        // BUR with sender-side serialization (measured: corr(frame_packets,
+        // base_bur) = +0.73, BUR > 1 on an empty 200 Mbps link).
+        if (pudica_intra_frame_pacing_) {
+          double rho = pudica_rho_override_ > 1.0 ? pudica_rho_override_ : 2.0;
+          DataSize frame_size = packet_size + QueueSizeData();
+          TimeDelta span = TimeDelta::Micros(
+              static_cast<int64_t>(kPudicaFrameIntervalUs / rho));
+          if (span > TimeDelta::Zero() && frame_size > DataSize::Zero()) {
+            // No rate clamp: an above-nominal frame is paced proportionally
+            // faster, which does burst past the link. Bounding it at B*rho was
+            // tried and reverted — B is what BUR controls, so the bound closed a
+            // positive feedback loop (B down -> bound down -> frame takes longer
+            // -> Eq.1's D counts that -> BUR up -> B down). Measured: 148 KB
+            // frames taking 245 ms, then a 4 s collapse to 2.8 Mbps on a 40 Mbps
+            // link. Any bound here must be anchored to something independent of
+            // B, and Eq.1 cannot tell a slow pacer from a full queue anyway.
+            pudica_frame_rate_ = frame_size / span;
+            // MaybeUpdateMediaRateDueToLongQueue() only runs at the end of
+            // ProcessPackets(), so apply it here too — otherwise the rest of
+            // this send batch still goes out at the old (bursty) rate.
+            adjusted_media_rate_ = pudica_frame_rate_;
+          }
+        }
       }
 
       // Pudica: detect video frame end (marker bit) before packet is moved
@@ -566,7 +657,7 @@ void PacingController::ProcessPackets() {
         marker_count++;
         // Compute T_packet = (1-1/ρ) × L / (N+1)
         double rho = pudica_rho_override_ > 1.0 ? pudica_rho_override_ : 2.0;
-        constexpr double kL_us = 33333.0;  // 30fps frame interval in μs
+        const double kL_us = kPudicaFrameIntervalUs;
         double T_packet_us = (1.0 - 1.0 / rho) * kL_us /
                              (pudica_num_probes_ + 1);
         T_packet_us = std::max(T_packet_us, 500.0);  // min 0.5ms
@@ -588,11 +679,15 @@ void PacingController::ProcessPackets() {
         pudica_gap_end_time_ = now + TimeDelta::Micros(
             static_cast<int64_t>(gap_us));
         pudica_frame_send_start_ = Timestamp::MinusInfinity();  // reset for next frame
+        double used_mbps = pudica_frame_rate_.bps() / 1e6;
+        pudica_frame_rate_ = DataRate::Zero();  // revert to pacing_rate_ in the gap
 
         if (marker_count % 100 == 0) {
-          fprintf(stderr, "[PUDICA-MARKER] markers=%d T_pkt=%.1fms gap=%.1f/%.1fms rho=%.1f send=%.1fms\n",
+          fprintf(stderr, "[PUDICA-MARKER] markers=%d T_pkt=%.1fms gap=%.1f/%.1fms rho=%.1f send=%.1fms "
+                  "paced=%.1fMbps span=%.1fms\n",
                   marker_count, T_packet_us / 1000.0, gap_us / 1000.0,
-                  desired_gap_us / 1000.0, rho, frame_send_us / 1000.0);
+                  desired_gap_us / 1000.0, rho, frame_send_us / 1000.0,
+                  used_mbps, kL_us / rho / 1000.0);
         }
       }
 
@@ -766,7 +861,10 @@ std::unique_ptr<RtpPacketToSend> PacingController::GetPendingPacket(
       return nullptr;
     }
 
-    if (now <= target_send_time && send_burst_interval_.IsZero()) {
+    // Pudica Eq.2: while spreading a frame, apply the strict debt check too —
+    // otherwise packets are still allowed out early as a burst.
+    if (now <= target_send_time && (send_burst_interval_.IsZero() ||
+                                    pudica_frame_rate_ > DataRate::Zero())) {
       // We allow sending slightly early if we think that we would actually
       // had been able to, had we been right on time - i.e. the current debt
       // is not more than would be reduced to zero at the target sent time.
@@ -819,6 +917,33 @@ void PacingController::SetQueueTimeLimit(TimeDelta limit) {
 
 void PacingController::MaybeUpdateMediaRateDueToLongQueue(Timestamp now) {
   adjusted_media_rate_ = pacing_rate_;
+  // Queue-depth watch: Pudica keeps pudica_frame_rate_ set almost continuously,
+  // so the drain_large_queues bump below is effectively never reached. Report
+  // when the queue crosses queue_time_limit_ in either direction, to show
+  // whether the pacer queue is what starves the encoder.
+  if (adjusted_media_rate_ > DataRate::Zero()) {
+    TimeDelta qt = QueueSizeData() / adjusted_media_rate_;
+    bool over = qt > queue_time_limit_;
+    if (over != queue_over_limit_) {
+      queue_over_limit_ = over;
+      fprintf(stderr,
+              "[PACER-QUEUE] %s qtime=%.0fms limit=%.0fms pkts=%d bytes=%.0fKB "
+              "rate=%.1fMbps pudica_frame=%d\n",
+              over ? "OVER" : "under", qt.ms<double>(),
+              queue_time_limit_.ms<double>(),
+              static_cast<int>(packet_queue_.SizeInPackets()),
+              QueueSizeData().bytes() / 1000.0,
+              adjusted_media_rate_.bps() / 1e6,
+              pudica_frame_rate_ > DataRate::Zero() ? 1 : 0);
+    }
+  }
+  // Pudica Eq.2: while a frame is being sent, its own span is the control
+  // variable. Skip the long-queue bump — it would speed the frame back up to
+  // drain the queue and undo the spreading.
+  if (pudica_frame_rate_ > DataRate::Zero()) {
+    adjusted_media_rate_ = pudica_frame_rate_;
+    return;
+  }
   if (!drain_large_queues_) {
     return;
   }
