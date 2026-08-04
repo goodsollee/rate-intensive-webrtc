@@ -2623,6 +2623,7 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
 
   int64_t new_target = old_target;
   const char* mode = "PUD-HOLD";
+  bool draining = false;
 
   if (frame_bur < kUpThresh) {
     // One-step restore to delivered rate, biased up by γ to probe headroom.
@@ -2639,9 +2640,61 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
     new_target =
         static_cast<int64_t>(config_.draining_target * recv_rate) - drain_rate_bps;
     mode = "PUD-DRAIN";
+    draining = true;
   } else {
     new_target = recv_rate;
     mode = "PUD-HOLD";
+  }
+
+  // === Rotary fix: bound how far ONE frame decision may cut the target ======
+  //
+  // Two unbounded down-paths above turn a single-frame measurement into a
+  // 60-90x rate cliff on a lossless, fixed-capacity link (the "rotary"):
+  //
+  //  (1) PUD-DRAIN. Eq.11 spends the whole standing queue over a *fixed* 200 ms
+  //      horizon: drain_rate = queue_ms/200ms x recv. Measured transient queues
+  //      on flat200 reach 150-190 ms, so drain_rate reaches 0.75-0.95 x recv and
+  //      (draining_target=0.85) x recv - drain_rate goes <= 0 -> clamped to
+  //      min_rate_bps (1 Mbps). i.e. any queue deeper than
+  //      draining_target x 200 ms = 170 ms demands a *negative* send rate.
+  //      Draining at 0.5 x recv clears the same queue in ~2x the horizon while
+  //      keeping the flow alive, so floor the drain instead of shutting off.
+  //
+  //  (2) PUD-RESTORE. This is the *up* rule, but its anchor recv_rate is a
+  //      200 ms windowed TWCC estimate whose frame-to-frame spread is ~3x
+  //      (measured: 40 -> 180 -> 134 Mbps within 100 ms). Assigning
+  //      target = gamma x recv unfiltered injects that noise straight into the
+  //      encoder target, producing 3-5x cuts with BUR ~ 0.06.
+  //
+  // Both are fixed with a per-decision slew floor. Defaults were swept on
+  // flat200 (see agent/experiment_docs/PUDICA-rotary-fix.md): the congestion
+  // response may cut 30% per frame (0.70^10 = 1/35 in 0.33 s — still an order
+  // of magnitude faster than GCC's AIMD), the up-rule may only decay 5% per
+  // frame (0.95^30 = 1/5 per second, i.e. a time constant near the 200 ms
+  // recv-rate estimator window it is anchored to).
+  // Set PUDICA_ROTARY_FIX=0 to restore the pre-fix behaviour.
+  static const bool kRotaryFix = []() {
+    const char* e = std::getenv("PUDICA_ROTARY_FIX");
+    return !(e && std::atoi(e) == 0); }();
+  static const double kDrainDownStep = []() {
+    const char* e = std::getenv("PUDICA_DRAIN_DOWN_STEP");
+    return e ? std::atof(e) : 0.70; }();
+  static const double kRestoreDownStep = []() {
+    const char* e = std::getenv("PUDICA_RESTORE_DOWN_STEP");
+    return e ? std::atof(e) : 0.95; }();
+  static const double kDrainFloorRatio = []() {
+    const char* e = std::getenv("PUDICA_DRAIN_FLOOR");
+    return e ? std::atof(e) : 0.40; }();
+  if (kRotaryFix && new_target < old_target) {
+    double step = draining ? kDrainDownStep : kRestoreDownStep;
+    int64_t slew_floor = static_cast<int64_t>(old_target * step);
+    if (draining) {
+      // Never drain below a fraction of what the link is actually delivering:
+      // the queue drains as long as we send less than recv_rate.
+      slew_floor = std::max(
+          slew_floor, static_cast<int64_t>(recv_rate * kDrainFloorRatio));
+    }
+    new_target = std::max(new_target, slew_floor);
   }
 
   int64_t ceiling = (kPudMaxBps > 0) ? kPudMaxBps : config_.max_rate_bps;
@@ -2650,6 +2703,47 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
 
   unified_metrics_.mode = mode;
   unified_metrics_.rtp_allocated_mbps = new_target / 1'000'000.0;
+
+  // === Rotary diagnostics: per-frame controller trace ===
+  // Every decision the Pudica RTP controller makes, with the raw estimator
+  // internals that feed it. Written to $UNIFIED_CSV_DIR/pudica_ctrl.csv.
+  if (!pudica_ctrl_csv_initialized_) {
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      std::string path = std::string(dir) + "/pudica_ctrl.csv";
+      pudica_ctrl_csv_.open(path, std::ios::out | std::ios::trunc);
+      if (pudica_ctrl_csv_.is_open()) {
+        chmod(path.c_str(), 0666);
+        pudica_ctrl_csv_
+            << "t_ms,mode,bur,rtp_recv_mbps,total_recv_mbps,n_ack_samples,"
+               "ack_span_ms,ack_bytes,old_target_mbps,new_target_mbps,"
+               "d_min_ms,frame_owd_ms,frame_pkts\n";
+      }
+      pudica_ctrl_csv_start_us_ = now_us;
+      pudica_ctrl_csv_initialized_ = true;
+    }
+  }
+  if (pudica_ctrl_csv_.is_open()) {
+    int n_samples = static_cast<int>(rtp_ack_samples_.size());
+    int64_t span_ms = (n_samples >= 2)
+        ? (rtp_ack_samples_.back().timestamp_ms -
+           rtp_ack_samples_.front().timestamp_ms)
+        : 0;
+    double frame_owd_ms =
+        (pudica_frame_.first_send_us >= 0 && pudica_frame_.last_recv_us >= 0)
+            ? (pudica_frame_.last_recv_us - pudica_frame_.first_send_us) / 1000.0
+            : -1.0;
+    pudica_ctrl_csv_ << std::fixed << std::setprecision(3)
+                     << ((now_us - pudica_ctrl_csv_start_us_) / 1000.0) << ","
+                     << mode << "," << frame_bur << ","
+                     << (recv_rate / 1e6) << ","
+                     << (GetTotalRecvRateBps() / 1e6) << ","
+                     << n_samples << "," << span_ms << ","
+                     << rtp_samples_total_bytes_ << ","
+                     << (old_target / 1e6) << "," << (new_target / 1e6) << ","
+                     << (pudica_d_min_us_ / 1000.0) << "," << frame_owd_ms << ","
+                     << pudica_frame_.frame_packets << "\n";
+  }
 
   static int64_t pud_log = 0;
   if (++pud_log % 30 == 0) {

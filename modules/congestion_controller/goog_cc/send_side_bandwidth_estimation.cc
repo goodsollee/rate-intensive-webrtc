@@ -739,6 +739,7 @@ void SendSideBandwidthEstimation::MaybeLogLossBasedEvent(Timestamp at_time) {
 
 void SendSideBandwidthEstimation::UpdateTargetBitrate(DataRate new_bitrate,
                                                       Timestamp at_time) {
+  DataRate proposed = new_bitrate;
   new_bitrate = std::min(new_bitrate, GetUpperLimit());
   if (new_bitrate < min_bitrate_configured_) {
     MaybeLogLowBitrateWarning(new_bitrate, at_time);
@@ -747,6 +748,32 @@ void SendSideBandwidthEstimation::UpdateTargetBitrate(DataRate new_bitrate,
   current_target_ = new_bitrate;
   MaybeLogLossBasedEvent(at_time);
   link_capacity_.OnRateUpdate(acknowledged_rate_, current_target_, at_time);
+
+  // === Rotary diagnostics ===
+  // Trace which limiter owns the final GCC target. Enabled by UNIFIED_CSV_DIR.
+  static std::ofstream* bwe_trace = []() -> std::ofstream* {
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (!dir || !*dir) return nullptr;
+    auto* f = new std::ofstream(std::string(dir) + "/bwe_trace.csv",
+                                std::ios::out | std::ios::trunc);
+    if (!f->is_open()) { delete f; return nullptr; }
+    *f << "t_ms,proposed_mbps,delay_based_mbps,receiver_limit_mbps,"
+          "acked_mbps,fraction_loss,loss_based_state,target_mbps\n";
+    return f;
+  }();
+  if (bwe_trace) {
+    auto mbps = [](DataRate r) {
+      return r.IsFinite() ? r.bps() / 1e6 : -1.0;
+    };
+    *bwe_trace << at_time.ms() << "," << mbps(proposed) << ","
+               << mbps(delay_based_limit_) << "," << mbps(receiver_limit_)
+               << ","
+               << (acknowledged_rate_.has_value() ? mbps(*acknowledged_rate_)
+                                                  : -1.0)
+               << "," << (last_fraction_loss_ / 256.0) << ","
+               << static_cast<int>(loss_based_state_) << ","
+               << mbps(current_target_) << "\n";
+  }
 }
 
 void SendSideBandwidthEstimation::ApplyTargetLimits(Timestamp at_time) {
