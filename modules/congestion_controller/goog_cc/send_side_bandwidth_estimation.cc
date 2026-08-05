@@ -20,6 +20,7 @@
 #include <string>
 #include <utility>
 #include <fstream>
+#include <unistd.h>
 
 #include "api/field_trials_view.h"
 #include "api/rtc_event_log/rtc_event_log.h"
@@ -751,10 +752,13 @@ void SendSideBandwidthEstimation::UpdateTargetBitrate(DataRate new_bitrate,
 
   // === Rotary diagnostics ===
   // Trace which limiter owns the final GCC target. Enabled by UNIFIED_CSV_DIR.
+  // Sender and receiver each run a BWE and share the log dir, so the file is
+  // per-pid; analysis picks the sender's (the larger, non-degenerate) file.
   static std::ofstream* bwe_trace = []() -> std::ofstream* {
     const char* dir = std::getenv("UNIFIED_CSV_DIR");
     if (!dir || !*dir) return nullptr;
-    auto* f = new std::ofstream(std::string(dir) + "/bwe_trace.csv",
+    auto* f = new std::ofstream(std::string(dir) + "/bwe_trace_" +
+                                    std::to_string(getpid()) + ".csv",
                                 std::ios::out | std::ios::trunc);
     if (!f->is_open()) { delete f; return nullptr; }
     *f << "t_ms,proposed_mbps,delay_based_mbps,receiver_limit_mbps,"
