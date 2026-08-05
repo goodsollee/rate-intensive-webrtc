@@ -9,8 +9,10 @@
  */
 #include "call/rtp_transport_controller_send.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
@@ -62,6 +64,34 @@
 
 namespace webrtc {
 namespace {
+// [KFT] Fixed pacing floor. A low-latency RTS pacer holding frames for seconds
+// is itself unrealistic, and it confounds RAN experiments: a congestion-driven
+// rate collapse then shows up as DELAY (frames queued in the pacer) instead of
+// as QUALITY (lower encoder bitrate). With KFT_PACER_FIXED_MBPS=N the pacer
+// always drains at >= N Mbps, so CC collapse costs bitrate, not latency, and
+// the remaining frame delay is attributable to the network/RAN queue.
+// Unset (or <= 0) keeps stock behaviour. padding_rate is never touched.
+double KftPacerFixedMbps() {
+  static const double v = [] {
+    const char* e = std::getenv("KFT_PACER_FIXED_MBPS");
+    if (!e || !*e) return 0.0;
+    char* end = nullptr;
+    double x = std::strtod(e, &end);
+    if (end == e || x <= 0.0) return 0.0;
+    RTC_LOG(LS_ERROR) << "[KFT] KFT_PACER_FIXED_MBPS override: " << x
+                      << " Mbps (pacing floor)";
+    return x;
+  }();
+  return v;
+}
+
+DataRate KftApplyPacerFloor(DataRate rate) {
+  const double mbps = KftPacerFixedMbps();
+  if (mbps <= 0.0) return rate;
+  return std::max(rate, DataRate::BitsPerSec(
+                            static_cast<int64_t>(mbps * 1e6)));
+}
+
 static const int64_t kRetransmitWindowSizeMs = 500;
 static const size_t kMaxOverheadBytes = 500;
 
@@ -137,7 +167,8 @@ RtpTransportControllerSend::RtpTransportControllerSend(
   RTC_DCHECK(config.bitrate_config.start_bitrate_bps > 0);
 
   pacer_.SetPacingRates(
-      DataRate::BitsPerSec(config.bitrate_config.start_bitrate_bps),
+      KftApplyPacerFloor(
+          DataRate::BitsPerSec(config.bitrate_config.start_bitrate_bps)),
       DataRate::Zero());
   if (config.pacer_burst_interval) {
     // Default burst interval overriden by config.
@@ -782,7 +813,7 @@ void RtpTransportControllerSend::PostUpdates(NetworkControlUpdate update) {
     UpdateCongestedState();
   }
   if (update.pacer_config) {
-    pacer_.SetPacingRates(update.pacer_config->data_rate(),
+    pacer_.SetPacingRates(KftApplyPacerFloor(update.pacer_config->data_rate()),
                           update.pacer_config->pad_rate());
   }
   if (!update.probe_cluster_configs.empty()) {
