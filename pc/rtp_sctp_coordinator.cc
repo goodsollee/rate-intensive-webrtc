@@ -2657,8 +2657,9 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
   //      (draining_target=0.85) x recv - drain_rate goes <= 0 -> clamped to
   //      min_rate_bps (1 Mbps). i.e. any queue deeper than
   //      draining_target x 200 ms = 170 ms demands a *negative* send rate.
-  //      Draining at 0.5 x recv clears the same queue in ~2x the horizon while
-  //      keeping the flow alive, so floor the drain instead of shutting off.
+  //      Draining at kDrainFloorRatio x recv clears the same queue in a small
+  //      multiple of the horizon while keeping the flow alive, so floor the
+  //      drain instead of shutting off.
   //
   //  (2) PUD-RESTORE. This is the *up* rule, but its anchor recv_rate is a
   //      200 ms windowed TWCC estimate whose frame-to-frame spread is ~3x
