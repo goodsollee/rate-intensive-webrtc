@@ -13,6 +13,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
@@ -772,17 +773,51 @@ void ExtractCodecInformation(
   }
 }
 
+// [KFT testbed] The video receive channel sets SO_RCVBUF on the media socket
+// in SetInterface, and it does so AFTER the ICE layer applied
+// WebRTC-SetSocketReceiveBuffer — so this value, not that field trial, is what
+// the media socket ends up with. The upstream default (kVideoRtpRecvBufferSize
+// = 1 MB) is only 107 ms of buffer at 75 Mb/s, while 1080p60 delivers ~155 KB
+// (~130 packets) per frame in a burst: a ~100 ms scheduling hiccup in the
+// receiving thread overflows it. Measured on this rig at 1080p60/75 Mb/s with
+// the 1 MB default: `ss` showed rb2097152 with a climbing drop counter, UDP
+// RcvbufErrors +293/run, getStats packets_lost 1119. The field trial can only
+// reach 10 MB (bounds below), and only when a rig remembers to set it, so the
+// DEFAULT is raised here instead — no rig can step on this trap again.
+// KFT_RCVBUF_BYTES overrides; the field trial, when set, can only raise it.
+int KftDefaultRecvBufferSize() {
+  static const int v = [] {
+    int def = 31'457'280;  // 30 MB (net.core.rmem_max must allow it)
+    const char* e = std::getenv("KFT_RCVBUF_BYTES");
+    if (e && *e) {
+      char* end = nullptr;
+      long x = std::strtol(e, &end, 10);
+      if (end != e && x >= 10'000 && x <= 256'000'000)
+        def = static_cast<int>(x);
+    }
+    RTC_LOG(LS_ERROR) << "[KFT] video RTP receive buffer default: " << def
+                      << " bytes (kernel reports ~2x via SO_RCVBUF)";
+    return def;
+  }();
+  return v;
+}
+
 int ParseReceiveBufferSize(const webrtc::FieldTrialsView& trials) {
+  const int kft_default = KftDefaultRecvBufferSize();
   webrtc::FieldTrialParameter<int> size_bytes("size_bytes",
                                               kVideoRtpRecvBufferSize);
   webrtc::ParseFieldTrial({&size_bytes},
                           trials.Lookup("WebRTC-ReceiveBufferSize"));
-  if (size_bytes.Get() < 10'000 || size_bytes.Get() > 10'000'000) {
-    RTC_LOG(LS_WARNING) << "WebRTC-ReceiveBufferSize out of bounds: "
-                        << size_bytes.Get();
-    return kVideoRtpRecvBufferSize;
+  int from_trial = size_bytes.Get();
+  if (from_trial < 10'000 || from_trial > 10'000'000) {
+    if (from_trial != kVideoRtpRecvBufferSize) {
+      RTC_LOG(LS_WARNING) << "WebRTC-ReceiveBufferSize out of bounds: "
+                          << from_trial;
+    }
+    from_trial = kVideoRtpRecvBufferSize;
   }
-  return size_bytes.Get();
+  // The trial may raise the floor but never lower it below the KFT default.
+  return std::max(kft_default, from_trial);
 }
 
 }  // namespace
