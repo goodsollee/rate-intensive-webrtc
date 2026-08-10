@@ -13,6 +13,9 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -42,6 +45,7 @@
 #include "modules/pacing/pacing_controller.h"
 #include "modules/remote_bitrate_estimator/include/bwe_defines.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/time_utils.h"
 #include "rtc_base/experiments/field_trial_parser.h"
 #include "rtc_base/experiments/rate_control_settings.h"
 #include "rtc_base/logging.h"
@@ -58,6 +62,55 @@ constexpr TimeDelta kLossUpdateInterval = TimeDelta::Millis(1000);
 // Increasing this factor will result in lower delays in cases of bitrate
 // overshoots from the encoder.
 constexpr float kDefaultPaceMultiplier = 2.5f;
+
+// --- testbed instrumentation: congestion-control target --------------------
+// CC-AGNOSTIC. Alternative controllers (Pudica) do not replace this class --
+// they override result.target_bitrate inside DelayBasedBwe (delay_based_bwe.cc
+// GetPudicaRtpOverride), which is UPSTREAM of here, so bandwidth_estimation_
+// ->target_rate() carries whichever controller is in force and this log fires
+// unchanged in either mode. The column is therefore named cc_target_bps, not
+// loss_based_*: under Pudica the value is a BUR-driven target that merely
+// travelled through the same variable.
+// The TOTAL target: it budgets media + retransmissions + padding + FEC
+// together, and the pacer runs at kDefaultPaceMultiplier times it. The
+// encoder is configured with a smaller number (this minus the protection
+// reserve) -- see encoder_target.csv, written from libvpx_vp8_encoder.cc. The
+// difference between the two files IS the protection reserve, which is what a
+// RAN-side estimator's RTX-stream term has to account for.
+// Same file-scope pattern and $UNIFIED_CSV_DIR as gcc_trendline.csv;
+// rtc::TimeMillis() shares a clock with sender_stats.csv and the RIC's BPF.
+// Intentionally leaked to avoid an exit-time destructor.
+std::ofstream& GccTargetCsvFile() {
+  static std::ofstream* const file = new std::ofstream();
+  return *file;
+}
+bool gcc_target_csv_initialized = false;
+
+void LogGccTarget(double cc_target_bps,
+                  double pushback_bps,
+                  double stable_bps,
+                  double pacing_bps,
+                  double loss_ratio) {
+  if (!gcc_target_csv_initialized) {
+    gcc_target_csv_initialized = true;
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      GccTargetCsvFile().open(std::string(dir) + "/gcc_target.csv",
+                              std::ios::out | std::ios::trunc);
+      if (GccTargetCsvFile().is_open()) {
+        GccTargetCsvFile() << "time_ms,cc_target_bps,"
+                              "pushback_target_bps,stable_target_bps,"
+                              "pacing_rate_bps,loss_ratio\n";
+      }
+    }
+  }
+  if (!GccTargetCsvFile().is_open())
+    return;
+  GccTargetCsvFile() << rtc::TimeMillis() << ',' << cc_target_bps << ','
+                     << pushback_bps << ',' << stable_bps << ','
+                     << pacing_bps << ',' << loss_ratio << '\n';
+  GccTargetCsvFile().flush();
+}
 
 // If the probe result is far below the current throughput estimate
 // it's unlikely that the probe is accurate, so we don't want to drop too far.
@@ -719,6 +772,11 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
     update->probe_cluster_configs.insert(update->probe_cluster_configs.end(),
                                          probes.begin(), probes.end());
     update->pacer_config = GetPacingRates(at_time);
+    LogGccTarget(loss_based_target_rate.bps<double>(),
+                 pushback_target_rate.bps<double>(),
+                 stable_target_rate.bps<double>(),
+                 update->pacer_config->data_rate().bps<double>(),
+                 fraction_loss / 255.0);
     RTC_LOG(LS_VERBOSE) << "bwe " << at_time.ms() << " pushback_target_bps="
                         << last_pushback_target_rate_.bps()
                         << " estimate_bps=" << loss_based_target_rate.bps();

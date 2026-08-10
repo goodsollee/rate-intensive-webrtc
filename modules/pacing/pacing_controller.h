@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include <array>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -309,10 +310,46 @@ class PacingController {
   // means the one-batch-enqueue assumption is not holding on this run.
   int pudica_frame_deadline_hits_ = 0;
 
+  // Per-frame pacer trace (PUDICA_PACE_TRACE=1, off by default). The quantity
+  // it exists to measure: Eq.2's rate is armed from `packet_size +
+  // QueueSizeData()` at the frame's FIRST packet, but the encoder may still be
+  // delivering the frame, so that is a fraction of the real size and the rate
+  // comes out proportionally low. Nothing recomputes it mid-frame. Logging the
+  // armed estimate against the bytes actually sent before the marker turns
+  // `pudica_frame_deadline_hits_` from a count into a magnitude, and separates
+  // "the estimate was wrong" from "the pacer could not keep up with a correct
+  // estimate" — which the frame's achieved span answers.
+  DataSize pudica_arm_size_ = DataSize::Zero();      // frame_size at arm time
+  DataSize pudica_arm_queue_ = DataSize::Zero();     // queue depth at arm time
+  DataSize pudica_frame_bytes_sent_ = DataSize::Zero();
+  int pudica_frame_pkts_sent_ = 0;
+  DataRate pudica_arm_rate_ = DataRate::Zero();      // rate Eq.2 asked for
+  bool pudica_frame_hit_deadline_ = false;
+  std::ofstream pudica_pace_file_;
+  bool pudica_pace_initialized_ = false;
+  Timestamp pudica_pace_start_ = Timestamp::MinusInfinity();
+
  public:
   static void SetPudicaProbing(bool enabled, int num_probes = 4);
   static void SetPudicaRho(double rho);
   static void SetPudicaIntraFramePacing(bool enabled);
+
+  // Pudica §4.3 "next delay": the elapsed time since the earliest still-
+  // unacknowledged frame was sent. It is the paper's answer to "the sender may
+  // experience delays in receiving feedback regarding network degradation" —
+  // unlike the BUR it needs no feedback at all, so it keeps working across a
+  // dip deep enough to stop frames completing.
+  //
+  // The send times have to come from here because the coordinator never sees a
+  // packet at send time: its only input is TWCC feedback, which is exactly the
+  // signal that stops. Recorded as a static rather than called through, because
+  // pc/ already depends on modules/pacing and the reverse edge would be a cycle.
+  static void PudicaRecordFrameSent(int64_t send_us);
+  // Drops every recorded frame sent at or before `acked_through_us` (those are
+  // accounted for) and returns the send time of the oldest survivor, or 0 if
+  // nothing is outstanding. Matching by send time avoids carrying a frame id
+  // across the two modules.
+  static int64_t PudicaOldestUnackedSendUs(int64_t acked_through_us);
   // Pudica probe packets use this cluster ID for identification in TWCC feedback.
   // ProbeController does only look at ids >= 0, but ProbeBitrateEstimator is
   // gated on `!= kNotAProbe` (-1), so -100 reaches it and trips its

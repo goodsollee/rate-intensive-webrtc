@@ -739,10 +739,71 @@ void SendSideBandwidthEstimation::MaybeLogLossBasedEvent(Timestamp at_time) {
 
 void SendSideBandwidthEstimation::UpdateTargetBitrate(DataRate new_bitrate,
                                                       Timestamp at_time) {
+  const DataRate requested = new_bitrate;
   new_bitrate = std::min(new_bitrate, GetUpperLimit());
   if (new_bitrate < min_bitrate_configured_) {
     MaybeLogLowBitrateWarning(new_bitrate, at_time);
     new_bitrate = min_bitrate_configured_;
+  }
+  // Which of the three limits in GetUpperLimit() is actually binding, and how
+  // far the resulting target sits from the acked rate. Needed because
+  // Pudica's per-frame target enters here as delay_based_limit_ (see
+  // DelayBasedBwe::MaybeUpdateEstimate), i.e. as a CEILING and not as the
+  // target: measured base=471 Mbps on a 40 Mbps link while the sender put out
+  // 1-10 Mbps, so the ceiling was never the constraint and the ramp came from
+  // whatever set `requested`. This prints which one it was.
+  // Rate-limited to 200 ms and to changes >5%; this is on the feedback path.
+  {
+    const char* kBind[] = {"none", "delay", "recv", "maxcfg", "mincfg"};
+    int bind = 0;
+    if (requested > GetUpperLimit()) {
+      DataRate ul = GetUpperLimit();
+      bind = (ul == delay_based_limit_) ? 1
+             : (ul == receiver_limit_) ? 2 : 3;
+    } else if (new_bitrate > requested) {
+      bind = 4;  // min_bitrate_configured_ floored it
+    }
+    const double rel = bwe_log_last_target_.IsFinite() && bwe_log_last_target_ > DataRate::Zero()
+        ? std::abs(new_bitrate.bps<double>() - bwe_log_last_target_.bps<double>()) /
+              bwe_log_last_target_.bps<double>()
+        : 1.0;
+    if (bwe_log_last_time_.IsInfinite() ||
+        at_time - bwe_log_last_time_ > TimeDelta::Millis(200) || rel > 0.05) {
+      bwe_log_last_time_ = at_time;
+      bwe_log_last_target_ = new_bitrate;
+      // v2loss / v2ub / v2obs: LossBasedBweV2's own inputs. `loss` above is
+      // RTCP fraction_lost and has read 0.000 through entire runs that spent
+      // 7 s in kDecreasing, so it says nothing about why V2 acted. v2ub is
+      // instant_upper_bound_bandwidth_balance / (v2loss - loss_offset); when
+      // cur tracks v2ub the fix is that constant, when it does not the fix is
+      // the observation history length.
+      double v2_loss = -1.0;
+      double v2_ub = -1.0;
+      int v2_obs = -1;
+      if (LossBasedBandwidthEstimatorV2Enabled()) {
+        v2_loss = loss_based_bandwidth_estimator_v2_->GetAverageReportedLossRatio();
+        DataRate ub =
+            loss_based_bandwidth_estimator_v2_->GetInstantUpperBoundForLogging();
+        v2_ub = ub.IsFinite() ? ub.kbps<double>() / 1000.0 : -1.0;
+        v2_obs = loss_based_bandwidth_estimator_v2_->GetNumObservations();
+      }
+      fprintf(stderr,
+              "[BWE-TARGET] t=%lld cur=%.2f req=%.2f delay=%.2f recv=%.2f "
+              "maxcfg=%.2f acked=%.2f loss=%.3f lbstate=%d bind=%s "
+              "v2loss=%.4f v2ub=%.2f v2obs=%d\n",
+              static_cast<long long>(at_time.ms()),
+              new_bitrate.kbps<double>() / 1000.0,
+              requested.kbps<double>() / 1000.0,
+              delay_based_limit_.IsFinite() ? delay_based_limit_.kbps<double>() / 1000.0 : -1.0,
+              receiver_limit_.IsFinite() ? receiver_limit_.kbps<double>() / 1000.0 : -1.0,
+              max_bitrate_configured_.IsFinite()
+                  ? max_bitrate_configured_.kbps<double>() / 1000.0 : -1.0,
+              acknowledged_rate_.has_value()
+                  ? acknowledged_rate_->kbps<double>() / 1000.0 : -1.0,
+              last_fraction_loss_ / 256.0,
+              static_cast<int>(loss_based_state_), kBind[bind],
+              v2_loss, v2_ub, v2_obs);
+    }
   }
   current_target_ = new_bitrate;
   MaybeLogLossBasedEvent(at_time);

@@ -2313,6 +2313,16 @@ void VideoStreamEncoder::OnBitrateUpdated(DataRate target_bitrate,
   const bool video_is_suspended = target_bitrate == DataRate::Zero();
   const bool video_suspension_changed = video_is_suspended != EncoderPaused();
 
+  // The other way sender fps reaches 0 (the first being a congested pacer, see
+  // [CC-CONGESTED]): a zero encoder target suspends the encoder outright, and
+  // the stats still report quality_limitation_reason "none". Log the edge.
+  if (video_suspension_changed) {
+    fprintf(stderr,
+            "[ENC-SUSPEND] %s target=%.2fMbps link_alloc=%.2fMbps\n",
+            video_is_suspended ? "ENTER" : "EXIT",
+            target_bitrate.bps() / 1e6, link_allocation.bps() / 1e6);
+  }
+
   if (!video_is_suspended && settings_.encoder_switch_request_callback &&
       encoder_selector_) {
     if (auto encoder = encoder_selector_->OnAvailableBitrate(link_allocation)) {

@@ -259,10 +259,17 @@ Conductor::Conductor(const webrtc::Environment& env,
   // are created inside the WebRTC library (VideoEncoder::GetDefaultVp8Settings)
   // with no app-level hook, so the flag is transported via an env var that
   // the library reads when building the default VP8 settings.
+  // The env var may already be set by the runner; only the explicit flag
+  // overrides it.
   const int vp8_kf_max_dist = absl::GetFlag(FLAGS_vp8_kf_max_dist);
-  setenv("WEBRTC_VP8_KF_MAX_DIST", std::to_string(vp8_kf_max_dist).c_str(),
-         /*overwrite=*/1);
-  RTC_LOG(LS_INFO) << "VP8 kf_max_dist pinned to " << vp8_kf_max_dist;
+  if (vp8_kf_max_dist > 0) {
+    setenv("WEBRTC_VP8_KF_MAX_DIST", std::to_string(vp8_kf_max_dist).c_str(),
+           /*overwrite=*/1);
+  }
+  RTC_LOG(LS_INFO) << "VP8 kf_max_dist env is "
+                   << (getenv("WEBRTC_VP8_KF_MAX_DIST")
+                           ? getenv("WEBRTC_VP8_KF_MAX_DIST")
+                           : "(unset)");
 }
 
 Conductor::~Conductor() {
@@ -319,7 +326,7 @@ bool Conductor::InitializePeerConnection() {
   deps.audio_mixer = nullptr;
   deps.audio_processing = nullptr;
   deps.adm = webrtc::TestAudioDeviceModule::Create(
-      deps.task_queue_factory.get(), nullptr, nullptr);
+      &env_.task_queue_factory(), nullptr, nullptr);
   deps.audio_processing_builder = nullptr;
 
   // In emulation mode the host has several interfaces (the real NIC, the
@@ -406,6 +413,39 @@ bool Conductor::CreatePeerConnection() {
   server.username = "";
   server.password = "";
   config.servers.push_back(server);
+
+  // ICE liveness timeouts, widened for RAN-emulator runs over real cellular
+  // traces. p2p_constants.cc defaults CONNECTION_WRITE_TIMEOUT to 15 s: after
+  // 15 s with no STUN ping response the candidate pair goes STATE_WRITE_TIMEOUT
+  // and stops carrying media (connection.cc: writable() is false). A real 5G
+  // trace (traces/real5g_mc.csv, from xu5g_0.pitree-trace) has sub-kbps
+  // outages of 18.3 s and 15.7 s — right across that threshold — so whether a
+  // ping squeezed through decided the run, killing ~45% of them permanently.
+  // Permanently, because the emulator points WEBRTC_CONNECT at a black-holed
+  // STUN address: there are no server-reflexive candidates, so the single host
+  // pair has nothing to fail over to and nothing to re-gather.
+  //
+  // A real UE keeps its RRC connection across an outage that long, so the
+  // 15 s default — not the widened value — is what misrepresents the link.
+  // Defaults below clear the worst outage with margin; override per-run if a
+  // trace has longer ones.
+  auto env_ms = [](const char* name, int fallback) {
+    if (const char* v = std::getenv(name)) {
+      char* end = nullptr;
+      long parsed = std::strtol(v, &end, 10);
+      if (end != v && parsed > 0) return static_cast<int>(parsed);
+    }
+    return fallback;
+  };
+  // (stun_keepalive_interval lives on IceConfig, not RTCConfiguration, in this
+  // baseline — the two below are the ones the failure hangs on anyway:
+  // ice_unwritable_timeout -> CONNECTION_WRITE_CONNECT_TIMEOUT,
+  // ice_inactive_timeout   -> CONNECTION_WRITE_TIMEOUT.)
+  config.ice_unwritable_timeout = env_ms("QCON_ICE_UNWRITABLE_TIMEOUT_MS", 30000);
+  config.ice_inactive_timeout = env_ms("QCON_ICE_INACTIVE_TIMEOUT_MS", 60000);
+  RTC_LOG(LS_WARNING) << "[ICE] liveness timeouts: unwritable="
+                      << *config.ice_unwritable_timeout << "ms inactive="
+                      << *config.ice_inactive_timeout << "ms";
 
   webrtc::PeerConnectionDependencies pc_dependencies(this);
   auto error_or_peer_connection =
@@ -2122,6 +2162,15 @@ void Conductor::InitializeLlmAdapter() {
 // ============================================================================
 // WebSocket Signaling Implementation
 // ============================================================================
+
+void Conductor::SetEmulationMode(bool is_emulation, bool is_sender) {
+  is_emulation_ = is_emulation;
+  is_sender_ = is_sender;
+}
+
+void Conductor::SetNetInterface(std::string interface_name) {
+  net_interface_ = interface_name;
+}
 
 void Conductor::ServiceWebSocket() {
   if (ws_client_) {

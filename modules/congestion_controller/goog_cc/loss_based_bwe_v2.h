@@ -81,6 +81,28 @@ class LossBasedBweV2 {
   // For unit testing only.
   void SetBandwidthEstimate(DataRate bandwidth_estimate);
 
+  // Diagnostics for the [BWE-TARGET] log in SendSideBandwidthEstimation.
+  //
+  // GoogCc can see this estimator's output (Result) but none of its input, and
+  // on this testbed the two disagree completely: runs that sat in kDecreasing
+  // for 7 s reported RTCP fraction_lost = 0.000 for their entire duration,
+  // because the loss ratio below is derived from TWCC feedback and the RAN's
+  // keyframe swap steers fresh packets past a stale backlog -- which makes the
+  // receiver's PacketArrivalTimeMap mark every overtaken packet not-received.
+  // Without these two numbers there is no way to tell which term is holding the
+  // rate down: the loss ratio itself (fix = shorten the observation history) or
+  // the instant upper bound's bandwidth-balance constant (fix = raise it).
+  double GetAverageReportedLossRatio() const {
+    return average_reported_loss_ratio_;
+  }
+  // Wrapper: the real getter is private and this is the only caller outside.
+  DataRate GetInstantUpperBoundForLogging() const {
+    return GetInstantUpperBound();
+  }
+  // How many observations have been sealed. Below observation_window_size the
+  // ring is still filling, so the average is over fewer samples than configured.
+  int GetNumObservations() const { return num_observations_; }
+
  private:
   struct ChannelParameters {
     double inherent_loss = 0.0;

@@ -98,8 +98,9 @@ ABSL_FLAG(bool, rtp_only_mode, false, "RTP-only test mode (no SCTP).");
 ABSL_FLAG(int, test_duration, 10, "Test duration in seconds.");
 ABSL_FLAG(int,
           vp8_kf_max_dist,
-          3000,
-          "VP8 keyframe interval (libvpx kf_max_dist).");
+          0,
+          "VP8 keyframe interval (libvpx kf_max_dist). 0 keeps whatever "
+          "WEBRTC_VP8_KF_MAX_DIST holds, or the library default.");
 ABSL_FLAG(std::string, model_path, "", "LLM model path (demo mode).");
 ABSL_FLAG(std::string, context_path, "", "Raw-text context file (demo mode).");
 ABSL_FLAG(std::string, kvcache_path, "", "KV-cache file (demo mode).");
@@ -118,5 +119,24 @@ ABSL_FLAG(bool,
           "default to no logging (rtc_base/logging.cc: LS_NONE); this flips it "
           "on at runtime via LogMessage::LogToDebug without needing a debug "
           "(-O0) build.");
+
+ABSL_FLAG(std::string,
+          experiment_mode,
+          "real",
+          "Operation mode: 'real' for normal bidirectional WebRTC, "
+          "'emulation' for network emulation (restricts ICE candidates to "
+          "--network_interface).");
+ABSL_FLAG(std::string,
+          network_interface,
+          "",
+          "Network interface to restrict ICE candidate gathering to; "
+          "required when --experiment_mode=emulation.");
+ABSL_FLAG(std::string,
+          server_scheme,
+          "https",
+          "Signalling URL scheme: 'https' (external server, no port in "
+          "URL) or 'http' (local signalling_server.py; --port is appended "
+          "to the URL). Unused unless --server/--port name the signalling "
+          "host instead of --signaling_server.");
 
 #endif  // EXAMPLES_PEERCONNECTION_CLIENT_FLAG_DEFS_H_

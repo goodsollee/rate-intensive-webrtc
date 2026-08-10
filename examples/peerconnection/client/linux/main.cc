@@ -225,7 +225,36 @@ Example Commands:
   // Configure conductor
   if (use_websocket) {
     conductor->SetRoomId(room_id);
-    conductor->SetServer(absl::GetFlag(FLAGS_signaling_server));
+    // --server/--port/--server_scheme (open-ran-emulator's run_e2e.sh) name
+    // the bundled local signalling_server.py; prefer them over
+    // --signaling_server when --server was actually set to something other
+    // than its "localhost" default. SignalingBaseUrl() (conductor.cc)
+    // prepends https:// unless the string already embeds a scheme.
+    std::string signaling_target = absl::GetFlag(FLAGS_signaling_server);
+    const std::string flag_server = absl::GetFlag(FLAGS_server);
+    if (flag_server != "localhost") {
+      signaling_target = flag_server;
+      if (absl::GetFlag(FLAGS_server_scheme) == "http") {
+        signaling_target = "http://" + flag_server + ":" +
+                            std::to_string(absl::GetFlag(FLAGS_port));
+      }
+    }
+    conductor->SetServer(signaling_target);
+    // --experiment_mode=emulation + --network_interface: restrict ICE
+    // candidate gathering to the emulator's tun interface (see
+    // InitializePeerConnection in conductor.cc).
+    const std::string experiment_mode = absl::GetFlag(FLAGS_experiment_mode);
+    const bool is_emulation = (experiment_mode == "emulation");
+    conductor->SetEmulationMode(is_emulation, absl::GetFlag(FLAGS_is_sender));
+    if (is_emulation) {
+      const std::string net_iface = absl::GetFlag(FLAGS_network_interface);
+      if (net_iface.empty()) {
+        printf("Error: --network_interface is required when "
+               "--experiment_mode=emulation.\n");
+        return -1;
+      }
+      conductor->SetNetInterface(net_iface);
+    }
     conductor->SetIsSender(absl::GetFlag(FLAGS_is_sender));
     conductor->SetY4mPath(absl::GetFlag(FLAGS_y4m_path));
     // Apply max bitrate: rtp.csv overrides --max_bitrate_kbps flag
@@ -264,7 +293,7 @@ Example Commands:
 
     // Start WebSocket signaling
     printf("[WebSocket] Starting signaling to %s...\n",
-           absl::GetFlag(FLAGS_signaling_server).c_str());
+           signaling_target.c_str());
     conductor->StartWebSocketSignaling();
   }
 

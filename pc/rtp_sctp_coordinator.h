@@ -332,7 +332,17 @@ class RtpSctpCoordinator {
   static std::atomic<bool> fse_mode_active_;           // FSE mode flag for GCC
   static std::atomic<bool> fse_v2_mode_active_;        // FSEv2 mode flag (lightweight override)
   static std::atomic<int64_t> pudica_rtp_target_bps_;  // Apollo: Pudica RTP target override
+  // steady_clock us when pudica_rtp_target_bps_ was last published. The
+  // controller only runs on a completed frame, so a dip deep enough to stop
+  // frame completions freezes the override; GetPudicaRtpOverride() uses this
+  // to hand the rate back to GCC instead of serving a stale value forever.
+  static std::atomic<int64_t> pudica_rtp_target_pub_us_;
   static std::atomic<bool> pudica_mode_active_;        // Apollo: Pudica mode flag for GCC
+  // §4.3 next delay: the newest send time seen in TWCC feedback. Every frame
+  // the pacer recorded at or before this has been accounted for, so the pacer's
+  // oldest survivor is the "earliest sent frame among the in-flight frames".
+  // Written from the feedback path, read from GetPudicaRtpOverride().
+  static std::atomic<int64_t> pudica_acked_send_us_;
 
   CoordinatorConfig config_;
   CoordinatorFeatures features_;
@@ -486,6 +496,9 @@ class RtpSctpCoordinator {
   // Per-frame OWD tracking (all times in microseconds for sub-ms precision)
   struct PudicaFrameInfo {
     int64_t first_send_us = -1;   // first packet send time (μs)
+    int64_t last_send_us = -1;    // last packet send time (μs); the frame's own
+                                  // send span, needed to keep it out of Eq.1 --
+                                  // see PudicaComputeFrameBur.
     int64_t last_recv_us = -1;    // last packet receive time (μs)
     int frame_packets = 0;
   };
@@ -542,7 +555,8 @@ class RtpSctpCoordinator {
   struct PudicaBurSample {
     int64_t time_us;
     double bur;
-    double bitrate_bps;
+    double bitrate_bps;       // encoding bitrate B_k the frame was produced at
+    double frame_rate_bps;    // the frame's OWN rate (size / L); see ratsum
   };
   std::deque<PudicaBurSample> pudica_bur_history_;
   static constexpr int64_t kPudicaBurWindowUs = 200'000;  // 200ms in μs
@@ -551,6 +565,19 @@ class RtpSctpCoordinator {
   std::ofstream pudica_csv_file_;
   bool pudica_csv_initialized_ = false;
   int64_t pudica_csv_start_us_ = 0;
+
+  // Per-packet OWD trace (PUDICA_OWD_TRACE=1, off by default). Eq.1's D is the
+  // frame's LAST receive time, i.e. the max over the frame's N packets, while
+  // D_min is the min over a 10 s window of single packets. If per-packet OWD has
+  // jitter, D - D_min picks up max(N) - min(window) — an extreme-value gap that
+  // grows with N and then saturates, which is the shape of the ~6-8 ms
+  // load-independent excess in section 4c. This trace records every packet's OWD
+  // so that gap can be measured directly instead of inferred.
+  std::ofstream pudica_owd_file_;
+  bool pudica_owd_initialized_ = false;
+  int64_t pudica_owd_start_us_ = 0;
+  int64_t pudica_owd_frame_id_ = 0;
+  int pudica_owd_pkt_in_frame_ = 0;
 
   // Pudica methods
   double PudicaComputeFrameBur(int64_t now_us);

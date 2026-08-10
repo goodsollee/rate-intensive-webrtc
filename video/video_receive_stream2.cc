@@ -166,9 +166,55 @@ std::string OptionalDelayToLogString(std::optional<TimeDelta> opt) {
   return opt.has_value() ? absl::StrCat(*opt) : "<unset>";
 }
 
+// --- Testbed knob: cloud-gaming-style short decodable-frame timeout ---------
+// The default kMaxWaitForFrame is 3 s, which is 7.5x the RAN swap's 400 ms
+// deadline. A RAN-induced stall therefore only reaches the UE's keyframe
+// request through NackRequester's list-overflow gate, and that gate needs an
+// arriving packet — silence disables it. Overriding the delta-frame timeout
+// (GeForce-Now-like ~0.4 s) turns silence itself into the trigger.
+//
+// Setting it via rtx-time in SDP would work too (see DetermineMaxWaitForFrame
+// below), but that same value is the NACK/RTX history, and shortening RTX
+// invalidates the RAN experiments this exists for. Hence a separate knob.
+//
+// Deliberately does NOT touch the keyframe timeout: max_wait_for_keyframe_ also
+// sizes IsReceivingKeyFrame()'s request-suppression window, so shortening it
+// would let the 400 ms timeout re-arm into a PLI storm.
+TimeDelta MaxWaitForFrameOverride() {
+  static const TimeDelta kOverride = [] {
+    const char* ms = getenv("QCON_MAX_WAIT_FOR_FRAME_MS");
+    if (!ms)
+      return TimeDelta::Zero();
+    int64_t v = atoll(ms);
+    // std::cout, not RTC_LOG: release builds default to LS_NONE
+    // (rtc_base/logging.cc) so an RTC_LOG line here is invisible unless the run
+    // passes --verbose_log, and then there is no way to tell "knob was off"
+    // from "knob was on and never fired". This line must always be in
+    // receiver.log.
+    if (v <= 0) {
+      std::cout << "[testbed] QCON_MAX_WAIT_FOR_FRAME_MS invalid: " << ms
+                << " (ignored)" << std::endl;
+      return TimeDelta::Zero();
+    }
+    std::cout << "[testbed] QCON_MAX_WAIT_FOR_FRAME_MS=" << v
+              << ": overriding the 3 s decodable-frame timeout." << std::endl;
+    return TimeDelta::Millis(v);
+  }();
+  return kOverride;
+}
+
 }  // namespace
 
 TimeDelta DetermineMaxWaitForFrame(TimeDelta rtp_history, bool is_keyframe) {
+  // Testbed override wins for delta frames only. Applied here rather than at
+  // the two call sites so that SetNackHistory()'s recomputation on codec
+  // renegotiation cannot silently restore the 3 s default mid-run.
+  if (!is_keyframe) {
+    TimeDelta override_wait = MaxWaitForFrameOverride();
+    if (override_wait > TimeDelta::Zero())
+      return override_wait;
+  }
+
   // A (arbitrary) conversion factor between the remotely signalled NACK buffer
   // time (if not present defaults to 1000ms) and the maximum time we wait for a
   // remote frame. Chosen to not change existing defaults when using not
@@ -851,6 +897,16 @@ void VideoReceiveStream2::OnEncodedFrame(std::unique_ptr<EncodedFrame> frame) {
 void VideoReceiveStream2::OnDecodableFrameTimeout(TimeDelta wait) {
   RTC_DCHECK_RUN_ON(&packet_sequence_checker_);
   Timestamp now = env_.clock().CurrentTime();
+
+  // Firing trace for the testbed knob, on stdout for the same reason as the
+  // announcement above. Not gated on the request actually being sent: the two
+  // suppressions below (stream_is_active, IsReceivingKeyFrame) are exactly what
+  // a "timeout fired but no PLI appeared" run needs to distinguish. Silent
+  // unless the override is set, so vanilla runs are unchanged.
+  if (MaxWaitForFrameOverride() > TimeDelta::Zero()) {
+    std::cout << "[testbed] FRAME_TIMEOUT fired after " << wait.ms()
+              << " ms at " << now.ms() << " ms (monotonic)" << std::endl;
+  }
 
   std::optional<int64_t> last_packet_ms =
       rtp_video_stream_receiver_.LastReceivedPacketMs();

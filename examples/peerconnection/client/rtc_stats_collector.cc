@@ -714,6 +714,14 @@ void VanillaRTCStatsCallback::ProcessOutboundRTPStats(
   int64_t bytes_sent = static_cast<int64_t>(get_numeric("bytesSent"));
   int64_t packets_sent = static_cast<int64_t>(get_numeric("packetsSent"));
   int64_t frames_encoded = static_cast<int64_t>(get_numeric("framesEncoded"));
+  // framesEncoded counts what the ENCODER produced; framesSent counts what
+  // actually went on the wire. Under a low rate target the pacer drops the
+  // difference before transmission, so the two diverge badly — measured
+  // encoded=30 fps against 11-19 fps delivered with ZERO packet loss and an
+  // empty RAN queue. Any "sender vs receiver fps" comparison built on
+  // framesEncoded therefore charges the network for the sender's own frame
+  // dropping; tools/plot_e2e.py's sent_fps needs this column instead.
+  int64_t frames_sent = static_cast<int64_t>(get_numeric("framesSent"));
   int64_t now_ms = rtc::TimeMillis();
 
   // RTCP feedback received by this sender + keyframe/retransmission ground
@@ -755,7 +763,7 @@ void VanillaRTCStatsCallback::ProcessOutboundRTPStats(
                   << "period_bitrate_mbps,overall_bitrate_mbps,"
                   << "pli_received,fir_received,nack_received,"
                   << "key_frames_encoded,retx_packets_sent,"
-                  << "quality_limitation_reason\n";
+                  << "quality_limitation_reason,frames_sent\n";
               RTC_LOG(LS_INFO) << "[SENDER] Opened sender_stats.csv: " << filepath;
           }
       }
@@ -795,7 +803,8 @@ void VanillaRTCStatsCallback::ProcessOutboundRTPStats(
           << nack_received << ","
           << key_frames_encoded << ","
           << retx_packets_sent << ","
-          << quality_limitation_reason << "\n";
+          << quality_limitation_reason << ","
+          << frames_sent << "\n";
       persistent_stats_.sender_stats_file_.flush();
 
       // Reset period

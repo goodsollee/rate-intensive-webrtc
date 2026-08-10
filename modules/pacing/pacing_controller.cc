@@ -10,11 +10,16 @@
 
 #include "modules/pacing/pacing_controller.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <memory>
+#include <string>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -34,6 +39,7 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/numerics/safe_conversions.h"
+#include "rtc_base/synchronization/mutex.h"
 #include "system_wrappers/include/clock.h"
 
 namespace webrtc {
@@ -68,6 +74,42 @@ bool PacingController::pudica_probing_enabled_ = false;
 int PacingController::pudica_num_probes_ = 4;
 double PacingController::pudica_rho_override_ = 0;
 bool PacingController::pudica_intra_frame_pacing_ = false;
+namespace {
+// A frame every 33 ms, so this is ~17 s of outstanding frames. The list only
+// grows while feedback is absent, and Pudica's own fallback bottoms out long
+// before then; the bound exists so a permanently dead return path cannot leak.
+constexpr size_t kPudicaMaxSentFrames = 512;
+
+struct PudicaSentFrames {
+  Mutex lock;
+  std::deque<int64_t> frames RTC_GUARDED_BY(lock);
+};
+// Function-local, intentionally never destroyed: a namespace-scope object with
+// a destructor trips -Wexit-time-destructors, and the pacer thread may still be
+// running at teardown.
+PudicaSentFrames& SentFrames() {
+  static PudicaSentFrames* const s = new PudicaSentFrames();
+  return *s;
+}
+}  // namespace
+
+void PacingController::PudicaRecordFrameSent(int64_t send_us) {
+  PudicaSentFrames& s = SentFrames();
+  MutexLock lock(&s.lock);
+  s.frames.push_back(send_us);
+  if (s.frames.size() > kPudicaMaxSentFrames) {
+    s.frames.pop_front();
+  }
+}
+
+int64_t PacingController::PudicaOldestUnackedSendUs(int64_t acked_through_us) {
+  PudicaSentFrames& s = SentFrames();
+  MutexLock lock(&s.lock);
+  while (!s.frames.empty() && s.frames.front() <= acked_through_us) {
+    s.frames.pop_front();
+  }
+  return s.frames.empty() ? 0 : s.frames.front();
+}
 
 // L: frame sending interval (30 fps). Shared by the Eq.2 intra-frame pacing
 // span, the T_packet probe spacing and the agnostic-period hold below.
@@ -516,6 +558,7 @@ void PacingController::ProcessPackets() {
     pudica_frame_rate_ = DataRate::Zero();
     adjusted_media_rate_ = pacing_rate_;
     pudica_frame_send_start_ = Timestamp::MinusInfinity();
+    pudica_frame_hit_deadline_ = true;
   }
 
   TimeDelta early_execute_margin =
@@ -634,6 +677,14 @@ void PacingController::ProcessPackets() {
             adjusted_media_rate_ = pudica_frame_rate_;
           }
         }
+        // Trace: what Eq.2 armed from, so it can be compared with what the
+        // frame turned out to be. See the member declarations.
+        pudica_arm_size_ = packet_size + QueueSizeData();
+        pudica_arm_queue_ = QueueSizeData();
+        pudica_arm_rate_ = pudica_frame_rate_;
+        pudica_frame_bytes_sent_ = DataSize::Zero();
+        pudica_frame_pkts_sent_ = 0;
+        pudica_frame_hit_deadline_ = false;
       }
 
       // Pudica: detect video frame end (marker bit) before packet is moved
@@ -650,11 +701,17 @@ void PacingController::ProcessPackets() {
       }
       data_sent += packet_size;
       ++packets_sent;
+      if (packet_type == RtpPacketMediaType::kVideo) {
+        pudica_frame_bytes_sent_ += packet_size;
+        ++pudica_frame_pkts_sent_;
+      }
 
       // Pudica: schedule deferred probe packets after frame ends
       if (pudica_frame_ended) {
         static int marker_count = 0;
         marker_count++;
+        // §4.3 next delay: this frame is now fully sent and outstanding.
+        PudicaRecordFrameSent(now.us());
         // Compute T_packet = (1-1/ρ) × L / (N+1)
         double rho = pudica_rho_override_ > 1.0 ? pudica_rho_override_ : 2.0;
         const double kL_us = kPudicaFrameIntervalUs;
@@ -681,6 +738,52 @@ void PacingController::ProcessPackets() {
         pudica_frame_send_start_ = Timestamp::MinusInfinity();  // reset for next frame
         double used_mbps = pudica_frame_rate_.bps() / 1e6;
         pudica_frame_rate_ = DataRate::Zero();  // revert to pacing_rate_ in the gap
+
+        // Per-frame pacer trace. armed_* is what Eq.2 sized the rate from;
+        // sent_* is what the frame actually was. span_ms against
+        // L/rho = the requested span says whether the pacer met the rate it was
+        // given, and armed vs sent says whether the rate was right to begin with.
+        static const bool kPaceTrace = []() {
+          const char* e = std::getenv("PUDICA_PACE_TRACE");
+          return e && std::atoi(e) != 0;
+        }();
+        if (kPaceTrace) {
+          if (!pudica_pace_initialized_) {
+            const char* dir = std::getenv("UNIFIED_CSV_DIR");
+            if (dir && dir[0]) {
+              std::string path = std::string(dir) + "/pudica_pace.csv";
+              pudica_pace_file_.open(path, std::ios::out | std::ios::trunc);
+              if (pudica_pace_file_.is_open()) {
+                chmod(path.c_str(), 0666);
+                pudica_pace_file_
+                    << "time_ms,armed_bytes,armed_queue_bytes,armed_rate_mbps,"
+                       "sent_bytes,sent_pkts,span_ms,want_span_ms,"
+                       "achieved_mbps,queue_end_bytes,pacing_rate_mbps,"
+                       "hit_deadline\n";
+              }
+              pudica_pace_start_ = now;
+              pudica_pace_initialized_ = true;
+            }
+          }
+          if (pudica_pace_file_.is_open()) {
+            double span_ms = frame_send_us / 1000.0;
+            double achieved = span_ms > 0.0
+                ? pudica_frame_bytes_sent_.bytes<double>() * 8.0 /
+                      (span_ms / 1000.0) / 1e6
+                : 0.0;
+            pudica_pace_file_
+                << (now - pudica_pace_start_).ms() << ','
+                << pudica_arm_size_.bytes() << ','
+                << pudica_arm_queue_.bytes() << ','
+                << pudica_arm_rate_.bps() / 1e6 << ','
+                << pudica_frame_bytes_sent_.bytes() << ','
+                << pudica_frame_pkts_sent_ << ','
+                << span_ms << ',' << (kL_us / rho / 1000.0) << ','
+                << achieved << ',' << QueueSizeData().bytes() << ','
+                << pacing_rate_.bps() / 1e6 << ','
+                << (pudica_frame_hit_deadline_ ? 1 : 0) << '\n';
+          }
+        }
 
         if (marker_count % 100 == 0) {
           fprintf(stderr, "[PUDICA-MARKER] markers=%d T_pkt=%.1fms gap=%.1f/%.1fms rho=%.1f send=%.1fms "

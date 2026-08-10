@@ -242,6 +242,14 @@ void RtpTransportControllerSend::UpdateControlState() {
 void RtpTransportControllerSend::UpdateCongestedState() {
   if (auto update = GetCongestedStateUpdate()) {
     is_congested_ = update.value();
+    // A congested pacer stops sending media entirely, which shows up as
+    // sender fps/bitrate going to 0 with quality_limitation_reason still
+    // "none" — indistinguishable in the CSVs from an encoder-side pause.
+    // Log the transition so the two can be told apart.
+    fprintf(stderr, "[CC-CONGESTED] %s outstanding=%.0fKB cwnd=%.0fKB\n",
+            update.value() ? "ENTER" : "EXIT",
+            transport_feedback_adapter_.GetOutstandingData().bytes() / 1000.0,
+            congestion_window_size_.bytes() / 1000.0);
     pacer_.SetCongested(update.value());
   }
 }

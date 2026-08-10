@@ -10,6 +10,7 @@
 
 #include "api/video_codecs/video_encoder.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -31,6 +32,21 @@
 
 namespace webrtc {
 
+namespace {
+// Testbed hook: peerconnection_client's --vp8_kf_max_dist is transported here
+// via env because the settings struct is built inside the library with no
+// app-level hook (see conductor.cc). Out of range or unset keeps the upstream
+// default. 0 is rejected rather than passed through: libvpx reads
+// keyFrameInterval as kf_max_dist, where 0 means "every frame is a keyframe".
+int Vp8KeyFrameIntervalFromEnv(int dflt) {
+  const char* v = getenv("WEBRTC_VP8_KF_MAX_DIST");
+  if (!v || !*v)
+    return dflt;
+  int parsed = atoi(v);
+  return (parsed > 0 && parsed <= 100000) ? parsed : dflt;
+}
+}  // namespace
+
 // TODO(mflodman): Add default complexity for VP9 and VP9.
 VideoCodecVP8 VideoEncoder::GetDefaultVp8Settings() {
   VideoCodecVP8 vp8_settings;
@@ -39,7 +55,7 @@ VideoCodecVP8 VideoEncoder::GetDefaultVp8Settings() {
   vp8_settings.numberOfTemporalLayers = 1;
   vp8_settings.denoisingOn = true;
   vp8_settings.automaticResizeOn = false;
-  vp8_settings.keyFrameInterval = 3000;
+  vp8_settings.keyFrameInterval = Vp8KeyFrameIntervalFromEnv(3000);
 
   return vp8_settings;
 }

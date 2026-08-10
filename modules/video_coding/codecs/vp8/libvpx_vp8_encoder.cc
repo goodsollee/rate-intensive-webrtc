@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -36,6 +38,7 @@
 #include "modules/video_coding/utility/simulcast_rate_allocator.h"
 #include "modules/video_coding/utility/simulcast_utility.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/time_utils.h"
 #include "rtc_base/experiments/field_trial_parser.h"
 #include "rtc_base/experiments/field_trial_units.h"
 #include "rtc_base/logging.h"
@@ -75,6 +78,113 @@ constexpr uint32_t kVp832ByteAlign = 32u;
 
 constexpr int kRtpTicksPerSecond = 90000;
 constexpr int kRtpTicksPerMs = kRtpTicksPerSecond / 1000;
+
+// --- testbed instrumentation: encoder target bitrate -----------------------
+// rc_target_bitrate is the rate libvpx actually budgets frames against, and it
+// is what MaxIntraTarget() scales to cap a keyframe (KF <= 0.3 s worth of this
+// value at any fps). It is NOT the congestion controller's target: the
+// protection/retransmission reserve is already subtracted by the time it gets
+// here, so measuring the RAN-side estimator against the GCC target or against
+// observed output bytes both introduce a bias this file can remove for free.
+// Same file-scope pattern and $UNIFIED_CSV_DIR as gcc_trendline.csv; the
+// timestamp is rtc::TimeMillis() so it shares a clock with sender_stats.csv
+// and the RIC's BPF (CLOCK_MONOTONIC ms).
+// kf_max_dist is logged because WEBRTC_VP8_KF_MAX_DIST reaches this process
+// through an explicit `env` list in run_e2e.sh, so a run where the pin failed
+// to arrive is indistinguishable from a normal one until the keyframe count is
+// counted hours later. Four calibration runs were lost that way.
+// Intentionally leaked to avoid an exit-time destructor.
+std::ofstream& EncTargetCsvFile() {
+  static std::ofstream* const file = new std::ofstream();
+  return *file;
+}
+bool enc_target_csv_initialized = false;
+
+// Per-ENCODED-FRAME ground truth: the actual encoder resolution and the actual
+// quantizer, neither of which is recoverable downstream.
+//
+// Why both are needed. The RAN-side keyframe-size bound is
+// S_kf = corr * (vp8_bits_per_mb[INTRA][Q] >> 9) * MBs, so it is a function of
+// the encoder's resolution and QP. Neither is observable from the wire, and the
+// receiver-side video_width/height in average_stats.csv is the LAST DECODED
+// frame -- during a dip nothing decodes, so that field goes stale exactly when
+// the answer matters. Two open questions rest on this file:
+//   1. the measured 0.295-0.375 Mb keyframes sit on the 540p analytic floor
+//      while the receiver reported 1920x1080; resolution or corr ~ 0.23?
+//   2. the quality scaler's downscale threshold is qp > 95 on the 0-127 qindex
+//      scale, and q_trans[rc_max_quantizer=56] = 106 -- so hitting the QP cap
+//      should GUARANTEE a downscale. That is a prediction, not a measurement.
+// qp is VP8E_GET_LAST_QUANTIZER, i.e. the 0-127 qindex, the SAME scale the
+// quality scaler thresholds against -- not the 0-63 rc_max_quantizer scale.
+// Intentionally leaked to avoid an exit-time destructor.
+std::ofstream& EncFrameCsvFile() {
+  static std::ofstream* const file = new std::ofstream();
+  return *file;
+}
+bool enc_frame_csv_initialized = false;
+
+void LogEncodedFrame(int width,
+                     int height,
+                     int qp_128,
+                     size_t bytes,
+                     bool is_key,
+                     uint32_t rtp_ts) {
+  if (!enc_frame_csv_initialized) {
+    enc_frame_csv_initialized = true;
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      EncFrameCsvFile().open(std::string(dir) + "/encoder_frames.csv",
+                             std::ios::out | std::ios::trunc);
+      if (EncFrameCsvFile().is_open()) {
+        EncFrameCsvFile()
+            << "time_ms,rtp_ts,width,height,qp,bytes,is_key,mbs\n";
+      }
+    }
+  }
+  if (!EncFrameCsvFile().is_open())
+    return;
+  // Macroblocks, so the consumer does not re-derive the 16x16 tiling that the
+  // analytic floor is expressed in.
+  const int mbs = ((width + 15) / 16) * ((height + 15) / 16);
+  EncFrameCsvFile() << rtc::TimeMillis() << ',' << rtp_ts << ',' << width << ','
+                    << height << ',' << qp_128 << ',' << bytes << ','
+                    << (is_key ? 1 : 0) << ',' << mbs << '\n';
+  EncFrameCsvFile().flush();
+}
+
+void LogEncoderTarget(unsigned int target_kbps,
+                      double framerate_fps,
+                      unsigned int max_intra_pct,
+                      unsigned int kf_max_dist,
+                      unsigned int cfg_w,
+                      unsigned int cfg_h) {
+  if (!enc_target_csv_initialized) {
+    enc_target_csv_initialized = true;
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      EncTargetCsvFile().open(std::string(dir) + "/encoder_target.csv",
+                              std::ios::out | std::ios::trunc);
+      if (EncTargetCsvFile().is_open()) {
+        EncTargetCsvFile()
+            << "time_ms,encoder_target_bps,framerate_fps,max_intra_pct,"
+               "kf_cap_bits,kf_max_dist,cfg_w,cfg_h\n";
+      }
+    }
+  }
+  if (!EncTargetCsvFile().is_open())
+    return;
+  // The cap libvpx will hold the next keyframe to, in bits, spelled out here
+  // so the consumer does not have to re-derive MaxIntraTarget()'s formula.
+  const double target_bps = static_cast<double>(target_kbps) * 1000.0;
+  const double fps = framerate_fps > 0.0 ? framerate_fps : 1.0;
+  const double kf_cap_bits =
+      (static_cast<double>(max_intra_pct) / 100.0) * (target_bps / fps);
+  EncTargetCsvFile() << rtc::TimeMillis() << ',' << target_bps << ','
+                     << framerate_fps << ',' << max_intra_pct << ','
+                     << kf_cap_bits << ',' << kf_max_dist << ','
+                     << cfg_w << ',' << cfg_h << '\n';
+  EncTargetCsvFile().flush();
+}
 
 // If internal frame dropping is enabled, force the encoder to output a frame
 // on an encode request after this timeout even if this causes some
@@ -418,6 +528,12 @@ void LibvpxVp8Encoder::SetRates(const RateControlParameters& parameters) {
       SetStreamState(send_stream, stream_idx);
 
     vpx_configs_[i].rc_target_bitrate = target_bitrate_kbps;
+    if (i == 0) {
+      // Stream 0 only: the single-stream case this testbed runs.
+      LogEncoderTarget(target_bitrate_kbps, parameters.framerate_fps,
+                       rc_max_intra_target_, vpx_configs_[0].kf_max_dist,
+                       vpx_configs_[0].g_w, vpx_configs_[0].g_h);
+    }
     if (send_stream) {
       frame_buffer_controller_->OnRatesUpdated(
           stream_idx, parameters.bitrate.GetTemporalLayerAllocation(stream_idx),
@@ -1258,6 +1374,12 @@ int LibvpxVp8Encoder::GetEncodedPartitions(const VideoFrame& input_image,
         libvpx_->codec_control(&encoders_[encoder_idx], VP8E_GET_LAST_QUANTIZER,
                                &qp_128);
         encoded_images_[encoder_idx].qp_ = qp_128;
+        LogEncodedFrame(encoded_images_[encoder_idx]._encodedWidth,
+                        encoded_images_[encoder_idx]._encodedHeight, qp_128,
+                        encoded_images_[encoder_idx].size(),
+                        encoded_images_[encoder_idx]._frameType ==
+                            VideoFrameType::kVideoFrameKey,
+                        encoded_images_[encoder_idx].RtpTimestamp());
         last_encoder_output_time_[stream_idx] =
             Timestamp::Micros(input_image.timestamp_us());
 

@@ -196,6 +196,9 @@ class SendSideBandwidthEstimation {
   int expected_packets_since_last_loss_update_;
 
   std::optional<DataRate> acknowledged_rate_;
+  // Rate-limiter state for the [BWE-TARGET] diagnostic in UpdateTargetBitrate.
+  Timestamp bwe_log_last_time_ = Timestamp::MinusInfinity();
+  DataRate bwe_log_last_target_ = DataRate::MinusInfinity();
   DataRate current_target_;
   DataRate last_logged_target_;
   DataRate min_bitrate_configured_;
