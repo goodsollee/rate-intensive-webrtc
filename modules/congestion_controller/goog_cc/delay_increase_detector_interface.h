@@ -40,6 +40,13 @@ class DelayIncreaseDetectorInterface {
   virtual double GetThreshold() const = 0;
 
   virtual BandwidthUsage State() const = 0;
+
+  // [MAE] Continuous companion to State(). State() is gated on a dwell time and
+  // a repeat count, so it turns ~96 ms after the delay trend does; this is the
+  // ungated ratio and rises immediately. 1.0 = at or below half the overuse
+  // threshold. Default here so detectors that do not implement it (e.g. the
+  // RTT-based one) stay compilable and simply report "no congestion".
+  virtual double AggressiveState() const { return 1.0; }
 };
 
 }  // namespace webrtc

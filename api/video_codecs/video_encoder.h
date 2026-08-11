@@ -292,6 +292,13 @@ class RTC_EXPORT VideoEncoder {
     // `bitrate.get_sum_bps()`, but may be higher if the application is not
     // network constrained.
     DataRate bandwidth_allocation;
+    // [MAE] Ungated delay-trend ratio from the congestion controller: 1.0 means
+    // no congestion signal, >1.0 means the trend has passed half the overuse
+    // threshold. Encoders may use it to tighten their rate control BEFORE
+    // GoogCC's own 3-state verdict fires (which is gated on a dwell time and a
+    // repeat count and so lands ~96 ms later). Defaulted, so encoders that
+    // ignore it are unaffected.
+    double is_overused_for_encoder = 1.0;
 
     bool operator==(const RateControlParameters& rhs) const;
     bool operator!=(const RateControlParameters& rhs) const;

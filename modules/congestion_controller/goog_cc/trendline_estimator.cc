@@ -218,6 +218,7 @@ TrendlineEstimator::TrendlineEstimator(
       time_over_using_(-1),
       overuse_counter_(0),
       hypothesis_(BandwidthUsage::kBwNormal),
+      hypothesis_aggressive_(1.0),
       hypothesis_predicted_(BandwidthUsage::kBwNormal),
       network_state_predictor_(network_state_predictor) {
   RTC_LOG(LS_INFO)
@@ -328,6 +329,7 @@ BandwidthUsage TrendlineEstimator::State() const {
 void TrendlineEstimator::Detect(double trend, double ts_delta, int64_t now_ms) {
   if (num_of_deltas_ < 2) {
     hypothesis_ = BandwidthUsage::kBwNormal;
+    hypothesis_aggressive_ = 1.0;
     return;
   }
   const double modified_trend =
@@ -360,6 +362,18 @@ void TrendlineEstimator::Detect(double trend, double ts_delta, int64_t now_ms) {
     overuse_counter_ = 0;
     hypothesis_ = BandwidthUsage::kBwNormal;
   }
+  // [MAE] The ungated companion to hypothesis_. The verdict above needs both
+  // `time_over_using_ > overusing_time_threshold_` and `overuse_counter_ > 1`
+  // before it will say kBwOverusing, which is why the delay-based backoff lands
+  // ~96 ms after the trend turns (measured, 25/25 runs). This ratio has neither
+  // gate: it leaves 1.0 as soon as the trend passes HALF the threshold, giving
+  // the encoder that much warning to bring its frames inside the per-frame
+  // budget instead of overshooting into the queue.
+  constexpr double kAggressiveRatio = 0.5;
+  hypothesis_aggressive_ = modified_trend > threshold_ * kAggressiveRatio
+                               ? modified_trend / (threshold_ * kAggressiveRatio)
+                               : 1.0;
+
   prev_trend_ = trend;
   UpdateThreshold(modified_trend, now_ms);
 }

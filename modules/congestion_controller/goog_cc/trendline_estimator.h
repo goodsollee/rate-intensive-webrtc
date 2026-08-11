@@ -75,6 +75,9 @@ class TrendlineEstimator : public DelayIncreaseDetectorInterface {
 
   BandwidthUsage State() const override;
 
+  // [MAE] See DelayIncreaseDetectorInterface::AggressiveState.
+  double AggressiveState() const override { return hypothesis_aggressive_; }
+
   struct PacketTiming {
     PacketTiming(double arrival_time_ms,
                  double smoothed_delay_ms,
@@ -119,6 +122,8 @@ class TrendlineEstimator : public DelayIncreaseDetectorInterface {
   double time_over_using_;
   int overuse_counter_;
   BandwidthUsage hypothesis_;
+  // [MAE] modified_trend / (threshold_ * 0.5), floored at 1.0.
+  double hypothesis_aggressive_;
   BandwidthUsage hypothesis_predicted_;
   NetworkStatePredictor* network_state_predictor_;
 };

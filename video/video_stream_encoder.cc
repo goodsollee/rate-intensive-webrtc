@@ -66,6 +66,53 @@
 namespace webrtc {
 
 namespace {
+// [T11] FRAME FATE. Every frame that enters the encoder leaves by exactly one
+// of five doors; getStats collapses four of them into one number and reports
+// quality_limitation="none" for two, which is why a 4 s hole in the output was
+// unexplainable from the outside. One line per second, off unless
+// KFT_CWND_FORENSICS=1.
+//
+//   captured  frames handed to the encoder by the source
+//   qoverload dropped at intake: a newer frame is already in flight
+//   paused    dropped because encoder_target == 0 (EncoderPaused)
+//   dropper   dropped by the leaky-bucket FrameDropper (kMediaOptimization)
+//   encoded   actually encoded
+//
+// target_kbps is last_encoder_rate_settings_->encoder_target — what the codec
+// was actually told, after allocation, not the transport estimate.
+struct FrameFate {
+  int captured = 0, qoverload = 0, paused = 0, dropper = 0, encoded = 0;
+  int64_t last_ms = 0;
+  static bool On() { return true; }  // [T11-DIAG] temporarily ungated
+  void Tick(int64_t now_ms, int target_kbps) {
+    if (!On()) return;
+    if (last_ms == 0) last_ms = now_ms;
+    if (now_ms - last_ms < 1000) return;
+    fprintf(stderr,
+            "KFTF FATE t_ms=%lld captured=%d qoverload=%d paused=%d "
+            "dropper=%d encoded=%d target_kbps=%d\n",
+            static_cast<long long>(now_ms), captured, qoverload, paused,
+            dropper, encoded, target_kbps);
+    captured = qoverload = paused = dropper = encoded = 0;
+    last_ms = now_ms;
+  }
+};
+FrameFate g_fate;
+
+// [NODROP] SparkRTC's disable_frame_drop, ported. Blocks all three doors a
+// frame can be thrown out of before it reaches the codec:
+//   1. EncoderPaused()   - target == 0
+//   2. FrameDropper      - the leaky bucket
+//   3. congestion window - cwnd_reduce_ratio
+// Unset => stock behaviour. Note this only stops WebRTC-level dropping; libvpx
+// still has its own rc_dropframe_thresh.
+bool NoFrameDrop() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_NO_FRAME_DROP");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
 
 // Time interval for logging frame counts.
 const int64_t kFrameLogIntervalMs = 60000;
@@ -1564,6 +1611,17 @@ void VideoStreamEncoder::OnFrame(Timestamp post_time,
   bool cwnd_frame_drop =
       cwnd_frame_drop_interval_ &&
       (cwnd_frame_counter_++ % cwnd_frame_drop_interval_.value() == 0);
+  ++g_fate.captured;
+  if (queue_overload) ++g_fate.qoverload;
+  // [T11] Tick here, not deeper in: every captured frame reaches this line,
+  // whereas MaybeEncodeVideoFrame is skipped entirely on queue_overload and
+  // returns early when the encoder is paused — the two cases the log most
+  // needs to report.
+  g_fate.Tick(rtc::TimeMillis(),
+              last_encoder_rate_settings_
+                  ? static_cast<int>(
+                        last_encoder_rate_settings_->encoder_target.kbps())
+                  : -1);
   if (!queue_overload && !cwnd_frame_drop) {
     MaybeEncodeVideoFrame(incoming_frame, post_time.us());
   } else {
@@ -1571,6 +1629,20 @@ void VideoStreamEncoder::OnFrame(Timestamp post_time,
       // Frame drop by congestion window pushback. Do not encode this
       // frame.
       ++dropped_frame_cwnd_pushback_count_;
+      // [T11] This drop happens BEFORE encoding, so it never reaches
+      // quality_limitation_reason — getStats reports "none" while the encoder
+      // emits nothing. That blind spot is why a 4 s hole in the output looked
+      // like a codec fault. Off unless KFT_CWND_FORENSICS=1.
+      static const bool kftf = [] {
+        const char* e = getenv("KFT_CWND_FORENSICS");
+        return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+      }();
+      if (kftf) {
+        fprintf(stderr, "KFTF CWNDDROP t_ms=%lld interval=%d total=%d\n",
+                static_cast<long long>(rtc::TimeMillis()),
+                cwnd_frame_drop_interval_.value(),
+                dropped_frame_cwnd_pushback_count_);
+      }
     } else {
       // There is a newer frame in flight. Do not encode this frame.
       RTC_LOG(LS_VERBOSE)
@@ -1603,6 +1675,8 @@ void VideoStreamEncoder::OnDiscardedFrame() {
 
 bool VideoStreamEncoder::EncoderPaused() const {
   RTC_DCHECK_RUN_ON(encoder_queue_.get());
+  // [NODROP] Never report paused, so frames are never withheld on a zero target.
+  if (NoFrameDrop()) return false;
   // Pause video if paused by caller or as long as the network is down or the
   // pacer queue has grown too large in buffered mode.
   // If the pacer queue has grown too large or the network is down,
@@ -1722,7 +1796,12 @@ void VideoStreamEncoder::SetEncoderRates(
     return;
 
   if (rate_control_changed) {
-    encoder_->SetRates(rate_settings.rate_control);
+    // [MAE] Attach the congestion signal to the parameters the codec receives.
+    // Done here rather than where rate_settings is built because this is the
+    // single point at which every path reaches the encoder.
+    VideoEncoder::RateControlParameters rc = rate_settings.rate_control;
+    rc.is_overused_for_encoder = last_is_overused_for_encoder_;
+    encoder_->SetRates(rc);
 
     encoder_stats_observer_->OnBitrateAllocationUpdated(
         send_codec_, rate_settings.rate_control.bitrate);
@@ -1835,6 +1914,7 @@ void VideoStreamEncoder::MaybeEncodeVideoFrame(const VideoFrame& video_frame,
   stream_resource_manager_.OnMaybeEncodeFrame();
 
   if (EncoderPaused()) {
+    ++g_fate.paused;
     // Storing references to a native buffer risks blocking frame capture.
     if (video_frame.video_frame_buffer()->type() !=
         VideoFrameBuffer::Type::kNative) {
@@ -1858,10 +1938,11 @@ void VideoStreamEncoder::MaybeEncodeVideoFrame(const VideoFrame& video_frame,
   // Frame dropping is enabled iff frame dropping is not force-disabled, and
   // rate controller is not trusted.
   const bool frame_dropping_enabled =
-      !force_disable_frame_dropper_ &&
+      !force_disable_frame_dropper_ && !NoFrameDrop() &&
       !encoder_info_.has_trusted_rate_controller;
   frame_dropper_.Enable(frame_dropping_enabled);
   if (frame_dropping_enabled && frame_dropper_.DropFrame()) {
+    ++g_fate.dropper;
     RTC_LOG(LS_VERBOSE)
         << "Drop Frame: "
            "target bitrate "
@@ -1875,6 +1956,7 @@ void VideoStreamEncoder::MaybeEncodeVideoFrame(const VideoFrame& video_frame,
     return;
   }
 
+  ++g_fate.encoded;
   EncodeVideoFrame(video_frame, time_when_posted_us);
 }
 
@@ -2266,6 +2348,8 @@ DataRate VideoStreamEncoder::UpdateTargetBitrate(DataRate target_bitrate,
                                                  double cwnd_reduce_ratio) {
   RTC_DCHECK_RUN_ON(encoder_queue_.get());
   DataRate updated_target_bitrate = target_bitrate;
+  // [NODROP] Neutralise congestion-window frame dropping.
+  if (NoFrameDrop()) cwnd_reduce_ratio = 0;
 
   // Drop frames when congestion window pushback ratio is larger than 1
   // percent and target bitrate is larger than codec min bitrate.
@@ -2294,21 +2378,26 @@ void VideoStreamEncoder::OnBitrateUpdated(DataRate target_bitrate,
                                           DataRate link_allocation,
                                           uint8_t fraction_lost,
                                           int64_t round_trip_time_ms,
-                                          double cwnd_reduce_ratio) {
+                                          double cwnd_reduce_ratio,
+                                          double is_overused_for_encoder) {
   RTC_DCHECK_GE(link_allocation, target_bitrate);
   if (!encoder_queue_->IsCurrent()) {
     encoder_queue_->PostTask([this, target_bitrate, stable_target_bitrate,
                               link_allocation, fraction_lost,
-                              round_trip_time_ms, cwnd_reduce_ratio] {
+                              round_trip_time_ms, cwnd_reduce_ratio,
+                              is_overused_for_encoder] {
       DataRate updated_target_bitrate =
           UpdateTargetBitrate(target_bitrate, cwnd_reduce_ratio);
       OnBitrateUpdated(updated_target_bitrate, stable_target_bitrate,
                        link_allocation, fraction_lost, round_trip_time_ms,
-                       cwnd_reduce_ratio);
+                       cwnd_reduce_ratio, is_overused_for_encoder);
     });
     return;
   }
   RTC_DCHECK_RUN_ON(encoder_queue_.get());
+  // [MAE] Remember it for the next SetRates() to the codec — that is where the
+  // VBV buffer is (re)configured, and the encoder is the only consumer.
+  last_is_overused_for_encoder_ = is_overused_for_encoder;
 
   const bool video_is_suspended = target_bitrate == DataRate::Zero();
   const bool video_suspension_changed = video_is_suspended != EncoderPaused();
@@ -2371,6 +2460,8 @@ void VideoStreamEncoder::OnBitrateUpdated(DataRate target_bitrate,
 }
 
 bool VideoStreamEncoder::DropDueToSize(uint32_t source_pixel_count) const {
+  // Fourth drop site, matching SparkRTC video_stream_encoder.cc:2406.
+  if (NoFrameDrop()) return false;
   if (!encoder_ || !stream_resource_manager_.DropInitialFrames() ||
       !encoder_target_bitrate_bps_ ||
       !stream_resource_manager_.SingleActiveStreamPixels()) {

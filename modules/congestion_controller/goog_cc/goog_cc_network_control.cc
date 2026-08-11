@@ -696,6 +696,10 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
     target_rate_msg.network_estimate.round_trip_time = round_trip_time;
     target_rate_msg.network_estimate.loss_rate_ratio = fraction_loss / 255.0f;
     target_rate_msg.network_estimate.bwe_period = bwe_period;
+    // [MAE] Ride the same message the encoder already receives. Set
+    // unconditionally: it costs one double, and gating it here would make the
+    // A/B depend on two things at once. The encoder decides whether to use it.
+    target_rate_msg.is_overused_for_encoder = delay_based_bwe_->aggressive_state();
 
     update->target_rate = target_rate_msg;
 

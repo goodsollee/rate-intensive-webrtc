@@ -38,6 +38,10 @@ struct BitrateAllocationUpdate {
   // VideoStreamEncoder to reduce the bitrate by the given fraction
   // by dropping frames.
   double cwnd_reduce_ratio = 0;
+  // [MAE] Carried alongside cwnd_reduce_ratio because it takes the identical
+  // path — congestion controller -> allocator -> stream -> encoder — and the
+  // encoder is the only consumer. See TargetTransferRate for what it measures.
+  double is_overused_for_encoder = 1.0;
 };
 
 }  // namespace webrtc
