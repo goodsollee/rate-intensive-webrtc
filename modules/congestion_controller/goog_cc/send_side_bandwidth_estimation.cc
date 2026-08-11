@@ -20,6 +20,7 @@
 #include <string>
 #include <utility>
 #include <fstream>
+#include <unistd.h>
 
 #include "api/field_trials_view.h"
 #include "api/rtc_event_log/rtc_event_log.h"
@@ -34,6 +35,7 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/experiments/field_trial_parser.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 #include "system_wrappers/include/metrics.h"
 
 namespace webrtc {
@@ -808,6 +810,53 @@ void SendSideBandwidthEstimation::UpdateTargetBitrate(DataRate new_bitrate,
   current_target_ = new_bitrate;
   MaybeLogLossBasedEvent(at_time);
   link_capacity_.OnRateUpdate(acknowledged_rate_, current_target_, at_time);
+
+  // === Rotary diagnostics ===
+  // Trace which limiter owns the final GCC target. Enabled by UNIFIED_CSV_DIR.
+  // Sender and receiver each run a BWE and share the log dir, so the file is
+  // per-pid; analysis picks the sender's (the larger, non-degenerate) file.
+  static std::ofstream* bwe_trace = []() -> std::ofstream* {
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (!dir || !*dir) return nullptr;
+    auto* f = new std::ofstream(std::string(dir) + "/bwe_trace_" +
+                                    std::to_string(getpid()) + ".csv",
+                                std::ios::out | std::ios::trunc);
+    if (!f->is_open()) { delete f; return nullptr; }
+    *f << "t_ms,proposed_mbps,delay_based_mbps,receiver_limit_mbps,"
+          "acked_mbps,fraction_loss,loss_based_state,target_mbps\n";
+    // [T5 / apollo-v2 spec 8.6] One anchor line per process pairing this
+    // file's monotonic t_ms with the epoch clock the emulator logs in, so
+    // bwe_trace_*.csv and apollo_decider.csv join by construction instead of
+    // by cross-correlating series: epoch = e + (t_ms - m).
+    // Written to a sidecar file (the CSV must stay parseable) and to stderr,
+    // which the rig captures in sender.log / receiver.log.
+    {
+      const int64_t m = rtc::TimeMillis();
+      const int64_t e = rtc::TimeUTCMillis();
+      std::ofstream a(std::string(dir) + "/bwe_anchor_" +
+                          std::to_string(getpid()) + ".txt",
+                      std::ios::out | std::ios::trunc);
+      if (a.is_open())
+        a << "ANCHOR monotonic_ms=" << m << " epoch_ms=" << e << "\n";
+      fprintf(stderr, "ANCHOR monotonic_ms=%lld epoch_ms=%lld\n",
+              (long long)m, (long long)e);
+      fflush(stderr);
+    }
+    return f;
+  }();
+  if (bwe_trace) {
+    auto mbps = [](DataRate r) {
+      return r.IsFinite() ? r.bps() / 1e6 : -1.0;
+    };
+    *bwe_trace << at_time.ms() << "," << mbps(requested) << ","
+               << mbps(delay_based_limit_) << "," << mbps(receiver_limit_)
+               << ","
+               << (acknowledged_rate_.has_value() ? mbps(*acknowledged_rate_)
+                                                  : -1.0)
+               << "," << (last_fraction_loss_ / 256.0) << ","
+               << static_cast<int>(loss_based_state_) << ","
+               << mbps(current_target_) << "\n";
+  }
 }
 
 void SendSideBandwidthEstimation::ApplyTargetLimits(Timestamp at_time) {

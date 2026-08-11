@@ -13,9 +13,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -30,10 +32,20 @@
 #include "rtc_base/experiments/field_trial_list.h"
 #include "rtc_base/experiments/field_trial_parser.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 
 namespace webrtc {
 
 namespace {
+
+// [T5b forensics] Off unless KFT_TWCC_FORENSICS=1 is in the environment.
+bool KftTwccForensics() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_TWCC_FORENSICS");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
 
 constexpr TimeDelta kInitHoldDuration = TimeDelta::Millis(300);
 constexpr TimeDelta kMaxHoldDuration = TimeDelta::Seconds(60);
@@ -1191,9 +1203,43 @@ bool LossBasedBweV2::PushBackObservation(
   observations_[observation.id % config_->observation_window_size] =
       observation;
 
+  // [T5b forensics] capture the unwrapped transport sequence numbers this
+  // observation counted as lost, collapsed into ranges, before the partial
+  // observation is reset.
+  std::string kftf_lostr;
+  const bool kftf = KftTwccForensics();
+  if (kftf && !partial_observation_.lost_packets.empty()) {
+    std::vector<int64_t> seqs;
+    seqs.reserve(partial_observation_.lost_packets.size());
+    for (auto const& [key, packet_size] : partial_observation_.lost_packets)
+      seqs.push_back(key);
+    std::sort(seqs.begin(), seqs.end());
+    size_t i = 0;
+    while (i < seqs.size()) {
+      size_t j = i;
+      while (j + 1 < seqs.size() && seqs[j + 1] == seqs[j] + 1)
+        ++j;
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%s%lld-%lld", kftf_lostr.empty() ? "" : ",",
+               static_cast<long long>(seqs[i]), static_cast<long long>(seqs[j]));
+      kftf_lostr += buf;
+      i = j + 1;
+    }
+  }
+
   partial_observation_ = PartialObservation();
   UpdateAverageReportedLossRatio();
   CalculateInstantUpperBound();
+  if (kftf) {
+    fprintf(stderr,
+            "KFTF LOSS_OBS id=%d packets=%d lost=%d avg_ratio=%.6f "
+            "t_ms=%lld ep_ms=%lld lostr=%s\n",
+            observation.id, observation.num_packets,
+            observation.num_lost_packets, average_reported_loss_ratio_,
+            static_cast<long long>(rtc::TimeMillis()),
+            static_cast<long long>(rtc::TimeUTCMillis()),
+            kftf_lostr.empty() ? "-" : kftf_lostr.c_str());
+  }
   return true;
 }
 

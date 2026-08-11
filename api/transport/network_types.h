@@ -237,6 +237,16 @@ struct RTC_EXPORT TargetTransferRate {
   DataRate target_rate = DataRate::Zero();
   DataRate stable_target_rate = DataRate::Zero();
   double cwnd_reduce_ratio = 0;
+  // [MAE] How far the delay trend has run past HALF the overuse threshold,
+  // as a ratio: 1.0 means "at or below half", 2.0 means "twice it".
+  //
+  // GoogCC's own overuse verdict is a 3-state enum that additionally requires a
+  // dwell time and a repeat count, so it lands ~96 ms after the trend turns.
+  // This is the same measurement without those gates — it rises the moment the
+  // trend does, which is early enough for the encoder to act on. Consumed by
+  // LibvpxVp8Encoder to shrink the VBV buffer to one frame; see
+  // TrendlineEstimator::Detect for the computation.
+  double is_overused_for_encoder = 1.0;
 };
 
 // Contains updates of network controller comand state. Using optionals to

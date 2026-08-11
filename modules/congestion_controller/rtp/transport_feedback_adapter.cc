@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -32,8 +33,19 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/network/sent_packet.h"
 #include "rtc_base/network_route.h"
+#include "rtc_base/time_utils.h"
 
 namespace webrtc {
+namespace {
+// [T5b forensics] Off unless KFT_TWCC_FORENSICS=1 is in the environment.
+bool KftTwccForensics() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_TWCC_FORENSICS");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+}  // namespace
 
 constexpr TimeDelta kSendTimeHistoryWindow = TimeDelta::Seconds(60);
 
@@ -217,10 +229,16 @@ TransportFeedbackAdapter::ProcessTransportFeedback(
 
   size_t failed_lookups = 0;
   size_t ignored = 0;
+  // [T5b forensics] unwrapped sequence number of the first entry in this
+  // datagram, captured inside the existing walk so no second unwrap happens.
+  const bool kftf = KftTwccForensics();
+  int64_t kftf_first_unwrapped = -1;
 
   feedback.ForAllPackets([&](uint16_t sequence_number,
                              TimeDelta delta_since_base) {
     int64_t seq_num = seq_num_unwrapper_.Unwrap(sequence_number);
+    if (kftf && kftf_first_unwrapped < 0)
+      kftf_first_unwrapped = seq_num;
     std::optional<PacketFeedback> packet_feedback = RetrievePacketFeedback(
         seq_num, /*received=*/delta_since_base.IsFinite());
     if (!packet_feedback) {
@@ -250,6 +268,22 @@ TransportFeedbackAdapter::ProcessTransportFeedback(
   if (ignored > 0) {
     RTC_LOG(LS_INFO) << "Ignoring " << ignored
                      << " packets because they were sent on a different route.";
+  }
+  // [T5b forensics] one line per feedback datagram that ARRIVED. The set
+  // difference against the receiver's TWCC_BUILT stream is exactly what the
+  // Gate removed.
+  if (kftf) {
+    const size_t count = feedback.GetPacketStatusCount();
+    const size_t recvd = feedback.GetReceivedPackets().size();
+    fprintf(stderr,
+            "KFTF TWCC_RECV base=%u count=%zu lost=%zu unw_base=%lld "
+            "t_ms=%lld ep_ms=%lld results=%zu failed=%zu\n",
+            static_cast<unsigned>(feedback.GetBaseSequence()), count,
+            count > recvd ? count - recvd : 0,
+            static_cast<long long>(kftf_first_unwrapped),
+            static_cast<long long>(rtc::TimeMillis()),
+            static_cast<long long>(rtc::TimeUTCMillis()),
+            packet_result_vector.size(), failed_lookups);
   }
   return ToTransportFeedback(std::move(packet_result_vector),
                              feedback_receive_time);

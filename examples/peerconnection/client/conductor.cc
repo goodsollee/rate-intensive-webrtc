@@ -369,6 +369,20 @@ bool Conductor::InitializePeerConnection() {
     return false;
   }
 
+  // [T5d Stage B] KFT_INSECURE_RTCP=1 turns DTLS-SRTP off so a middlebox can
+  // read RTCP in the clear. MEASUREMENT INSTRUMENT ONLY — it exists to compute
+  // an oracle upper bound for the Feedback Gate (spec §8.4) and is never on by
+  // default. Uses the supported PeerConnectionFactoryInterface::Options bit
+  // (api/peer_connection_interface.h:1517), the same one the loopback path and
+  // pc/g3doc/srtp.md document; no crypto code is touched.
+  if (const char* iv = getenv("KFT_INSECURE_RTCP"); iv && iv[0] == '1') {
+    webrtc::PeerConnectionFactoryInterface::Options opts;
+    opts.disable_encryption = true;
+    peer_connection_factory_->SetOptions(opts);
+    RTC_LOG(LS_ERROR) << "KFTF INSECURE_RTCP=1 disable_encryption=true "
+                         "(SRTP/SRTCP OFF — measurement build)";
+  }
+
   if (!CreatePeerConnection()) {
     main_wnd_->MessageBox("Error", "CreatePeerConnection failed", true);
     DeletePeerConnection();
@@ -948,6 +962,20 @@ void Conductor::AddTracks() {
             int max_bps = max_bitrate_kbps_ * 1000;
             int start_bps = std::min(max_bps, 10000000);  // Start at 10 Mbps
             int min_bps = std::min(max_bps, std::min(start_bps, 500000));  // Min 500 kbps
+            // KeyFrameTrigger experiment: env overrides to PIN the bitrate
+            // (min=start=max=K kbps makes the send rate constant regardless of
+            // GCC, giving a deterministic packet rate for injection trials).
+            auto kft_env_kbps = [](const char* name) -> int {
+              const char* v = getenv(name);
+              if (!v || !*v) return 0;
+              int x = atoi(v);
+              return x > 0 ? x : 0;
+            };
+            if (int k = kft_env_kbps("KFT_MAX_BITRATE_KBPS")) max_bps = k * 1000;
+            if (int k = kft_env_kbps("KFT_START_BITRATE_KBPS")) start_bps = k * 1000;
+            if (int k = kft_env_kbps("KFT_MIN_BITRATE_KBPS")) min_bps = k * 1000;
+            start_bps = std::min(start_bps, max_bps);
+            min_bps = std::min(min_bps, start_bps);
             bitrate_settings.min_bitrate_bps = min_bps;
             bitrate_settings.start_bitrate_bps = start_bps;
             bitrate_settings.max_bitrate_bps = max_bps;

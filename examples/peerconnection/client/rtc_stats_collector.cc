@@ -326,6 +326,64 @@ per_frame_stats_file_.flush();
 
     int64_t current_time_ms = rtc::TimeMillis();
 
+    // --- KeyFrameTrigger: raw 200 ms getStats dump (commercial-equivalent) --
+    // Every poll (kStatsIntervalMs cadence) writes the CUMULATIVE W3C getStats
+    // counters unaggregated, mirroring what a commercial-app measurement sees
+    // through RTCPeerConnection.getStats(). average_stats.csv stays the 1 s
+    // aggregate; this file is the estimator's blind input. Runs under
+    // stats_mutex_; one receiver per process, so a local static is safe.
+    {
+        static std::ofstream raw_file;
+        static bool raw_tried = false;
+        if (!raw_tried) {
+            raw_tried = true;
+            const char* dir = getenv("UNIFIED_CSV_DIR");
+            std::string path = std::string(dir ? dir : ".") + "/getstats_raw.csv";
+            raw_file.open(path, std::ios::app);
+            if (raw_file.is_open()) {
+                raw_file << "t_ms,packets_received,packets_lost,nack_count,"
+                            "pli_count,fir_count,key_frames_decoded,"
+                            "frames_decoded,frames_dropped,frames_received,"
+                            "bytes_received,retx_packets_received,"
+                            "retx_bytes_received,fec_packets_received,"
+                            "fec_packets_discarded,freeze_count,"
+                            "total_freezes_duration_ms,jitter_buffer_delay_ms,"
+                            "jitter_buffer_emitted_count,jitter_ms,qp_sum,"
+                            "frames_assembled_multi,total_assembly_time_ms,"
+                            "frame_width,frame_height,frames_per_second,"
+                            "pause_count,total_pauses_duration_ms,"
+                            "estimated_playout_ts,last_packet_received_ts,"
+                            "total_decode_time_ms\n";
+            }
+        }
+        if (raw_file.is_open()) {
+            raw_file << current_time_ms << ','
+                     << packets_received << ',' << packets_lost << ','
+                     << nack_count << ',' << pli_count << ',' << fir_count << ','
+                     << key_frames_decoded << ',' << frames_decoded << ','
+                     << frames_dropped << ',' << frames_received << ','
+                     << bytes_received << ',' << retx_pkts_recv << ','
+                     << retx_bytes_recv << ',' << fec_packets_received << ','
+                     << fec_packets_discarded << ',' << freeze_count << ','
+                     << total_freezes_duration_ms << ','
+                     << jitter_buffer_delay << ','
+                     << static_cast<int64_t>(get_numeric("jitterBufferEmittedCount")) << ','
+                     << get_numeric("jitter") * 1000.0 << ','
+                     << static_cast<int64_t>(get_numeric("qpSum")) << ','
+                     << static_cast<int64_t>(get_numeric("framesAssembledFromMultiplePackets")) << ','
+                     << get_numeric("totalAssemblyTime") * 1000.0 << ','
+                     << width << ',' << height << ',' << framerate << ','
+                     << static_cast<int64_t>(get_numeric("pauseCount")) << ','
+                     << get_numeric("totalPausesDuration") * 1000.0 << ','
+                     // timestamps as integer ms — default ostream double
+                     // precision (6 sig figs) destroys epoch-ms values
+                     << static_cast<int64_t>(get_numeric("estimatedPlayoutTimestamp")) << ','
+                     << static_cast<int64_t>(get_numeric("lastPacketReceivedTimestamp")) << ','
+                     << total_decode_time << '\n';
+            raw_file.flush();
+        }
+    }
+
     // Initialize first stats time if not set
     if (persistent_stats_.first_stats_time_ms_ == -1) {
         persistent_stats_.first_stats_time_ms_ = current_time_ms;

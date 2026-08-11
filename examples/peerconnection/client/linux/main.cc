@@ -156,6 +156,17 @@ Example Commands:
 
   absl::ParseCommandLine(argc, argv);
 
+  // This main() never installed a log sink, so every RTC_LOG in the tree has
+  // been silently discarded -- including the MAE on/off markers. Opt in to the
+  // ERROR level only: the KFT markers are logged at LS_ERROR, and stock WebRTC
+  // emits almost nothing there, so the run is not perturbed by log volume.
+  if (const char* e = getenv("KFT_WEBRTC_LOG")) {
+    if (e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) {
+      rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
+      rtc::LogMessage::LogTimestamps();
+    }
+  }
+
   bool headless = absl::GetFlag(FLAGS_headless);
   bool demo_mode = absl::GetFlag(FLAGS_demo_mode);
   std::string room_id = absl::GetFlag(FLAGS_room_id);

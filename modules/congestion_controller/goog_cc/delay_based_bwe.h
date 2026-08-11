@@ -115,6 +115,10 @@ class DelayBasedBwe {
                           std::optional<DataRate> link_capacity);
   DataRate last_estimate() const { return prev_bitrate_; }
   BandwidthUsage last_state() const { return prev_state_; }
+  // [MAE] Ungated delay-trend ratio; see DelayIncreaseDetectorInterface.
+  double aggressive_state() const {
+    return active_delay_detector_->AggressiveState();
+  }
 
   void SetLoggingFolder(const std::optional<std::string>& logging_folder) {
     delay_cc_logger_->SetLoggingFolder(logging_folder);

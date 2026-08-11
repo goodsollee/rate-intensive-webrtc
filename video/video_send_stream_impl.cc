@@ -694,7 +694,8 @@ void VideoSendStreamImpl::StopVideoSendStream() {
   bitrate_allocator_->RemoveObserver(this);
   check_encoder_activity_task_.Stop();
   video_stream_encoder_->OnBitrateUpdated(DataRate::Zero(), DataRate::Zero(),
-                                          DataRate::Zero(), 0, 0, 0);
+                                          DataRate::Zero(), 0, 0, 0,
+                                          /*is_overused_for_encoder=*/1.0);
   stats_proxy_.OnSetEncoderTargetRate(0);
 }
 
@@ -942,7 +943,8 @@ uint32_t VideoSendStreamImpl::OnBitrateUpdated(BitrateAllocationUpdate update) {
   video_stream_encoder_->OnBitrateUpdated(
       encoder_target_rate, encoder_stable_target_rate, link_allocation,
       rtc::dchecked_cast<uint8_t>(update.packet_loss_ratio * 256),
-      update.round_trip_time.ms(), update.cwnd_reduce_ratio);
+      update.round_trip_time.ms(), update.cwnd_reduce_ratio,
+      update.is_overused_for_encoder);
   stats_proxy_.OnSetEncoderTargetRate(encoder_target_rate_bps_);
   return protection_bitrate_bps;
 }

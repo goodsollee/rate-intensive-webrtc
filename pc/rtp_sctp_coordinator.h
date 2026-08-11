@@ -579,6 +579,11 @@ class RtpSctpCoordinator {
   int64_t pudica_owd_frame_id_ = 0;
   int pudica_owd_pkt_in_frame_ = 0;
 
+  // Pudica RTP rate-controller trace CSV (rotary diagnostics)
+  std::ofstream pudica_ctrl_csv_;
+  bool pudica_ctrl_csv_initialized_ = false;
+  int64_t pudica_ctrl_csv_start_us_ = 0;
+
   // Pudica methods
   double PudicaComputeFrameBur(int64_t now_us);
   double PudicaSmoothedBur(int64_t now_us);

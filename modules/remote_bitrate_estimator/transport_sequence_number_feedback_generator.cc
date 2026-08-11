@@ -12,9 +12,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include "api/units/data_size.h"
@@ -25,6 +28,7 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/numerics/safe_minmax.h"
+#include "rtc_base/time_utils.h"
 #include "system_wrappers/include/clock.h"
 
 namespace webrtc {
@@ -48,6 +52,15 @@ TimeDelta GetAbsoluteSendTimeDelta(uint32_t new_sendtime,
     return TimeDelta::Micros(int64_t{delta} * -1'000'000 / (1 << 18));
   }
   return TimeDelta::Micros(int64_t{delta} * 1'000'000 / (1 << 18));
+}
+
+// [T5b forensics] Off unless KFT_TWCC_FORENSICS=1 is in the environment.
+bool KftTwccForensics() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_TWCC_FORENSICS");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
 }
 }  // namespace
 
@@ -238,6 +251,49 @@ void TransportSequenceNumberFeedbackGenenerator::SendPeriodicFeedbacks() {
     }
 
     RTC_DCHECK(feedback_sender_ != nullptr);
+
+    // [T5b forensics] one line per feedback datagram we BUILD, with the count
+    // of not-received entries and the sequence ranges they cover.
+    if (KftTwccForensics()) {
+      const rtcp::TransportFeedback& fb = *feedback_packet;
+      const size_t count = fb.GetPacketStatusCount();
+      const size_t recvd = fb.GetReceivedPackets().size();
+      const size_t lost = count > recvd ? count - recvd : 0;
+      std::string lostr;
+      int32_t run_start = -1;
+      int32_t run_prev = -1;
+      auto flush_run = [&]() {
+        if (run_start < 0)
+          return;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s%d-%d", lostr.empty() ? "" : ",",
+                 run_start, run_prev);
+        lostr += buf;
+        run_start = -1;
+      };
+      fb.ForAllPackets([&](uint16_t seq, TimeDelta delta_since_base) {
+        if (!delta_since_base.IsFinite()) {
+          if (run_start >= 0 &&
+              static_cast<uint16_t>(run_prev + 1) == seq) {
+            run_prev = seq;
+          } else {
+            flush_run();
+            run_start = seq;
+            run_prev = seq;
+          }
+        } else {
+          flush_run();
+        }
+      });
+      flush_run();
+      fprintf(stderr,
+              "KFTF TWCC_BUILT base=%u count=%zu lost=%zu t_ms=%lld "
+              "ep_ms=%lld lostr=%s\n",
+              static_cast<unsigned>(fb.GetBaseSequence()), count, lost,
+              static_cast<long long>(rtc::TimeMillis()),
+              static_cast<long long>(rtc::TimeUTCMillis()),
+              lostr.empty() ? "-" : lostr.c_str());
+    }
 
     std::vector<std::unique_ptr<rtcp::RtcpPacket>> packets;
     if (remote_estimate) {

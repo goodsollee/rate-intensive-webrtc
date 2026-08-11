@@ -53,6 +53,30 @@
 
 namespace webrtc {
 namespace {
+// [MAE] Env gate. Unset => byte-identical to stock VP8 rate control.
+bool MaeEnabled() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_MAE");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
+// [NO-FRAME-DROP] Env gate for libvpx's OWN dropper, which SparkRTC never had
+// to touch: they encode with x264, whose `frame_dropping_on` is stored and
+// never read, so blocking WebRTC's own drop sites was a complete
+// implementation there. VP8 has a second, independent dropper in
+// vp8_check_drop_buffer() (onyx_if.c:3203) that decimates the frame rate to
+// exactly 1/2 or 2/3 -- which is the 60.0 -> 30.0 fps step we measured. It is
+// live iff rc_dropframe_thresh > 0 (vp8_cx_iface.c:333 allow_df).
+bool NoFrameDropEnabled() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_NO_FRAME_DROP");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
 #if defined(WEBRTC_IOS)
 constexpr char kVP8IosMaxNumberOfThreadFieldTrial[] =
     "WebRTC-VP8IosMaxNumberOfThread";
@@ -534,6 +558,49 @@ void LibvpxVp8Encoder::SetRates(const RateControlParameters& parameters) {
                        rc_max_intra_target_, vpx_configs_[0].kf_max_dist,
                        vpx_configs_[0].g_w, vpx_configs_[0].g_h);
     }
+    // [MAE] Shrink the VBV buffer to ONE FRAME while the congestion signal is
+    // raised. rc_buf_* are in MILLISECONDS of the target bitrate
+    // (vpx_encoder.h: "of time (milliseconds)"), so the value tracks the rate
+    // automatically and only has to be written when the regime changes.
+    //
+    // Why: at 600 ms the encoder only has to hit the average over 600 ms, so a
+    // single frame may run far past its share. Measured on p5_f2_att100 with a
+    // 0.86 Mb/s target at 60 fps: budget 1.8 kB, actual frames 4.3-7.2 kB. The
+    // overshoot lands in the RAN queue and is then paid for by dropped frames
+    // (drop rate >= 60% is itself what makes QualityScaler step the resolution
+    // down). At one frame of buffer the encoder must meet the per-frame budget,
+    // so the frames stay inside the rate and there is nothing to drop.
+    if (MaeEnabled() && parameters.is_overused_for_encoder > 1.0) {
+      const int fps = std::max(1, static_cast<int>(parameters.framerate_fps + 0.5));
+      const unsigned int one_frame_ms = std::max(1u, 1000u / fps);
+      vpx_configs_[i].rc_buf_optimal_sz = one_frame_ms;
+      vpx_configs_[i].rc_buf_initial_sz = one_frame_ms;
+      vpx_configs_[i].rc_buf_sz = one_frame_ms * 2;
+      // On VP8, MAE is NOT independent of the codec's own dropper. The drop
+      // trigger is drop_mark = rc_dropframe_thresh * optimal_buffer_level / 100
+      // (onyx_if.c:3205), and optimal_buffer_level is exactly the buffer MAE
+      // shrinks -- 600 ms -> 16 ms at 60 fps, a 37x collapse of the trigger.
+      // Leaving the stock 30 here would mean one overshooting frame empties the
+      // buffer and arms the 1/2-rate decimation, i.e. MAE would manufacture the
+      // very frame drops it exists to avoid. x264 has no such path, so the
+      // faithful VP8 port of MAE has to take the dropper out with it.
+      vpx_configs_[i].rc_dropframe_thresh = 0;
+      if (!mae_active_) {
+        mae_active_ = true;
+        RTC_LOG(LS_ERROR) << "KFTF MAE on ratio=" << parameters.is_overused_for_encoder
+                          << " fps=" << fps << " vbv_ms=" << one_frame_ms;
+      }
+    } else if (mae_active_) {
+      // Back to stock. Same three constants InitEncode uses.
+      vpx_configs_[i].rc_buf_initial_sz = 500;
+      vpx_configs_[i].rc_buf_optimal_sz = 600;
+      vpx_configs_[i].rc_buf_sz = 1000;
+      // Restore whatever the arm asks for: still 0 under KFT_NO_FRAME_DROP
+      // (so MAE+no-drop composes), stock 30 otherwise.
+      vpx_configs_[i].rc_dropframe_thresh = FrameDropThreshold(stream_idx);
+      mae_active_ = false;
+      RTC_LOG(LS_ERROR) << "KFTF MAE off ratio=" << parameters.is_overused_for_encoder;
+    }
     if (send_stream) {
       frame_buffer_controller_->OnRatesUpdated(
           stream_idx, parameters.bitrate.GetTemporalLayerAllocation(stream_idx),
@@ -719,6 +786,9 @@ int LibvpxVp8Encoder::InitEncode(const VideoCodec* inst,
 
   // rate control settings
   vpx_configs_[0].rc_dropframe_thresh = FrameDropThreshold(0);
+  RTC_LOG(LS_ERROR) << "KFTF init mae=" << MaeEnabled()
+                    << " nodrop=" << NoFrameDropEnabled()
+                    << " rc_dropframe_thresh=" << vpx_configs_[0].rc_dropframe_thresh;
   vpx_configs_[0].rc_end_usage = VPX_CBR;
   vpx_configs_[0].g_pass = VPX_RC_ONE_PASS;
   // Handle resizing outside of libvpx.
@@ -1007,10 +1077,38 @@ uint32_t LibvpxVp8Encoder::MaxIntraTarget(uint32_t optimalBuffersize) {
 
   // Don't go below 3 times the per frame bandwidth.
   const uint32_t minIntraTh = 300;
-  return (targetPct < minIntraTh) ? minIntraTh : targetPct;
+  const uint32_t stock = (targetPct < minIntraTh) ? minIntraTh : targetPct;
+
+  // [T9a] KeyFrameTrigger experiment. NOTE, measured: with the stock
+  // rc_buf_optimal_sz = 600 and maxFramerate = 60, targetPct = 1800, so the
+  // 300 % floor above is DEAD CODE in this rig — the operative intra cap is
+  // 1800 % of the per-frame bandwidth, not 300 %. (Spec §16.5 assumes 300 %.)
+  // KFT_MAX_INTRA_PCT therefore overrides the RESULT, not the floor: it is the
+  // percentage of perFrameBw that libvpx is allowed to spend on a key frame.
+  // Unset => stock value, byte-identical to the upstream encoder. This is a
+  // sender-side probe, NOT a shippable RAN mechanism: it exists to answer
+  // whether keyframe size is on the recovery critical path at all.
+  static const long override_pct = []() -> long {
+    const char* v = getenv("KFT_MAX_INTRA_PCT");
+    if (!v || !*v) return 0;
+    char* end = nullptr;
+    long x = strtol(v, &end, 10);
+    return (end == v || x <= 0) ? 0 : x;
+  }();
+  if (override_pct > 0) {
+    RTC_LOG(LS_ERROR) << "[KFT] KFT_MAX_INTRA_PCT override: " << override_pct
+                      << " (stock would be " << stock << ")";
+    return static_cast<uint32_t>(override_pct);
+  }
+  return stock;
 }
 
 uint32_t LibvpxVp8Encoder::FrameDropThreshold(size_t spatial_idx) const {
+  // [NO-FRAME-DROP] webrtc_video_engine.cc:2373 hard-codes frame_drop_enabled
+  // to true, so GetFrameDropEnabled() can never carry the flag; gate here.
+  if (NoFrameDropEnabled()) {
+    return 0;
+  }
   if (!codec_.GetFrameDropEnabled()) {
     return 0;
   }
@@ -1429,9 +1527,16 @@ VideoEncoder::EncoderInfo LibvpxVp8Encoder::GetEncoderInfo() const {
         encoder_info_override_.resolution_bitrate_limits();
   }
 
+  // Stock ties QualityScaler to the codec dropper being armed. Once MAE or
+  // KFT_NO_FRAME_DROP zeroes rc_dropframe_thresh that would switch resolution
+  // adaptation off as a side effect -- exactly backwards, since not dropping
+  // frames is what makes resolution the remaining way to fit the rate.
+  const bool drop_thresh_zeroed_by_us =
+      NoFrameDropEnabled() || (MaeEnabled() && mae_active_);
   const bool enable_scaling =
       num_active_streams_ == 1 &&
-      (vpx_configs_.empty() || vpx_configs_[0].rc_dropframe_thresh > 0) &&
+      (vpx_configs_.empty() || vpx_configs_[0].rc_dropframe_thresh > 0 ||
+       drop_thresh_zeroed_by_us) &&
       codec_.VP8().automaticResizeOn;
 
   info.scaling_settings = enable_scaling

@@ -131,6 +131,9 @@ class LibvpxVp8Encoder : public VideoEncoder {
   std::vector<bool> send_stream_;
   std::vector<int> cpu_speed_;
   std::vector<vpx_image_t> raw_images_;
+  // [MAE] True while the VBV buffer is shrunk to one frame; edge-triggered so
+  // the regime change is logged once, not per SetRates.
+  bool mae_active_ = false;
   std::vector<EncodedImage> encoded_images_;
   std::vector<vpx_codec_ctx_t> encoders_;
   std::vector<vpx_codec_enc_cfg_t> vpx_configs_;

@@ -3023,6 +3023,11 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
 
   if (pudica_base_target_bps_ <= 0) pudica_base_target_bps_ = recv_rate;
 
+  // Target published by the previous frame's decision; only pudica_ctrl.csv
+  // reads it, to make each row a before/after pair.
+  const int64_t old_target =
+      pudica_rtp_target_bps_.load(std::memory_order_relaxed);
+
   // Env-tunable thresholds; defaults pivot on the paper's BUR = 1.
   // §4.3 pivots on R = 1 for both short-term rules; it is not a separate
   // tunable in the paper.
@@ -3251,6 +3256,47 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
 
   unified_metrics_.mode = mode;
   unified_metrics_.rtp_allocated_mbps = new_target / 1'000'000.0;
+
+  // === Rotary diagnostics: per-frame controller trace ===
+  // Every decision the Pudica RTP controller makes, with the raw estimator
+  // internals that feed it. Written to $UNIFIED_CSV_DIR/pudica_ctrl.csv.
+  if (!pudica_ctrl_csv_initialized_) {
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      std::string path = std::string(dir) + "/pudica_ctrl.csv";
+      pudica_ctrl_csv_.open(path, std::ios::out | std::ios::trunc);
+      if (pudica_ctrl_csv_.is_open()) {
+        chmod(path.c_str(), 0666);
+        pudica_ctrl_csv_
+            << "t_ms,mode,bur,rtp_recv_mbps,total_recv_mbps,n_ack_samples,"
+               "ack_span_ms,ack_bytes,old_target_mbps,new_target_mbps,"
+               "d_min_ms,frame_owd_ms,frame_pkts\n";
+      }
+      pudica_ctrl_csv_start_us_ = now_us;
+      pudica_ctrl_csv_initialized_ = true;
+    }
+  }
+  if (pudica_ctrl_csv_.is_open()) {
+    int n_samples = static_cast<int>(rtp_ack_samples_.size());
+    int64_t span_ms = (n_samples >= 2)
+        ? (rtp_ack_samples_.back().timestamp_ms -
+           rtp_ack_samples_.front().timestamp_ms)
+        : 0;
+    double frame_owd_ms =
+        (pudica_frame_.first_send_us >= 0 && pudica_frame_.last_recv_us >= 0)
+            ? (pudica_frame_.last_recv_us - pudica_frame_.first_send_us) / 1000.0
+            : -1.0;
+    pudica_ctrl_csv_ << std::fixed << std::setprecision(3)
+                     << ((now_us - pudica_ctrl_csv_start_us_) / 1000.0) << ","
+                     << mode << "," << frame_bur << ","
+                     << (recv_rate / 1e6) << ","
+                     << (GetTotalRecvRateBps() / 1e6) << ","
+                     << n_samples << "," << span_ms << ","
+                     << rtp_samples_total_bytes_ << ","
+                     << (old_target / 1e6) << "," << (new_target / 1e6) << ","
+                     << (pudica_d_min_us_ / 1000.0) << "," << frame_owd_ms << ","
+                     << pudica_frame_.frame_packets << "\n";
+  }
 
   static int64_t pud_log = 0;
   if (++pud_log % 30 == 0) {
