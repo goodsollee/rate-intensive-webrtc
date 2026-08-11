@@ -168,7 +168,33 @@ std::string OptionalDelayToLogString(std::optional<TimeDelta> opt) {
 
 }  // namespace
 
+namespace {
+// KeyFrameTrigger experiment: env overrides for the decodable-frame timeout
+// keyframe-request triggers (defaults = the stock constants). An override
+// takes absolute precedence, including over the rtx-time derivation below,
+// so a sweep value is exactly what the receiver uses.
+std::optional<TimeDelta> KftEnvMs(const char* name) {
+  const char* v = getenv(name);
+  if (!v || !*v) return std::nullopt;
+  char* end = nullptr;
+  long x = strtol(v, &end, 10);
+  if (end == v || x <= 0) return std::nullopt;
+  RTC_LOG(LS_ERROR) << "[KFT] " << name << " override: " << x << " ms";
+  return TimeDelta::Millis(x);
+}
+std::optional<TimeDelta> KftMaxWaitForKeyFrame() {
+  static const std::optional<TimeDelta> v = KftEnvMs("KFT_MAX_WAIT_KEYFRAME_MS");
+  return v;
+}
+std::optional<TimeDelta> KftMaxWaitForFrame() {
+  static const std::optional<TimeDelta> v = KftEnvMs("KFT_MAX_WAIT_FRAME_MS");
+  return v;
+}
+}  // namespace
+
 TimeDelta DetermineMaxWaitForFrame(TimeDelta rtp_history, bool is_keyframe) {
+  if (is_keyframe && KftMaxWaitForKeyFrame()) return *KftMaxWaitForKeyFrame();
+  if (!is_keyframe && KftMaxWaitForFrame()) return *KftMaxWaitForFrame();
   // A (arbitrary) conversion factor between the remotely signalled NACK buffer
   // time (if not present defaults to 1000ms) and the maximum time we wait for a
   // remote frame. Chosen to not change existing defaults when using not

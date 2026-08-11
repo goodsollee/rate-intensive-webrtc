@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "absl/strings/match.h"
@@ -241,8 +242,23 @@ void AimdRateControl::ChangeBitrate(const RateControlInput& input,
       break;
 
     case RateControlState::kRcIncrease: {
-      if (estimated_throughput > link_capacity_.UpperBound())
+      if (estimated_throughput > link_capacity_.UpperBound()) {
+        // [T8a forensics] The escape from the additive-increase trap: the
+        // acked throughput cleared the link_capacity_ band, the estimate is
+        // reset and increase returns to MULTIPLICATIVE. Off unless
+        // KFT_TWCC_FORENSICS=1 (same gate as the T5b TWCC forensics).
+        static const bool kftf = []() {
+          const char* e = getenv("KFT_TWCC_FORENSICS");
+          return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+        }();
+        if (kftf) {
+          fprintf(stderr, "KFTF LINKCAP_RESET t_ms=%lld throughput=%.0f upper=%.0f\n",
+                  static_cast<long long>(at_time.ms()),
+                  estimated_throughput.bps<double>(),
+                  link_capacity_.UpperBound().bps<double>());
+        }
         link_capacity_.Reset();
+      }
 
       // We limit the new bitrate based on the troughput to avoid unlimited
       // bitrate increases. We allow a bit more lag at very low rates to not too

@@ -35,6 +35,7 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/experiments/field_trial_parser.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 #include "system_wrappers/include/metrics.h"
 
 namespace webrtc {
@@ -763,6 +764,24 @@ void SendSideBandwidthEstimation::UpdateTargetBitrate(DataRate new_bitrate,
     if (!f->is_open()) { delete f; return nullptr; }
     *f << "t_ms,proposed_mbps,delay_based_mbps,receiver_limit_mbps,"
           "acked_mbps,fraction_loss,loss_based_state,target_mbps\n";
+    // [T5 / apollo-v2 spec 8.6] One anchor line per process pairing this
+    // file's monotonic t_ms with the epoch clock the emulator logs in, so
+    // bwe_trace_*.csv and apollo_decider.csv join by construction instead of
+    // by cross-correlating series: epoch = e + (t_ms - m).
+    // Written to a sidecar file (the CSV must stay parseable) and to stderr,
+    // which the rig captures in sender.log / receiver.log.
+    {
+      const int64_t m = rtc::TimeMillis();
+      const int64_t e = rtc::TimeUTCMillis();
+      std::ofstream a(std::string(dir) + "/bwe_anchor_" +
+                          std::to_string(getpid()) + ".txt",
+                      std::ios::out | std::ios::trunc);
+      if (a.is_open())
+        a << "ANCHOR monotonic_ms=" << m << " epoch_ms=" << e << "\n";
+      fprintf(stderr, "ANCHOR monotonic_ms=%lld epoch_ms=%lld\n",
+              (long long)m, (long long)e);
+      fflush(stderr);
+    }
     return f;
   }();
   if (bwe_trace) {

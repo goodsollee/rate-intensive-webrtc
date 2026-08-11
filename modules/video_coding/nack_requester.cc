@@ -11,6 +11,7 @@
 #include "modules/video_coding/nack_requester.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 
 #include "api/sequence_checker.h"
@@ -40,6 +41,28 @@ TimeDelta GetSendNackDelay(const FieldTrialsView& field_trials) {
     return TimeDelta::Millis(delay_ms);
   }
   return kDefaultSendNackDelay;
+}
+
+// KeyFrameTrigger experiment: allow overriding the receiver's NACK trigger
+// parameters via env, so estimator blind tests can sweep them without a
+// rebuild per value. Defaults are the stock constants above.
+int EnvOrInt(const char* name, int def) {
+  const char* v = getenv(name);
+  if (!v || !*v) return def;
+  char* end = nullptr;
+  long x = strtol(v, &end, 10);
+  if (end == v || x <= 0) return def;
+  RTC_LOG(LS_ERROR) << "[KFT] " << name << " override: " << x
+                      << " (default " << def << ")";
+  return static_cast<int>(x);
+}
+int MaxNackPackets() {
+  static const int v = EnvOrInt("KFT_MAX_NACK_PACKETS", kMaxNackPackets);
+  return v;
+}
+int MaxNackRetries() {
+  static const int v = EnvOrInt("KFT_MAX_NACK_RETRIES", kMaxNackRetries);
+  return v;
 }
 }  // namespace
 
@@ -232,7 +255,8 @@ void NackRequester::AddPacketsToNack(uint16_t seq_num_start,
   nack_list_.erase(nack_list_.begin(), it);
 
   uint16_t num_new_nacks = ForwardDiff(seq_num_start, seq_num_end);
-  if (nack_list_.size() + num_new_nacks > kMaxNackPackets) {
+  if (nack_list_.size() + num_new_nacks >
+      static_cast<size_t>(MaxNackPackets())) {
     nack_list_.clear();
     RTC_LOG(LS_WARNING) << "NACK list full, clearing NACK"
                            " list and requesting keyframe.";
@@ -270,7 +294,7 @@ std::vector<uint16_t> NackRequester::GetNackBatch(NackFilterOptions options) {
       nack_batch.emplace_back(it->second.seq_num);
       ++it->second.retries;
       it->second.sent_at_time = now;
-      if (it->second.retries >= kMaxNackRetries) {
+      if (it->second.retries >= MaxNackRetries()) {
         RTC_LOG(LS_WARNING) << "Sequence number " << it->second.seq_num
                             << " removed from NACK list due to max retries.";
         it = nack_list_.erase(it);
