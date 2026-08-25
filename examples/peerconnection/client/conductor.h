@@ -217,6 +217,8 @@ class Conductor : public webrtc::PeerConnectionObserver,
   bool datachannel_test_mode_ = false;
   bool rtp_sctp_mode_ = false;
   bool rtp_only_mode_ = false;
+  // --with_audio: add an audio track on a synthetic device, own stream id.
+  bool with_audio_ = false;
   // Apollo: owns the coordinator in RTP-only mode (no SCTP transport to own
   // it). Drives the Pudica/AgentRtc/FSE RTP-rate controller.
   std::unique_ptr<webrtc::RtpSctpCoordinator> rtp_only_coordinator_;

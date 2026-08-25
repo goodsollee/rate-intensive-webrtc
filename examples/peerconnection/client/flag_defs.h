@@ -95,6 +95,20 @@ ABSL_FLAG(std::string,
 ABSL_FLAG(bool, datachannel_test, false, "DataChannel throughput test mode.");
 ABSL_FLAG(bool, rtp_sctp_mode, false, "Combined RTP+SCTP test mode.");
 ABSL_FLAG(bool, rtp_only_mode, false, "RTP-only test mode (no SCTP).");
+// The research modes skip audio to avoid depending on a real capture device.
+// This adds it back deliberately, on a synthetic device, for experiments that
+// need a second media stream on the wire -- e.g. proving a RAN-side video hold
+// leaves audio flowing. Off by default so every existing run is unchanged.
+//
+// The audio track is published under its OWN stream id, which keeps A/V
+// synchronization OFF: WebRTC pairs streams for lip-sync by matching sync_group,
+// and sync_group comes from the stream id (webrtc_video_engine.cc /
+// webrtc_voice_engine.cc). Sharing one id would silently turn sync on and couple
+// the video playout clock to audio -- exactly what a video-hold experiment must
+// not have.
+ABSL_FLAG(bool, with_audio, false,
+          "Add an audio track from a synthetic device, on its own stream id "
+          "(no A/V sync). Research modes omit audio unless this is set.");
 ABSL_FLAG(int, test_duration, 10, "Test duration in seconds.");
 ABSL_FLAG(int,
           vp8_kf_max_dist,

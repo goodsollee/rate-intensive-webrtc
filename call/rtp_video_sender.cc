@@ -10,6 +10,8 @@
 
 #include "call/rtp_video_sender.h"
 
+#include "call/finesse_frame_log.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -583,6 +585,15 @@ EncodedImageCallback::Result RtpVideoSender::OnEncodedImage(
   uint32_t rtp_timestamp =
       encoded_image.RtpTimestamp() +
       rtp_streams_[simulcast_index].rtp_rtcp->StartTimestamp();
+
+  // [FINESSE W1a'] Logged HERE and not one line earlier: this is where the
+  // timestamp becomes the value that goes on the wire, and the wire value is
+  // what the receiver writes. `encoded_image.RtpTimestamp()` differs from it by
+  // a random per-session offset, so logging that would join zero rows.
+  finesse::SenderFrameLog::Get().OnFrame(
+      rtp_timestamp, encoded_image.capture_time_ms_, encoded_image.size(),
+      encoded_image._frameType == VideoFrameType::kVideoFrameKey,
+      simulcast_index);
 
   // RTCPSender has it's own copy of the timestamp offset, added in
   // RTCPSender::BuildSR, hence we must not add the in the offset for this call.

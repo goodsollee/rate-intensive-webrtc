@@ -33,6 +33,7 @@
 #include "logging/rtc_event_log/events/rtc_event_rtp_packet_outgoing.h"
 #include "modules/include/module_fec_types.h"
 #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"
+#include "modules/rtp_rtcp/source/finesse_egress_log.h"
 #include "modules/rtp_rtcp/source/packet_sequencer.h"
 #include "modules/rtp_rtcp/source/rtp_header_extensions.h"
 #include "modules/rtp_rtcp/source/rtp_packet_history.h"
@@ -328,6 +329,22 @@ void RtpSenderEgress::CompleteSendPacket(const Packet& compound_packet,
 
     RTC_DCHECK(packet->packet_type().has_value());
     RtpPacketMediaType packet_type = *packet->packet_type();
+
+    // [FINESSE W1b] Logged HERE and not at the pacer's enqueue: enqueue is
+    // when the frame joins the backlog, and the whole question is how long it
+    // then waits. Upstream of this line the packet has already been metered by
+    // PacingController and accepted by transport_->SendRtp(); downstream is
+    // only the socket. `now` is the same instant that was stamped into
+    // abs-send-time and the transmission offset a few lines above, so the
+    // number here is the one the receiver could in principle corroborate.
+    // Gated on `send_success` because a packet the transport refused did not
+    // leave, and the retirement rule would otherwise credit it to the frame.
+    if (packet_type == RtpPacketMediaType::kVideo) {
+      finesse::SenderEgressLog::Get().OnMediaPacketSent(
+          packet->Ssrc(), packet->Timestamp(), now.us() / 1000, packet->size(),
+          packet->Marker());
+    }
+
     RtpPacketCounter counter(*packet);
     UpdateRtpStats(now, packet->Ssrc(), packet_type, std::move(counter),
                    packet->size());

@@ -172,6 +172,7 @@ rtc_library("rtp_rtcp") {
     "source/fec_private_tables_bursty.h",
     "source/fec_private_tables_random.cc",
     "source/fec_private_tables_random.h",
+    "source/finesse_egress_log.h",
     "source/flexfec_03_header_reader_writer.cc",
     "source/flexfec_03_header_reader_writer.h",
     "source/flexfec_header_reader_writer.cc",

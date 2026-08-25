@@ -68,6 +68,7 @@
 #include "json/reader.h"
 #include "json/value.h"
 #include "json/writer.h"
+#include "modules/audio_device/include/test_audio_device.h"
 #include "modules/video_capture/video_capture.h"
 #include "modules/video_capture/video_capture_factory.h"
 #include "pc/video_track_source.h"
@@ -84,6 +85,7 @@
 ABSL_DECLARE_FLAG(bool, datachannel_test);
 ABSL_DECLARE_FLAG(bool, rtp_sctp_mode);
 ABSL_DECLARE_FLAG(bool, rtp_only_mode);
+ABSL_DECLARE_FLAG(bool, with_audio);
 ABSL_DECLARE_FLAG(int, test_duration);
 ABSL_DECLARE_FLAG(int, vp8_kf_max_dist);
 ABSL_DECLARE_FLAG(bool, demo_mode);
@@ -249,6 +251,7 @@ Conductor::Conductor(const webrtc::Environment& env,
   datachannel_test_mode_ = absl::GetFlag(FLAGS_datachannel_test);
   rtp_sctp_mode_ = absl::GetFlag(FLAGS_rtp_sctp_mode);
   rtp_only_mode_ = absl::GetFlag(FLAGS_rtp_only_mode);
+  with_audio_ = absl::GetFlag(FLAGS_with_audio);
   test_duration_sec_ = absl::GetFlag(FLAGS_test_duration);
 
   // Pin the VP8 keyframe interval (libvpx kf_max_dist). The encoder settings
@@ -309,6 +312,24 @@ bool Conductor::InitializePeerConnection() {
   deps.audio_mixer = nullptr;
   deps.adm = nullptr;
   deps.audio_processing_builder = nullptr;
+
+  // --with_audio: a SYNTHETIC audio device rather than the platform one. These
+  // runs are headless, so a real capture device is either absent or silent, and
+  // a silent source is worse than no source for our purpose: Opus would send
+  // almost nothing and "audio kept flowing" could not be distinguished from
+  // "audio was never there". The pulsed-noise capturer produces a steady stream
+  // on a fixed clock, so the packet rate is a property of the experiment instead
+  // of a property of the machine.
+  if (with_audio_) {
+    deps.adm = webrtc::TestAudioDeviceModule::Create(
+        &env_.task_queue_factory(),
+        webrtc::TestAudioDeviceModule::CreatePulsedNoiseCapturer(
+            /*max_amplitude=*/16000, /*sampling_frequency_in_hz=*/48000),
+        webrtc::TestAudioDeviceModule::CreateDiscardRenderer(
+            /*sampling_frequency_in_hz=*/48000));
+    printf("[AUDIO] synthetic ADM (pulsed noise, 48 kHz) installed\n");
+    fflush(stdout);
+  }
 
   webrtc::EnableMedia(deps);
   
@@ -819,21 +840,39 @@ void Conductor::AddTracks() {
     return;  // Already added tracks.
   }
 
-  // In headless/demo modes, skip audio to avoid audio device issues
-  if (!rtp_sctp_mode_ && !rtp_only_mode_ && !demo_mode_) {
+  // In headless/demo modes, skip audio to avoid audio device issues, unless
+  // --with_audio asked for it on a synthetic device.
+  const bool add_audio =
+      with_audio_ || (!rtp_sctp_mode_ && !rtp_only_mode_ && !demo_mode_);
+  if (add_audio) {
+    // Audio goes on its OWN stream id. WebRTC derives each receiver's sync_group
+    // from the stream id and lip-syncs the pair when they match, so sharing
+    // kStreamId would couple the video playout clock to audio -- which would
+    // corrupt any experiment that deliberately stalls video.
+    static const char kAudioStreamId[] = "audio_stream_id";
     webrtc::scoped_refptr<webrtc::AudioTrackInterface> audio_track(
         peer_connection_factory_->CreateAudioTrack(
             kAudioLabel,
             peer_connection_factory_->CreateAudioSource(cricket::AudioOptions())
                 .get()));
-    auto result_or_error = peer_connection_->AddTrack(audio_track, {kStreamId});
+    const char* stream_id = with_audio_ ? kAudioStreamId : kStreamId;
+    auto result_or_error = peer_connection_->AddTrack(audio_track, {stream_id});
     if (!result_or_error.ok()) {
       RTC_LOG(LS_ERROR) << "Failed to add audio track to PeerConnection: "
                         << result_or_error.error().message();
+      printf("[AUDIO] FAILED to add audio track: %s\n",
+             result_or_error.error().message());
+    } else {
+      printf("[AUDIO] audio track added, stream_id=%s (video stream_id=%s;"
+             " different ids => A/V sync OFF)\n", stream_id, kStreamId);
     }
+    fflush(stdout);
   } else {
-    printf("[%s] Skipping audio track\n",
-           demo_mode_ ? "DEMO" : "RTP+SCTP");
+    // The mode label used to be hard-coded to RTP+SCTP here, so an RTP-only run
+    // reported "[RTP+SCTP] Skipping audio track" and read as if the mode had
+    // changed under us. It had not; only the label was wrong.
+    printf("[%s] Skipping audio track (pass --with_audio to add one)\n",
+           demo_mode_ ? "DEMO" : rtp_only_mode_ ? "RTP-ONLY" : "RTP+SCTP");
     fflush(stdout);
   }
 

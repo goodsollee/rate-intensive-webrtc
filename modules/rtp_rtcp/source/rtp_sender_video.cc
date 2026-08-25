@@ -840,12 +840,12 @@ bool RTPSenderVideo::SendVideo(int payload_type,
         std::min<size_t>(rtp_packets.size(), 0xFFFF));
     for (size_t i = 0; i < rtp_packets.size(); ++i) {
       pdu_set_info.end_of_set = (i == rtp_packets.size() - 1);
-      // PSN is 6 bits; wraps for frames with more than 64 packets.
-      pdu_set_info.packet_number = static_cast<uint8_t>(i & 0x3F);
+      pdu_set_info.packet_number =
+          static_cast<uint16_t>(std::min<size_t>(i, 0xFFFF));
       rtp_packets[i]->SetExtension<PduSetInfoExtension>(pdu_set_info);
     }
-    // PSSN is 10 bits, wraps.
-    pdu_set_sequence_number_ = (pdu_set_sequence_number_ + 1) & 0x3FF;
+    // PSSN is 16 bits and wraps naturally on the uint16_t.
+    ++pdu_set_sequence_number_;
   }
 
   LogAndSendToNetwork(std::move(rtp_packets), encoder_output_size);

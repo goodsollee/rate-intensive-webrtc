@@ -172,6 +172,7 @@ rtc_library("rtp_sender") {
     "rtp_transport_controller_send.cc",
     "rtp_transport_controller_send.h",
     "rtp_transport_controller_send_factory.h",
+    "finesse_frame_log.h",
     "rtp_video_sender.cc",
     "rtp_video_sender.h",
     "rtp_video_sender_interface.h",

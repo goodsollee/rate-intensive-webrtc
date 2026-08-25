@@ -842,10 +842,19 @@ bool VideoFrameTrackingIdExtension::Write(rtc::ArrayView<uint8_t> data,
 
 // PduSetInfoExtension (urn:3gpp:pdu-set-info)
 //
-// 8-byte payload, RFC 8285 one-byte header (ID pinned to 7 in SDP offers):
-//   |E| KR|D|  PSI  |     PSSN (10)     | PSN (6)   |
+// 10-byte payload, RFC 8285 one-byte header (ID pinned to 7 in SDP offers):
+//   |E| KR|D|  PSI  |      PSSN (16)      |      PSN (16)       |
 //   |                  PSSize (24)                  |  NPDS (16)  |
 // KR: keyframe-reason (0=n/a, 1=startup/app, 2=RTCP PLI/FIR, 3=encoder).
+//
+// PSSN and PSN are byte-aligned 16-bit fields rather than the 10/6-bit packing
+// of TS 38.415 §6.5.3.10-11. The standard widths do not survive this rig: at
+// ~1200 B/packet a 1080p frame is routinely >64 packets (measured p50 = 70,
+// p90 = 326, max = 1674), so a 6-bit PSN wraps mid-frame and splits one frame
+// into several apparent PDU sets. A 10-bit PSSN wraps every 1024 frames, i.e.
+// 17 s at 60 fps, which is shorter than a run. Both fields are ours end to end
+// (we stamp and we parse; this never leaves the testbed), so they are sized to
+// the traffic instead of to the spec.
 bool PduSetInfoExtension::Parse(rtc::ArrayView<const uint8_t> data,
                                 PduSetInfo* pdu_set_info) {
   RTC_DCHECK(pdu_set_info);
@@ -856,12 +865,13 @@ bool PduSetInfoExtension::Parse(rtc::ArrayView<const uint8_t> data,
   pdu_set_info->keyframe_reason = (data[0] >> 5) & 0x03;
   pdu_set_info->discardable = (data[0] & 0x10) != 0;
   pdu_set_info->importance = data[0] & 0x0F;
-  uint16_t pssn_psn = ByteReader<uint16_t>::ReadBigEndian(data.data() + 1);
-  pdu_set_info->sequence_number = pssn_psn >> 6;
-  pdu_set_info->packet_number = pssn_psn & 0x3F;
+  pdu_set_info->sequence_number =
+      ByteReader<uint16_t>::ReadBigEndian(data.data() + 1);
+  pdu_set_info->packet_number =
+      ByteReader<uint16_t>::ReadBigEndian(data.data() + 3);
   pdu_set_info->pdu_set_size =
-      ByteReader<uint32_t, 3>::ReadBigEndian(data.data() + 3);
-  pdu_set_info->num_pdus = ByteReader<uint16_t>::ReadBigEndian(data.data() + 6);
+      ByteReader<uint32_t, 3>::ReadBigEndian(data.data() + 5);
+  pdu_set_info->num_pdus = ByteReader<uint16_t>::ReadBigEndian(data.data() + 8);
   return true;
 }
 
@@ -872,14 +882,14 @@ bool PduSetInfoExtension::Write(rtc::ArrayView<uint8_t> data,
             static_cast<uint8_t>((pdu_set_info.keyframe_reason & 0x03) << 5) |
             (pdu_set_info.discardable ? 0x10 : 0x00) |
             (pdu_set_info.importance & 0x0F);
-  uint16_t pssn_psn =
-      static_cast<uint16_t>((pdu_set_info.sequence_number & 0x3FF) << 6) |
-      (pdu_set_info.packet_number & 0x3F);
-  ByteWriter<uint16_t>::WriteBigEndian(data.data() + 1, pssn_psn);
+  ByteWriter<uint16_t>::WriteBigEndian(data.data() + 1,
+                                       pdu_set_info.sequence_number);
+  ByteWriter<uint16_t>::WriteBigEndian(data.data() + 3,
+                                       pdu_set_info.packet_number);
   uint32_t pdu_set_size = std::min<uint32_t>(pdu_set_info.pdu_set_size,
                                              0xFFFFFF);  // Cap to 24 bits.
-  ByteWriter<uint32_t, 3>::WriteBigEndian(data.data() + 3, pdu_set_size);
-  ByteWriter<uint16_t>::WriteBigEndian(data.data() + 6, pdu_set_info.num_pdus);
+  ByteWriter<uint32_t, 3>::WriteBigEndian(data.data() + 5, pdu_set_size);
+  ByteWriter<uint16_t>::WriteBigEndian(data.data() + 8, pdu_set_info.num_pdus);
   return true;
 }
 

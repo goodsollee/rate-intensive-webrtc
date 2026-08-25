@@ -377,8 +377,8 @@ struct PduSetInfo {
   bool discardable = false;       // D: always 0 for now.
   uint8_t importance = 0;         // PSI, 4 bits (key frame = 9, delta = 11).
   uint8_t keyframe_reason = 0;    // 2 bits, see kKeyFrameReason* above.
-  uint16_t sequence_number = 0;   // PSSN, 10 bits, wraps per frame.
-  uint8_t packet_number = 0;      // PSN, 6 bits, packet index within frame.
+  uint16_t sequence_number = 0;   // PSSN, 16 bits, wraps per frame.
+  uint16_t packet_number = 0;     // PSN, 16 bits, packet index within frame.
   uint32_t pdu_set_size = 0;      // PSSize, 24 bits, sum of IP+UDP+RTP bytes.
   uint16_t num_pdus = 0;          // NPDS, 16 bits, packet count of the frame.
 
@@ -398,7 +398,7 @@ class PduSetInfoExtension {
  public:
   using value_type = PduSetInfo;
   static constexpr RTPExtensionType kId = kRtpExtensionPduSetInfo;
-  static constexpr uint8_t kValueSizeBytes = 8;
+  static constexpr uint8_t kValueSizeBytes = 10;
   static constexpr absl::string_view Uri() {
     return RtpExtension::kPduSetInfoUri;
   }
