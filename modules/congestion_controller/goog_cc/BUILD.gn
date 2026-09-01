@@ -43,6 +43,7 @@ rtc_library("goog_cc") {
     "../../remote_bitrate_estimator",
     "//third_party/abseil-cpp/absl/strings",
     "//third_party/abseil-cpp/absl/strings:string_view",
+      "../../../pc:rtp_sctp_coordinator",
   ]
 }
 
@@ -289,6 +290,7 @@ if (rtc_include_tests) {
         "delay_based_bwe_unittest.cc",
         "delay_based_bwe_unittest_helper.cc",
         "delay_based_bwe_unittest_helper.h",
+        "feedback_gate_invariance_test.cc",
         "goog_cc_network_control_unittest.cc",
         "loss_based_bwe_v2_test.cc",
         "probe_bitrate_estimator_unittest.cc",
@@ -339,6 +341,30 @@ if (rtc_include_tests) {
         "../../pacing",
         "//testing/gmock",
         "//third_party/abseil-cpp/absl/strings:string_view",
+      ]
+    }
+  }
+
+  # Standalone binary for the feedback-gate invariance tests. The umbrella
+  # modules_unittests target cannot link in this tree (an unrelated undefined
+  # symbol in pc/), and these tests need nothing outside goog_cc, so they get
+  # their own target rather than waiting on that.
+  if (rtc_include_tests) {
+    rtc_test("feedback_gate_invariance_test") {
+      testonly = true
+      sources = [ "feedback_gate_invariance_test.cc" ]
+      deps = [
+        ":delay_based_bwe",
+        ":estimators",
+        ":loss_based_bwe_v2",
+        "../../../api/transport:network_control",
+        "../../../api/units:data_rate",
+        "../../../api/units:data_size",
+        "../../../api/units:time_delta",
+        "../../../api/units:timestamp",
+        "../../../test:explicit_key_value_config",
+        "../../../test:test_main",
+        "../../../test:test_support",
       ]
     }
   }
