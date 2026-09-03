@@ -70,7 +70,8 @@ namespace {
 // as QUALITY (lower encoder bitrate). With KFT_PACER_FIXED_MBPS=N the pacer
 // always drains at >= N Mbps, so CC collapse costs bitrate, not latency, and
 // the remaining frame delay is attributable to the network/RAN queue.
-// Unset (or <= 0) keeps stock behaviour. padding_rate is never touched.
+// Unset (or <= 0) keeps stock behaviour. This knob never touches
+// padding_rate -- see KFT_MAX_PADDING_MBPS below for that.
 double KftPacerFixedMbps() {
   static const double v = [] {
     const char* e = std::getenv("KFT_PACER_FIXED_MBPS");
@@ -83,6 +84,45 @@ double KftPacerFixedMbps() {
     return x;
   }();
   return v;
+}
+
+// [KFT] Padding cap. The pacer pads up to pad_rate whenever the media queue
+// cannot fill the pacing rate, and WebRTC's payload padding re-sends FULL-SIZE
+// packets out of RtpPacketHistory on the RTX stream -- so padding is
+// indistinguishable from retransmission in outbound-rtp stats.
+//
+// Why this knob exists: on q1s_atthighway2_4g_795s the sender emitted ~52 Mbps
+// of 900-1094 B RTX packets into a 0-2 Mbps link while the CC target was
+// 1.0-1.76 Mbps. That burst survived capping the receiver's NACK retries
+// (nack packets 166 -> 41, requested SNs 54780 -> 7078, retx unchanged) and
+// survived PUDICA_PROBING=0, and its volume EXCEEDED every sequence number the
+// receiver ever asked for -- so it is neither NACK repair nor probe clusters.
+// It coincides with a 2.6-3.5 s silence of the ACK-driven controller that
+// begins while the target is still 17-19 Mbps, leaving the pacer draining at a
+// stale rate. Runs without such a silence showed the lowest retx of the set.
+//
+// KFT_MAX_PADDING_MBPS=0 turns padding off outright; >0 caps it. Unset keeps
+// stock behaviour. Only pad_rate is touched, so a run with this set differs
+// from the baseline in padding and nothing else.
+double KftMaxPaddingMbps() {
+  static const double v = [] {
+    const char* e = std::getenv("KFT_MAX_PADDING_MBPS");
+    if (!e || !*e) return -1.0;
+    char* end = nullptr;
+    double x = std::strtod(e, &end);
+    if (end == e || x < 0.0) return -1.0;
+    RTC_LOG(LS_ERROR) << "[KFT] KFT_MAX_PADDING_MBPS override: " << x
+                      << " Mbps (padding cap)";
+    return x;
+  }();
+  return v;
+}
+
+DataRate KftApplyPaddingCap(DataRate rate) {
+  const double mbps = KftMaxPaddingMbps();
+  if (mbps < 0.0) return rate;
+  return std::min(rate, DataRate::BitsPerSec(
+                            static_cast<int64_t>(mbps * 1e6)));
 }
 
 DataRate KftApplyPacerFloor(DataRate rate) {
@@ -822,7 +862,7 @@ void RtpTransportControllerSend::PostUpdates(NetworkControlUpdate update) {
   }
   if (update.pacer_config) {
     pacer_.SetPacingRates(KftApplyPacerFloor(update.pacer_config->data_rate()),
-                          update.pacer_config->pad_rate());
+                          KftApplyPaddingCap(update.pacer_config->pad_rate()));
   }
   if (!update.probe_cluster_configs.empty()) {
     pacer_.CreateProbeClusters(std::move(update.probe_cluster_configs));

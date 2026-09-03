@@ -2924,14 +2924,35 @@ int64_t RtpSctpCoordinator::GetPudicaRtpOverride() {
   static const double kZeta = []() {
     const char* e = std::getenv("PUDICA_FALLBACK_ZETA");
     return e ? std::atof(e) : 0.15; }();
-  // Each further frame interval with no acknowledgement is one more frame's
-  // worth of overshoot, so it earns one more zeta cut. Compounding rather than a
-  // single 15% step is ours, not the paper's: the paper's fallback re-fires per
-  // frame off the BUR, and here there are no frames to re-fire on. Capped so a
-  // long outage cannot drive the target to zero and strand the recovery.
+  // Each further frame interval with no acknowledgement earns one more zeta
+  // cut. Compounding rather than a single 15% step is ours, not the paper's:
+  // the paper's fallback re-fires per frame off the BUR, and here there are no
+  // frames to re-fire on.
+  //
+  // The cap is 2, and it is the load-bearing part of this rule. `next_delay`
+  // grows at 1 ms/ms once the queue builds, so `steps` grows by one every L —
+  // 30 steps per second. At the original cap of 12 the whole budget was spent
+  // in 400 ms, i.e. an exponential with a ~205 ms time constant.
+  //
+  // That was right when the anchor was the frozen published target, which
+  // carried no information about the collapse at all, so the exponent had to
+  // supply all of it. Once the anchor became recv_rate the exponent's job
+  // shrank to "how far below the delivered rate to sit while draining", and
+  // keeping 12 double-counted the collapse: on deepdip8 the anchor fell 12.43
+  // -> 6.94 Mbps on its own (x0.56) and the exponent multiplied that by
+  // 0.85^12 = 0.142, landing on the 1 Mbps floor and staying there for 3.5 s
+  // while `acked` sat at a steady 7.0 Mbps on an 8 Mbps link. Received video
+  // went to 4 fps for four seconds (baseline recovered to 29 fps in one), and
+  // the DU backlog integral got 2.1x WORSE, because sending at 1 Mbps does not
+  // drain a queue any faster than the link does.
+  //
+  // At 2, `published >= 0.72 x recv_rate` by construction — the cap IS the
+  // floor against the delivered rate, which is the same invariant LBWE_FLOOR
+  // enforces in section 2: never descend below a rate that is demonstrably
+  // being acknowledged.
   static const int kMaxSteps = []() {
     const char* e = std::getenv("PUDICA_NEXT_DELAY_MAX_STEPS");
-    return e ? std::atoi(e) : 12; }();
+    return e ? std::atoi(e) : 2; }();
 
   if (kNextDelayMarginUs > 0.0 && active_instance_ != nullptr) {
     const double L_us = active_instance_->features_.L_ms * 1000.0;
@@ -3243,6 +3264,69 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
   }
 
   int64_t ceiling = (kPudMaxBps > 0) ? kPudMaxBps : config_.max_rate_bps;
+
+  // Delivered-rate ceiling: B <= k x max(recv_rate over a short window).
+  //
+  // Why. Eq.1's R is a queue-occupancy signal, and Eq.2 deliberately drains
+  // that queue every frame (the rho-gap idles (1-1/rho)L after each frame), so
+  // R stays under alpha even on a saturated link -- measured on a flat 40 Mbps
+  // segment with the span contamination removed: R p50 = 0.72 against a
+  // 1/rho = 0.61 floor, i.e. a queue term of 3 ms. Worse, the target is never
+  // realised: the encoder delivered 16-18 Mbps while B stood at 80. The
+  // controller was therefore measuring the queue caused by the ACTUAL rate and
+  // inferring headroom for the TARGET rate -- open loop above the send rate,
+  // which is why B parked on whatever ceiling it was given (1000 Mbps by
+  // default, then exactly 150/70/80 as each ceiling was tried).
+  //
+  // recv_rate is the one signal that bounds the target from below the link:
+  // against the sender's own 200 ms-window bitrate it tracked p50 18.5 vs 16.4
+  // and max 37.7 vs 37.1 Mbps on a 40 Mbps link.
+  //
+  // No application-limited gate. Gating on "recv >= util x B" was tried first
+  // and is wrong by construction: a runaway B and an app-limited encoder both
+  // present as recv << B, so the gate opens exactly when the clamp is not
+  // needed and closes when it is. It is also unnecessary -- if the encoder is
+  // app-limited then a larger B buys nothing, because the encoder would not
+  // use it. The only real cost is a bound on GROWTH: B can rise by at most k
+  // per window, so keep the window short enough that a link step-up is
+  // followed within a frame interval or two (k=1.5 at 500 ms = 2.25x/s).
+  //
+  // The rolling MAX (not mean) is what makes a short window safe: recv is
+  // sampled per frame and noisy, and max-filter noise is one-sided upward,
+  // which errs toward letting B grow rather than choking it.
+  //
+  // A PURELY multiplicative ceiling deadlocks on the way up, because recv is
+  // itself bounded by B: after the trace's 8 Mbps outage ended, K=1.5 pinned
+  // ack_ceil and B to the same value frame for frame (7 3 3 4 5 6 7 8 10 11)
+  // and took 7.66 s to regain 20 Mbps, against 0.18 s with no ceiling. The
+  // loop gain is well under K per window, since recv lags B by the encoder
+  // ramp plus the delivery delay. The additive headroom breaks that at low
+  // rates -- 2 -> 8 -> 17 -> 30 -> 45 in four windows -- and is negligible
+  // once B is anywhere near the link.
+  static const double kAckCeilHeadroomBps = []() {
+    const char* e = std::getenv("PUDICA_ACK_CEIL_HEADROOM_MBPS");
+    return (e ? std::atof(e) : 0.0) * 1e6; }();
+  // PUDICA_ACK_CEIL_K <= 0 (the default) disables all of this.
+  static const double kAckCeilK = []() {
+    const char* e = std::getenv("PUDICA_ACK_CEIL_K"); return e ? std::atof(e) : 0.0; }();
+  static const int64_t kAckCeilWindowUs = []() {
+    const char* e = std::getenv("PUDICA_ACK_CEIL_WINDOW_MS");
+    return (e ? static_cast<int64_t>(std::atoll(e)) : 500) * 1000; }();
+  double ack_ceil_mbps = -1.0;  // -1 = disabled, for the trace
+  if (kAckCeilK > 0.0) {
+    pudica_recv_window_.push_back({now_us, recv_rate});
+    while (!pudica_recv_window_.empty() &&
+           now_us - pudica_recv_window_.front().first > kAckCeilWindowUs) {
+      pudica_recv_window_.pop_front();
+    }
+    int64_t recv_max = recv_rate;
+    for (const auto& [t, r] : pudica_recv_window_) recv_max = std::max(recv_max, r);
+    int64_t ack_ceiling =
+        static_cast<int64_t>(kAckCeilK * recv_max + kAckCeilHeadroomBps);
+    ack_ceil_mbps = ack_ceiling / 1e6;
+    ceiling = std::min(ceiling, ack_ceiling);
+  }
+
   pudica_base_target_bps_ = std::max(
       config_.min_rate_bps, std::min(ceiling, pudica_base_target_bps_));
   int64_t new_target =
@@ -3270,7 +3354,7 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
         pudica_ctrl_csv_
             << "t_ms,mode,bur,rtp_recv_mbps,total_recv_mbps,n_ack_samples,"
                "ack_span_ms,ack_bytes,old_target_mbps,new_target_mbps,"
-               "d_min_ms,frame_owd_ms,frame_pkts\n";
+               "d_min_ms,frame_owd_ms,frame_pkts,ack_ceil_mbps\n";
       }
       pudica_ctrl_csv_start_us_ = now_us;
       pudica_ctrl_csv_initialized_ = true;
@@ -3295,7 +3379,8 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
                      << rtp_samples_total_bytes_ << ","
                      << (old_target / 1e6) << "," << (new_target / 1e6) << ","
                      << (pudica_d_min_us_ / 1000.0) << "," << frame_owd_ms << ","
-                     << pudica_frame_.frame_packets << "\n";
+                     << pudica_frame_.frame_packets << ","
+                     << ack_ceil_mbps << "\n";
   }
 
   static int64_t pud_log = 0;

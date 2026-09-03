@@ -10,6 +10,8 @@
 
 #include "modules/congestion_controller/goog_cc/goog_cc_network_control.h"
 
+#include "pc/rtp_sctp_coordinator.h"
+
 #include <stdio.h>
 
 #include <algorithm>
@@ -305,6 +307,44 @@ NetworkControlUpdate GoogCcNetworkController::OnProcessInterval(
         *current_data_window_);
   } else {
     update.congestion_window = current_data_window_;
+  }
+  // [KFT] Timer-driven evaluation of Pudica's fallbacks.
+  //
+  // GetPudicaRtpOverride() carries two responses to a link that has stopped
+  // delivering: the paper's §4.3 next-delay fallback, and the staleness expiry
+  // that hands back to GCC. The next-delay rule is measured entirely on the
+  // SENDER's clock precisely so it does not need the failed link to carry
+  // anything -- but its only call site is inside
+  // DelayBasedBwe::MaybeUpdateEstimate(), which is reachable only from
+  // OnTransportPacketsFeedback(). In a full blackout no packet reaches the UE,
+  // so no TWCC comes back, so neither fallback ever runs and the target stays
+  // frozen at its pre-dip value.
+  //
+  // Measured on run 1787146909 (q1s_atthighway2_4g_698s, ctl arm, no RAN
+  // module and zero retransmissions): capacity hit 0 at t=18 s with the target
+  // at 32.04 Mbps and pudica_ctrl.csv recorded NO update for the next 5 s while
+  // the sender's rate ROSE to 25.6 Mbps; same again at t=52..54 s from 38.53
+  // Mbps, rising to 32.7. The run logged 4 NEXT-DELAY lines in total, all at
+  // targets of 2.4-13 Mbps, i.e. only where feedback was still flowing.
+  //
+  // OnProcessInterval is the periodic path and keeps running with no feedback,
+  // so evaluating the override here makes both fallbacks reachable. Applied the
+  // same way the feedback path applies it (UpdateDelayBasedEstimate, then
+  // MaybeTriggerOnNetworkChanged). A zero return means "expired, GCC takes
+  // over", which is the expiry's designed behaviour, so it is left alone.
+  //
+  // Off by default: this changes the rate trajectory of every pudica run, and
+  // the arms it would be compared against were measured without it.
+  static const bool kPudicaTimerFallback = [] {
+    const char* e = std::getenv("KFT_PUDICA_TIMER_FALLBACK");
+    return e && *e && std::atoi(e) != 0;
+  }();
+  if (kPudicaTimerFallback && RtpSctpCoordinator::IsPudicaMode()) {
+    int64_t pud_override = RtpSctpCoordinator::GetPudicaRtpOverride();
+    if (pud_override > 0) {
+      bandwidth_estimation_->UpdateDelayBasedEstimate(
+          msg.at_time, DataRate::BitsPerSec(pud_override));
+    }
   }
   MaybeTriggerOnNetworkChanged(&update, msg.at_time);
   return update;

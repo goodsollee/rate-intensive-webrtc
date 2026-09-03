@@ -91,6 +91,7 @@ PudicaSentFrames& SentFrames() {
   static PudicaSentFrames* const s = new PudicaSentFrames();
   return *s;
 }
+
 }  // namespace
 
 void PacingController::PudicaRecordFrameSent(int64_t send_us) {
@@ -480,6 +481,22 @@ Timestamp PacingController::NextSendTime() const {
     if (now < pudica_gap_end_time_ && pudica_gap_end_time_.IsFinite()) {
       next_send_time = std::min(next_send_time, pudica_gap_end_time_);
     }
+    // Wake up for the Eq.2 deadline guard (ProcessPackets, ~line 547). Without
+    // this the guard's wake-up is scheduled from media_debt_ /
+    // adjusted_media_rate_ -- i.e. from the very rate it exists to correct, so
+    // the lower the bogus rate the later the correction, and an emptied queue
+    // falls through to the kPausedProcessInterval (500 ms) branch above.
+    // Measured before this clamp: held=298 ms at rate=1.2 Mbps with 624 KB
+    // still queued, and 501 ms of a silent wire on an idle 40 Mbps link with
+    // the DU backlog at 0 -- against a guard that is supposed to bound the
+    // hold at L. The deadline must not be scheduled by the thing it bounds.
+    if (pudica_intra_frame_pacing_ && pudica_frame_send_start_.IsFinite()) {
+      next_send_time =
+          std::min(next_send_time,
+                   pudica_frame_send_start_ +
+                       TimeDelta::Micros(
+                           static_cast<int64_t>(kPudicaFrameIntervalUs)));
+    }
   }
 
   return next_send_time;
@@ -670,6 +687,16 @@ void PacingController::ProcessPackets() {
             // frames taking 245 ms, then a 4 s collapse to 2.8 Mbps on a 40 Mbps
             // link. Any bound here must be anchored to something independent of
             // B, and Eq.1 cannot tell a slow pacer from a full queue anyway.
+            //
+            // Re-solving this per packet against a fixed deadline was tried
+            // (run 1786426385) on the theory that the queue holds only part of
+            // the frame. pudica_pace.csv refuted the premise: armed_bytes /
+            // sent_bytes = 0.97 at p50 with 0% under-estimates, i.e. the frame
+            // IS enqueued as one batch. The error runs the other way -- the
+            // queue can also hold the NEXT frame (queue_end_bytes p90 = 296 KB
+            // under the re-solve, 0 without it) -- so re-solving amplified an
+            // over-estimate on every packet: achieved/armed p90 went 2.8 -> 7.6
+            // and pre-dip frames over 150 ms went 1 -> 57.
             pudica_frame_rate_ = frame_size / span;
             // MaybeUpdateMediaRateDueToLongQueue() only runs at the end of
             // ProcessPackets(), so apply it here too — otherwise the rest of

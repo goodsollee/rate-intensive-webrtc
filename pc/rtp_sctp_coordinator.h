@@ -507,6 +507,9 @@ class RtpSctpCoordinator {
   // D_min: minimum packet OWD over 10-second window (μs)
   double pudica_d_min_us_ = -1.0;
   std::deque<std::pair<int64_t, double>> pudica_owd_window_;  // (time_us, owd_us)
+  // (time_us, recv_rate_bps) for the delivered-rate ceiling's rolling max.
+  // See PUDICA_ACK_CEIL_K in PudicaUpdateRtpTarget().
+  std::deque<std::pair<int64_t, int64_t>> pudica_recv_window_;
   static constexpr int64_t kPudicaDminWindowUs = 10'000'000;  // 10 seconds in μs
   // A frame's packets all leave within L/rho <= L. Past this many frame
   // intervals the marker that would close pudica_frame_ is not coming.
