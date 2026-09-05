@@ -11,6 +11,8 @@
 #include "rtc_base/async_udp_socket.h"
 
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 
@@ -80,13 +82,24 @@ int AsyncUDPSocket::SendTo(const void* pv,
   rtc::SentPacket sent_packet(options.packet_id, rtc::TimeMillis(),
                               options.info_signaled_after_sent);
   CopySocketInformationToPacketInfo(cb, *this, &sent_packet.info);
-  if (has_set_ect1_options_ != options.ecn_1) {
+  // [L4Span L1, J-135] Force ECT(1) on every UDP send when KFT_ECT1 is set
+  // (value != "0"). PhysicalSocket::RecvFrom only reads the incoming ECN
+  // cmsg when the send flag ecn_ is already on (physical_socket_server.cc:492),
+  // so ECN marking is invisible to the receiver unless OPT_SEND_ECN is enabled
+  // on all UDP traffic — hence the flag lives here rather than per media packet.
+  // Unset => want_ect1 == options.ecn_1 => byte-identical to prior behavior.
+  static const bool kEct1 = []() {
+    const char* e = getenv("KFT_ECT1");
+    return e != nullptr && std::strcmp(e, "0") != 0;
+  }();
+  const bool want_ect1 = options.ecn_1 || kEct1;
+  if (has_set_ect1_options_ != want_ect1) {
     // It is unclear what is most efficient, setting options on every sent
     // packet or when changed. Potentially, can separate send sockets be used?
     // This is the easier implementation.
     if (socket_->SetOption(Socket::Option::OPT_SEND_ECN,
-                           options.ecn_1 ? 1 : 0) == 0) {
-      has_set_ect1_options_ = options.ecn_1;
+                           want_ect1 ? 1 : 0) == 0) {
+      has_set_ect1_options_ = want_ect1;
     }
   }
   int ret = socket_->SendTo(pv, cb, addr);

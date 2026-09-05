@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <utility>
 
@@ -124,12 +126,20 @@ void ReceiveSideCongestionController::OnReceivedPacket(
   if (send_rfc8888_congestion_feedback_) {
     RTC_DCHECK_RUN_ON(&sequence_checker_);
     congestion_control_feedback_generator_.OnReceivedPacket(packet);
+    // [L4Span L2, J-136] When KFT_CCFB_ONLY is set (value != "0") and CCFB is
+    // negotiated, stop emitting transport-cc (TWCC) feedback so the sender's
+    // goog_cc reacts to RFC 8888 CCFB (which carries per-packet ECN) exclusively.
+    // Unset => both generators run, matching upstream behavior.
+    static const bool kCcfbOnly = []() {
+      const char* e = getenv("KFT_CCFB_ONLY");
+      return e != nullptr && std::strcmp(e, "0") != 0;
+    }();
     // TODO(https://bugs.webrtc.org/374197376): Utilize RFC 8888 feedback, which
     // provides comprehensive details similar to transport-cc. To ensure a
     // smooth transition, we will continue using transport sequence number
     // feedback temporarily. Once validation is complete, we will fully
     // transition to using RFC 8888 feedback exclusively.
-    if (has_transport_sequence_number) {
+    if (has_transport_sequence_number && !kCcfbOnly) {
       transport_sequence_number_feedback_generator_.OnReceivedPacket(packet);
     }
     return;

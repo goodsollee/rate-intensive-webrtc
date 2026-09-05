@@ -260,6 +260,7 @@ SendSideBandwidthEstimation::SendSideBandwidthEstimation(
       last_round_trip_time_(TimeDelta::Zero()),
       receiver_limit_(DataRate::PlusInfinity()),
       delay_based_limit_(DataRate::PlusInfinity()),
+      ce_limit_(DataRate::PlusInfinity()),
       time_last_decrease_(Timestamp::MinusInfinity()),
       first_report_time_(Timestamp::MinusInfinity()),
       initially_lost_packets_(0),
@@ -313,6 +314,7 @@ void SendSideBandwidthEstimation::OnRouteChange() {
   last_round_trip_time_ = TimeDelta::Zero();
   receiver_limit_ = DataRate::PlusInfinity();
   delay_based_limit_ = DataRate::PlusInfinity();
+  ce_limit_ = DataRate::PlusInfinity();
   time_last_decrease_ = Timestamp::MinusInfinity();
   first_report_time_ = Timestamp::MinusInfinity();
   initially_lost_packets_ = 0;
@@ -713,7 +715,18 @@ DataRate SendSideBandwidthEstimation::GetUpperLimit() const {
   DataRate upper_limit = delay_based_limit_;
   if (disable_receiver_limit_caps_only_)
     upper_limit = std::min(upper_limit, receiver_limit_);
+  // [L4Span L3, J-138] The CE brake is a true ceiling: it caps loss-/delay-based
+  // increases too. PlusInfinity (default, and whenever the brake is inactive)
+  // makes this std::min a no-op, so the target series is byte-identical.
+  upper_limit = std::min(upper_limit, ce_limit_);
   return std::min(upper_limit, max_bitrate_configured_);
+}
+
+void SendSideBandwidthEstimation::SetCeLimit(DataRate ce_limit,
+                                             Timestamp at_time) {
+  ce_limit_ = ce_limit;
+  // Re-clamp the current target to the new ceiling immediately.
+  ApplyTargetLimits(at_time);
 }
 
 void SendSideBandwidthEstimation::MaybeLogLowBitrateWarning(DataRate bitrate,

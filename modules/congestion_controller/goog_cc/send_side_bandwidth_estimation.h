@@ -133,6 +133,11 @@ class SendSideBandwidthEstimation {
                    DataRate max_bitrate,
                    Timestamp at_time);
   void SetSendBitrate(DataRate bitrate, Timestamp at_time);
+  // [L4Span L3, J-138] Upper bound imposed by the L4S CE brake. Merged into
+  // GetUpperLimit(), so it caps even loss-/delay-based increases (a true
+  // ceiling). Pass DataRate::PlusInfinity() to release. Default is PlusInfinity
+  // (no cap) => byte-identical when the CE brake never fires.
+  void SetCeLimit(DataRate ce_limit, Timestamp at_time);
   void SetMinMaxBitrate(DataRate min_bitrate, DataRate max_bitrate);
   int GetMinBitrate() const;
   void SetAcknowledgedRate(std::optional<DataRate> acknowledged_rate,
@@ -214,6 +219,8 @@ class SendSideBandwidthEstimation {
   // send side delay based estimate.
   DataRate receiver_limit_;
   DataRate delay_based_limit_;
+  // [L4Span L3, J-138] L4S CE-brake ceiling; PlusInfinity == no cap.
+  DataRate ce_limit_;
   Timestamp time_last_decrease_;
   Timestamp first_report_time_;
   int initially_lost_packets_;

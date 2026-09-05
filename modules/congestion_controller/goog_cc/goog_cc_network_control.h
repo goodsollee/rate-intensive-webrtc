@@ -81,6 +81,14 @@ class GoogCcNetworkController : public NetworkControllerInterface {
   void ClampConstraints();
   void MaybeTriggerOnNetworkChanged(NetworkControlUpdate* update,
                                     Timestamp at_time);
+  // [L4Span L3, J-137/J-138] GCC + CE brake. Reads the per-packet ECN carried
+  // by RFC 8888 CCFB feedback and, once per RTT window that saw any CE, caps
+  // the send target at target*(1 - alpha/2); a CE-free window releases the cap.
+  // Gated by field trial WebRTC-L4S-CeReaction — when absent this is a no-op and
+  // the target series is byte-identical (J-141 regression check).
+  void MaybeReactToCe(const std::vector<PacketResult>& feedbacks,
+                      TimeDelta max_feedback_rtt,
+                      Timestamp at_time);
   void UpdateCongestionWindowSize();
   PacerConfig GetPacingRates(Timestamp at_time) const;
   void SetNetworkStateEstimate(std::optional<NetworkStateEstimate> estimate);
@@ -125,6 +133,16 @@ class GoogCcNetworkController : public NetworkControllerInterface {
   int expected_packets_since_last_loss_update_ = 0;
 
   std::deque<int64_t> feedback_max_rtts_;
+
+  // [L4Span L3, J-137/J-138] CE-brake state. All inert unless the field trial
+  // WebRTC-L4S-CeReaction is enabled.
+  const bool l4s_ce_reaction_enabled_;
+  FieldTrialParameter<double> l4s_ce_g_;   // EWMA gain, default 1/16.
+  double ce_alpha_ = 0.0;                  // EWMA of the CE fraction.
+  double ce_rtt_ewma_ms_ = -1.0;           // EWMA of max_feedback_rtt (window).
+  Timestamp ce_window_start_ = Timestamp::MinusInfinity();
+  int ce_window_ce_count_ = 0;             // CE packets seen in current window.
+  bool ce_cap_active_ = false;             // a finite cap is currently applied.
 
   DataRate last_loss_based_target_rate_;
   DataRate last_pushback_target_rate_;

@@ -132,6 +132,9 @@ GoogCcNetworkController::GoogCcNetworkController(NetworkControllerConfig config,
       acknowledged_bitrate_estimator_(
           AcknowledgedBitrateEstimatorInterface::Create(&env_.field_trials())),
       initial_config_(config),
+      l4s_ce_reaction_enabled_(
+          env_.field_trials().IsEnabled("WebRTC-L4S-CeReaction")),
+      l4s_ce_g_("g", 0.0625),
       last_loss_based_target_rate_(*config.constraints.starting_rate),
       last_pushback_target_rate_(last_loss_based_target_rate_),
       last_stable_target_rate_(last_loss_based_target_rate_),
@@ -147,6 +150,10 @@ GoogCcNetworkController::GoogCcNetworkController(NetworkControllerConfig config,
   ParseFieldTrial(
       {&safe_reset_on_route_change_, &safe_reset_acknowledged_rate_},
       env_.field_trials().Lookup("WebRTC-Bwe-SafeResetOnRouteChange"));
+  // [L4Span L3] Parse CE-brake gain g (default 1/16). Only meaningful when
+  // WebRTC-L4S-CeReaction is enabled; otherwise MaybeReactToCe returns early.
+  ParseFieldTrial({&l4s_ce_g_},
+                  env_.field_trials().Lookup("WebRTC-L4S-CeReaction"));
   if (delay_based_bwe_)
     delay_based_bwe_->SetMinBitrate(kCongestionControllerMinBitrate);
 
@@ -463,6 +470,10 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
     bandwidth_estimation_->UpdatePropagationRtt(report.feedback_time,
                                                 min_propagation_rtt);
   }
+  // [L4Span L3, J-137/J-138] React to CE marks before the delay/loss BWE
+  // updates below, so the CE cap (merged into GetUpperLimit) clamps this
+  // report's target update. No-op unless WebRTC-L4S-CeReaction is enabled.
+  MaybeReactToCe(feedbacks, max_feedback_rtt, report.feedback_time);
   if (packet_feedback_only_) {
     if (!feedback_max_rtts_.empty()) {
       int64_t sum_rtt_ms =
@@ -716,6 +727,67 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
                         << last_pushback_target_rate_.bps()
                         << " estimate_bps=" << loss_based_target_rate.bps();
   }
+}
+
+void GoogCcNetworkController::MaybeReactToCe(
+    const std::vector<PacketResult>& feedbacks,
+    TimeDelta max_feedback_rtt,
+    Timestamp at_time) {
+  if (!l4s_ce_reaction_enabled_)
+    return;  // Gate: byte-identical target series when the trial is absent.
+
+  // Count CE among ECN-Capable-Transport packets only. TWCC-derived feedback
+  // carries ecn == kNotEct, so a pure-TWCC report contributes 0 to both
+  // counters and can never move the brake (INVARIANT).
+  int n_ce = 0;
+  int n_ect = 0;
+  for (const auto& fb : feedbacks) {
+    if (fb.ecn == EcnMarking::kCe) {
+      ++n_ce;
+      ++n_ect;
+    } else if (fb.ecn == EcnMarking::kEct1 || fb.ecn == EcnMarking::kEct0) {
+      ++n_ect;
+    }
+  }
+
+  // Per-report EWMA of the CE fraction (Prague/DCTCP alpha, g = 1/16 default).
+  if (n_ect > 0) {
+    double batch_ce_frac = static_cast<double>(n_ce) / n_ect;
+    double g = l4s_ce_g_.Get();
+    ce_alpha_ = (1.0 - g) * ce_alpha_ + g * batch_ce_frac;
+  }
+
+  // RTT window length = EWMA of max_feedback_rtt (J-137).
+  if (max_feedback_rtt.IsFinite() && max_feedback_rtt > TimeDelta::Zero()) {
+    double rtt_ms = max_feedback_rtt.ms<double>();
+    ce_rtt_ewma_ms_ =
+        ce_rtt_ewma_ms_ < 0.0 ? rtt_ms : 0.9 * ce_rtt_ewma_ms_ + 0.1 * rtt_ms;
+  }
+
+  ce_window_ce_count_ += n_ce;
+  if (!ce_window_start_.IsFinite()) {
+    ce_window_start_ = at_time;
+    return;
+  }
+  if (ce_rtt_ewma_ms_ <= 0.0)
+    return;  // No usable RTT yet; wait for a finite feedback RTT.
+  if ((at_time - ce_window_start_).ms<double>() < ce_rtt_ewma_ms_)
+    return;  // Still inside the current RTT window: at most one reaction/RTT.
+
+  // Window boundary crossed.
+  if (ce_window_ce_count_ > 0) {
+    // Multiplicative decrease once per RTT that saw CE (paper §2).
+    DataRate target = bandwidth_estimation_->target_rate();
+    DataRate cap = target * (1.0 - ce_alpha_ / 2.0);
+    bandwidth_estimation_->SetCeLimit(cap, at_time);
+    ce_cap_active_ = true;
+  } else if (ce_cap_active_) {
+    // A CE-free window: release the cap so additive increase resumes.
+    bandwidth_estimation_->SetCeLimit(DataRate::PlusInfinity(), at_time);
+    ce_cap_active_ = false;
+  }
+  ce_window_start_ = at_time;
+  ce_window_ce_count_ = 0;
 }
 
 PacerConfig GoogCcNetworkController::GetPacingRates(Timestamp at_time) const {
