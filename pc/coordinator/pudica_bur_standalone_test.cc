@@ -5,10 +5,15 @@
  *  Build: g++ -std=c++17 -O2 -o /tmp/pudica_test pc/coordinator/pudica_bur_standalone_test.cc
  *  Run: /tmp/pudica_test
  */
-#include <cstdio>
-#include <cmath>
-#include <deque>
+#include "pudica_rtp_rate.h"
+
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <string>
 
 static int failed_count = 0;
 #define EXPECT_NEAR(a, b, tol) do { \
@@ -20,6 +25,11 @@ static int failed_count = 0;
 #define EXPECT_GT(a, b) do { if (!((a) > (b))) { fprintf(stderr, "  FAIL: %s > %s\n", #a, #b); failed_count++; } } while(0)
 #define EXPECT_LT(a, b) do { if (!((a) < (b))) { fprintf(stderr, "  FAIL: %s < %s\n", #a, #b); failed_count++; } } while(0)
 #define EXPECT_GE(a, b) do { if (!((a) >= (b))) { fprintf(stderr, "  FAIL: %s >= %s\n", #a, #b); failed_count++; } } while(0)
+#define EXPECT_STREQ(a, b) do { \
+  if (std::string(a) != std::string(b)) { \
+    fprintf(stderr, "  FAIL: %s == %s (got '%s')\n", #a, #b, (a)); \
+    failed_count++; \
+  } } while(0)
 
 // Minimal Pudica BUR computation (mirrors rtp_sctp_coordinator.cc)
 struct PudicaBur {
@@ -211,113 +221,139 @@ TEST(AdaptivePacing) {
 }
 
 // ============================================================================
-// Pudica RTP rate controller (mirrors RtpSctpCoordinator::PudicaUpdateRtpTarget)
-// Regression cover for the "rotary" fix: no single frame decision may collapse
-// the target to the min-rate floor.
+// Pudica NSDI'24 §4.2–§4.3 RTP rate controller
 // ============================================================================
-struct PudicaRateCtrl {
-  double L_ms = 33.0;
-  double gamma_up = 1.30;
-  double up_thresh = 0.9;
-  double drain_thresh = 1.1;
-  double draining_target = 0.85;
-  int64_t min_rate = 1'000'000;
-  int64_t max_rate = 1'000'000'000;
-  // Rotary fix knobs (0 disables the fix, reproducing the pre-fix behaviour).
-  bool rotary_fix = true;
-  double drain_down_step = 0.70;
-  double restore_down_step = 0.95;
-  double drain_floor_ratio = 0.40;
+using webrtc::PudicaRtpRateCtrl;
+using webrtc::PudicaBurSampleEq6;
+using webrtc::PudicaSmoothBurEq6;
 
-  int64_t target = 0;
+static PudicaRtpRateCtrl::Input MakeIn(double bur, double rtilde, int64_t recv,
+                                       int64_t now_us, int64_t send_us,
+                                       int64_t inflight = 0) {
+  PudicaRtpRateCtrl::Input in;
+  in.frame_bur = bur;
+  in.smoothed_bur = rtilde;
+  in.recv_rate_bps = recv;
+  in.inflight_bytes = inflight;
+  in.now_us = now_us;
+  in.frame_send_us = send_us;
+  return in;
+}
 
-  int64_t Update(double frame_bur, int64_t recv_rate) {
-    int64_t old_target = target > 0 ? target : recv_rate;
-    int64_t nt = old_target;
-    bool draining = false;
-    if (frame_bur < up_thresh) {
-      nt = static_cast<int64_t>(recv_rate * gamma_up);
-    } else if (frame_bur > drain_thresh) {
-      double queue_delay_ms = std::max(0.0, (frame_bur - 1.0) * L_ms);
-      int64_t queue_bytes =
-          static_cast<int64_t>(queue_delay_ms * recv_rate / 8000.0);
-      int64_t drain_rate =
-          queue_bytes > 0 ? static_cast<int64_t>(queue_bytes * 8.0 / 0.200) : 0;
-      nt = static_cast<int64_t>(draining_target * recv_rate) - drain_rate;
-      draining = true;
-    } else {
-      nt = recv_rate;
-    }
-    if (rotary_fix && nt < old_target) {
-      double step = draining ? drain_down_step : restore_down_step;
-      int64_t floor_bps = static_cast<int64_t>(old_target * step);
-      if (draining) {
-        floor_bps = std::max(
-            floor_bps, static_cast<int64_t>(recv_rate * drain_floor_ratio));
-      }
-      nt = std::max(nt, floor_bps);
-    }
-    nt = std::max(min_rate, std::min(max_rate, nt));
-    target = nt;
-    return nt;
+// J-251 (1)(3): low BUR is MI from committed B, not recv × 1.30.
+TEST(RestoreOnlyAfterDrain) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 50'000'000;
+  auto o = c.Update(MakeIn(0.27, 0.27, 5'000'000, 200000, 200000));
+  printf("  low-BUR without drain: mode=%s target=%.2f Mbps (committed was 50)\n",
+         o.mode, o.target_bps / 1e6);
+  EXPECT_GT(o.target_bps, 50'000'000);          // MI raises B
+  EXPECT_LT(o.target_bps, 200'000'000);
+  EXPECT_GT(o.target_bps, 10'000'000);          // must not snap to 1.30×5 Mbps
+}
+
+// Restore to receiving_rate happens only when leaving drain.
+TEST(RestoreAfterDrain) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 40'000'000;
+  int64_t now = 0;
+  PudicaRtpRateCtrl::Output o{};
+  for (int i = 0; i < 3; ++i) {
+    now += 200000;
+    o = c.Update(MakeIn(2.0, 1.2, 20'000'000, now, now, 50'000));
   }
-};
-
-// The measured rotary trigger: one frame reporting BUR ~ 6 (a 165 ms transient
-// queue) while the link delivers 50 Mbps. Pre-fix this lands on min_rate.
-TEST(DrainCliffPreFix) {
-  PudicaRateCtrl c;
-  c.rotary_fix = false;
-  c.target = 77'000'000;
-  int64_t t = c.Update(6.15, 50'000'000);
-  printf("  pre-fix drain target = %.2f Mbps (expect min-rate cliff)\n", t / 1e6);
-  EXPECT_LT(t, 2'000'000);   // collapses to the 1 Mbps floor
+  printf("  after 3 high BUR: mode=%s draining=%d target=%.2f\n",
+         o.mode, (int)o.draining, o.target_bps / 1e6);
+  EXPECT_GT(std::string(o.mode) == "PUD-DRAIN" ? 1 : 0, 0);
+  now += 200000;
+  o = c.Update(MakeIn(0.4, 0.5, 18'000'000, now, now));
+  printf("  drain exit: mode=%s target=%.2f (recv=18)\n", o.mode,
+         o.target_bps / 1e6);
+  EXPECT_STREQ(o.mode, "PUD-RESTORE");
+  EXPECT_NEAR(o.target_bps / 1e6, 18.0, 0.01);
 }
 
-TEST(DrainCliffFixed) {
-  PudicaRateCtrl c;
-  c.target = 77'000'000;
-  int64_t t = c.Update(6.15, 50'000'000);
-  printf("  fixed drain target = %.2f Mbps\n", t / 1e6);
-  EXPECT_GE(t, 20'000'000);              // >= max(0.70*77, 0.40*50)
-  EXPECT_LT(t, 77'000'000);              // still a real drain
+// Single BUR>1 is a 15% one-frame fallback; committed B is unchanged.
+TEST(SingleHighIsFallbackNotDrain) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 70'000'000;
+  auto o = c.Update(MakeIn(6.15, 0.4, 50'000'000, 100000, 100000, 200000));
+  printf("  one high BUR: mode=%s published=%.2f committed=%.2f\n",
+         o.mode, o.target_bps / 1e6, o.committed_bps / 1e6);
+  EXPECT_STREQ(o.mode, "PUD-FALLBACK");
+  EXPECT_NEAR(o.target_bps / 1e6, 70.0 * 0.85, 0.05);
+  EXPECT_NEAR(o.committed_bps / 1e6, 70.0, 0.01);
+  // Next frame reverts, then MI from 70 not from 59.5.
+  auto o2 = c.Update(MakeIn(0.2, 0.2, 50'000'000, 300000, 300000));
+  printf("  after revert: mode=%s target=%.2f\n", o2.mode, o2.target_bps / 1e6);
+  EXPECT_GT(o2.target_bps, 70'000'000);
 }
 
-// A drain that must persist still converges fast: 0.70^n per frame.
-TEST(DrainStillFast) {
-  PudicaRateCtrl c;
-  c.target = 77'000'000;
-  int64_t t = 0;
-  for (int i = 0; i < 10; ++i) t = c.Update(6.15, 5'000'000);
-  printf("  after 10 sustained-drain frames (0.33 s): %.2f Mbps\n", t / 1e6);
-  EXPECT_LT(t, 8'000'000);   // > 9x cut inside a third of a second
-  EXPECT_GT(t, 1'000'000);   // but never the shutoff floor
+// Three consecutive BUR>1 enters Eq.11 drain.
+TEST(DrainOnThreeConsecutive) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 40'000'000;
+  PudicaRtpRateCtrl::Output o{};
+  int64_t now = 0;
+  for (int i = 0; i < 3; ++i) {
+    now += 200000;
+    o = c.Update(MakeIn(2.5, 1.4, 30'000'000, now, now, 80'000));
+  }
+  printf("  3rd high BUR: mode=%s target=%.2f draining=%d\n", o.mode,
+         o.target_bps / 1e6, (int)o.draining);
+  EXPECT_GT(std::string(o.mode) == "PUD-DRAIN" ? 1 : 0, 0);
+  EXPECT_LT(o.target_bps, 40'000'000);
 }
 
-// The RESTORE branch is the *up* rule; a single low reading of the noisy
-// 200 ms recv-rate estimator must not cut the target several-fold.
-TEST(RestoreNoiseRejected) {
-  PudicaRateCtrl c;
-  c.target = 70'000'000;
-  int64_t t = c.Update(0.09, 12'000'000);   // measured: recv glitch to 12 Mbps
-  printf("  fixed restore target after recv glitch = %.2f Mbps\n", t / 1e6);
-  EXPECT_GE(t, 66'000'000);                 // >= 0.95 * 70
-  PudicaRateCtrl c2;
-  c2.rotary_fix = false;
-  c2.target = 70'000'000;
-  int64_t t2 = c2.Update(0.09, 12'000'000);
-  printf("  pre-fix restore target after same glitch = %.2f Mbps\n", t2 / 1e6);
-  EXPECT_LT(t2, 20'000'000);
+// MI waits until a frame sent at/after the decision now.
+TEST(MiWaitsForFeedback) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 10'000'000;
+  auto o1 = c.Update(MakeIn(0.2, 0.2, 8'000'000, 100000, 50000));
+  int64_t after_mi = o1.target_bps;
+  printf("  first MI: %s %.2f Mbps\n", o1.mode, after_mi / 1e6);
+  EXPECT_GT(std::string(o1.mode) == "PUD-MI" ? 1 : 0, 0);
+  auto o2 = c.Update(MakeIn(0.2, 0.2, 8'000'000, 120000, 50000));
+  printf("  before feedback: %s %.2f Mbps\n", o2.mode, o2.target_bps / 1e6);
+  EXPECT_GT(std::string(o2.mode) == "PUD-HOLD" ? 1 : 0, 0);
+  EXPECT_NEAR(o2.target_bps / 1e6, after_mi / 1e6, 0.01);
+  auto o3 = c.Update(MakeIn(0.2, 0.2, 8'000'000, 250000, 100000));
+  printf("  after feedback: %s %.2f Mbps\n", o3.mode, o3.target_bps / 1e6);
+  EXPECT_GT(std::string(o3.mode) == "PUD-MI" ? 1 : 0, 0);
+  EXPECT_GT(o3.target_bps, after_mi);
 }
 
-// Real capacity loss must still be tracked down, just not in one step.
-TEST(RestoreStillTracksDown) {
-  PudicaRateCtrl c;
-  c.target = 70'000'000;
-  int64_t t = 0;
-  for (int i = 0; i < 30; ++i) t = c.Update(0.09, 5'000'000);  // 1 s at 30 fps
-  printf("  after 1 s at recv=5 Mbps: %.2f Mbps\n", t / 1e6);
-  EXPECT_LT(t, 16'000'000);
+// HOLD / AI-MD must not snap B to recv_rate.
+TEST(AimdDoesNotSnapToRecv) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 35'000'000;
+  auto o = c.Update(MakeIn(0.95, 0.90, 12'000'000, 200000, 200000));
+  printf("  AI-MD: mode=%s target=%.2f recv=12\n", o.mode, o.target_bps / 1e6);
+  EXPECT_GT(std::string(o.mode) == "PUD-AIMD" ? 1 : 0, 0);
+  EXPECT_GT(o.target_bps, 20'000'000);  // not 12 Mbps
+  EXPECT_LT(std::abs(o.target_bps - 35'000'000), 10'000'000);
+}
+
+TEST(Eq6WeightsPreferRecent) {
+  std::deque<PudicaBurSampleEq6> h;
+  h.push_back({0, 0.1, 10e6});
+  h.push_back({50000, 0.2, 10e6});
+  h.push_back({100000, 0.9, 10e6});
+  double r = PudicaSmoothBurEq6(h, 10e6, 100000, 200000);
+  printf("  Rtilde=%.3f (should lean toward 0.9)\n", r);
+  EXPECT_GT(r, 0.4);
+  EXPECT_LT(r, 0.9);
+}
+
+// Thin ack window after a sweep must not be how B is set; the paper path
+// keeps committed B. (Coordinator skip is the other half; here recv=committed.)
+TEST(LowRecvDoesNotCollapseCommitted) {
+  PudicaRtpRateCtrl c;
+  c.committed_bps = 40'000'000;
+  auto o = c.Update(MakeIn(0.27, 0.27, 2'000'000, 200000, 200000));
+  printf("  recv glitch 2 Mbps, BUR low: mode=%s target=%.2f\n", o.mode,
+         o.target_bps / 1e6);
+  EXPECT_GT(o.target_bps, 20'000'000);
 }
 
 int main() {

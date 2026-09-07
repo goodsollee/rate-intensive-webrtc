@@ -300,6 +300,16 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
     // Start at 0 so GCC warm-starts until the first frame BUR arrives.
     pudica_mode_active_.store(true, std::memory_order_relaxed);
     pudica_rtp_target_bps_.store(0, std::memory_order_relaxed);
+    pudica_rtp_ctrl_.cfg = PudicaRtpRateCtrl::Config::FromEnv();
+    pudica_rtp_ctrl_.cfg.min_rate_bps = config_.min_rate_bps;
+    if (pudica_rtp_ctrl_.cfg.max_rate_bps <= 0 ||
+        pudica_rtp_ctrl_.cfg.max_rate_bps == 1'000'000'000) {
+      pudica_rtp_ctrl_.cfg.max_rate_bps = config_.max_rate_bps;
+    }
+    {
+      const char* e = std::getenv("PUDICA_LEGACY");
+      pudica_legacy_ = (e && std::atoi(e) != 0);
+    }
     // Activate probe injection in PacingController
     if (features_.pudica_probing) {
       PacingController::SetPudicaProbing(true, features_.pudica_num_probes);
@@ -307,7 +317,12 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
     RTC_LOG(LS_INFO) << "[PUDICA] Initialized: L_ms=" << features_.L_ms
                      << " probing=" << features_.pudica_probing
                      << " num_probes=" << features_.pudica_num_probes
-                     << " gamma_rho=" << features_.pudica_gamma_rho;
+                     << " gamma_rho=" << features_.pudica_gamma_rho
+                     << " paper_cc=" << (!pudica_legacy_ ? 1 : 0)
+                     << " alpha=" << pudica_rtp_ctrl_.cfg.alpha
+                     << " gamma_mi=" << pudica_rtp_ctrl_.cfg.gamma_mi
+                     << " gamma_md=" << pudica_rtp_ctrl_.cfg.gamma_md
+                     << " zeta=" << pudica_rtp_ctrl_.cfg.zeta;
   }
 
   // Initialize MAFS flow coordinator if enabled
@@ -681,9 +696,11 @@ int64_t RtpSctpCoordinator::GetAckRateBps() const {
 }
 
 int64_t RtpSctpCoordinator::GetRtpRecvRateBps() const {
-  if (rtp_ack_samples_.empty()) return 0;
-  int64_t window_ms = rtp_ack_samples_.back().timestamp_ms -
-                      rtp_ack_samples_.front().timestamp_ms;
+  if (rtp_ack_samples_.size() < 3) return 0;
+  int64_t span_ms = rtp_ack_samples_.back().timestamp_ms -
+                    rtp_ack_samples_.front().timestamp_ms;
+  if (span_ms < 10) return 0;
+  int64_t window_ms = std::min(span_ms, kAckWindowMs);
   if (window_ms <= 0) return 0;
   return rtp_samples_total_bytes_ * 8 * 1000 / window_ms;
 }
@@ -2504,8 +2521,12 @@ double RtpSctpCoordinator::PudicaComputeFrameBur(int64_t now_us) {
     R += probe_correction_us / L_us;
   }
 
-  // Store for smoothed BUR (window in μs)
-  int64_t rate_bps = pacing_rate_bps_.load(std::memory_order_relaxed);
+  // Store for smoothed BUR (window in μs). B_k is the encoder target of
+  // this frame (paper Eq.6), not the SCTP pacing rate.
+  int64_t rate_bps = pudica_rtp_target_bps_.load(std::memory_order_relaxed);
+  if (rate_bps <= 0) {
+    rate_bps = pacing_rate_bps_.load(std::memory_order_relaxed);
+  }
   pudica_bur_history_.push_back({now_us, R, static_cast<double>(rate_bps)});
   while (!pudica_bur_history_.empty() &&
          (now_us - pudica_bur_history_.front().time_us) > kPudicaBurWindowUs) {
@@ -2544,24 +2565,13 @@ double RtpSctpCoordinator::PudicaComputeFrameBur(int64_t now_us) {
 }
 
 double RtpSctpCoordinator::PudicaSmoothedBur(int64_t now_us) {
-  // Weighted average BUR over 200ms (Pudica Eq.6)
-  if (pudica_bur_history_.empty()) return 0.0;
-
-  double current_rate = static_cast<double>(
-      pacing_rate_bps_.load(std::memory_order_relaxed));
-  if (current_rate <= 0) current_rate = 1.0;
-
-  double sum_bur = 0.0;
-  double sum_weight = 0.0;
-  for (const auto& s : pudica_bur_history_) {
-    double age_us = static_cast<double>(now_us - s.time_us);
-    double weight = std::max(0.0, 1.0 - age_us / static_cast<double>(kPudicaBurWindowUs));
-    double rate_ratio = (s.bitrate_bps > 0) ? current_rate / s.bitrate_bps : 1.0;
-    sum_bur += weight * s.bur * rate_ratio;
-    sum_weight += weight;
+  // Paper Eq.6 + Appendix B. B is the current encoder target.
+  double B = static_cast<double>(
+      pudica_rtp_target_bps_.load(std::memory_order_relaxed));
+  if (B <= 0.0) {
+    B = static_cast<double>(pacing_rate_bps_.load(std::memory_order_relaxed));
   }
-
-  return (sum_weight > 0) ? sum_bur / sum_weight : 0.0;
+  return PudicaSmoothBurEq6(pudica_bur_history_, B, now_us, kPudicaBurWindowUs);
 }
 
 double RtpSctpCoordinator::GetPudicaPacingMultiplier() {
@@ -2583,119 +2593,130 @@ int64_t RtpSctpCoordinator::GetPudicaRtpOverride() {
   return pudica_rtp_target_bps_.load(std::memory_order_relaxed);
 }
 
-// Per-frame Pudica rate rule (NSDI'24): the arrived frame's BUR (= queuing
-// delay / frame interval) decides the next RTP-video target relative to the
-// measured receiving_rate (delivered RTP bitrate).
-//   BUR < 1  → headroom: one-step restore to receiving_rate × γ_up (fast up,
-//              unlike GCC's slow AIMD ramp; the signature Pudica behavior).
-//   BUR ≈ 1  → hold at receiving_rate.
-//   BUR > 1  → queue building: drain below receiving_rate (§4.3 Eq.11-style).
-// The result is published via GetPudicaRtpOverride() and applied by
-// DelayBasedBwe as the delay-based target. NOTE: still subject to the
-// loss-based cap downstream (see "Neutralize loss-based BWE" task) — that
-// matters only once burst loss occurs; the loss-light up-step case is exact.
+// Per-frame Pudica RTP-video target (NSDI'24 §4.2–§4.3). Default is the
+// paper controller in pudica_rtp_rate.h. PUDICA_LEGACY=1 restores the old
+// recv-anchored 3-way branch + rotary slew (not in the paper; J-251).
 void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us) {
   if (config_.mode != CoordinatorMode::kPudica) return;
 
-  // Measured RTP receiving rate (delivered) — the restore anchor.
   int64_t recv_rate = GetRtpRecvRateBps();
   if (recv_rate <= 0) recv_rate = GetTotalRecvRateBps();
-  if (recv_rate <= 0) return;  // No delivery signal yet → leave GCC in charge.
 
   int64_t old_target = pudica_rtp_target_bps_.load(std::memory_order_relaxed);
-  if (old_target <= 0) old_target = recv_rate;
-
-  // Env-tunable thresholds; defaults pivot on the paper's BUR = 1.
-  static const double kGammaUp = []() {
-    // Restore aggressiveness: target = recv_rate x gamma when BUR<1. 1.05 was
-    // too gentle to break out of a low-quality equilibrium and probe into
-    // available headroom; 1.3 climbs ~30%/feedback to the link limit in ~1s,
-    // then BUR>1 triggers drain (the intended aggressive Pudica sawtooth).
-    const char* e = std::getenv("PUDICA_GAMMA_UP"); return e ? std::atof(e) : 1.30; }();
-  static const double kUpThresh = []() {
-    const char* e = std::getenv("PUDICA_UP_THRESHOLD"); return e ? std::atof(e) : 0.9; }();
-  static const double kDrainThresh = []() {
-    const char* e = std::getenv("PUDICA_DRAIN_THRESHOLD"); return e ? std::atof(e) : 1.1; }();
-  // Controller ceiling (independent of the legacy 5 Mbps rtp_max_rate_bps).
-  static const int64_t kPudMaxBps = []() {
-    const char* e = std::getenv("PUDICA_MAX_RATE_KBPS");
-    return e ? static_cast<int64_t>(std::atoll(e)) * 1000 : static_cast<int64_t>(0); }();
-
   int64_t new_target = old_target;
   const char* mode = "PUD-HOLD";
-  bool draining = false;
+  double smoothed = PudicaSmoothedBur(now_us);
+  int consec = 0;
+  int64_t committed_out = old_target;
+  int64_t drain_recv_out = 0;
 
-  if (frame_bur < kUpThresh) {
-    // One-step restore to delivered rate, biased up by γ to probe headroom.
-    new_target = static_cast<int64_t>(recv_rate * kGammaUp);
-    mode = "PUD-RESTORE";
-  } else if (frame_bur > kDrainThresh) {
-    // Drain the standing queue within ~200 ms (Eq.11-style).
-    double queue_delay_ms = (frame_bur - 1.0) * features_.L_ms;
-    if (queue_delay_ms < 0.0) queue_delay_ms = 0.0;
-    int64_t queue_bytes =
-        static_cast<int64_t>(queue_delay_ms * recv_rate / 8000.0);
-    int64_t drain_rate_bps =
-        (queue_bytes > 0) ? static_cast<int64_t>(queue_bytes * 8.0 / 0.200) : 0;
-    new_target =
-        static_cast<int64_t>(config_.draining_target * recv_rate) - drain_rate_bps;
-    mode = "PUD-DRAIN";
-    draining = true;
-  } else {
-    new_target = recv_rate;
-    mode = "PUD-HOLD";
-  }
+  static const int64_t kPudMaxBps = []() {
+    const char* e = std::getenv("PUDICA_MAX_RATE_KBPS");
+    return e ? static_cast<int64_t>(std::atoll(e)) * 1000
+             : static_cast<int64_t>(0);
+  }();
 
-  // === Rotary fix: bound how far ONE frame decision may cut the target ======
-  //
-  // Two unbounded down-paths above turn a single-frame measurement into a
-  // 60-90x rate cliff on a lossless, fixed-capacity link (the "rotary"):
-  //
-  //  (1) PUD-DRAIN. Eq.11 spends the whole standing queue over a *fixed* 200 ms
-  //      horizon: drain_rate = queue_ms/200ms x recv. Measured transient queues
-  //      on flat200 reach 150-190 ms, so drain_rate reaches 0.75-0.95 x recv and
-  //      (draining_target=0.85) x recv - drain_rate goes <= 0 -> clamped to
-  //      min_rate_bps (1 Mbps). i.e. any queue deeper than
-  //      draining_target x 200 ms = 170 ms demands a *negative* send rate.
-  //      Draining at kDrainFloorRatio x recv clears the same queue in a small
-  //      multiple of the horizon while keeping the flow alive, so floor the
-  //      drain instead of shutting off.
-  //
-  //  (2) PUD-RESTORE. This is the *up* rule, but its anchor recv_rate is a
-  //      200 ms windowed TWCC estimate whose frame-to-frame spread is ~3x
-  //      (measured: 40 -> 180 -> 134 Mbps within 100 ms). Assigning
-  //      target = gamma x recv unfiltered injects that noise straight into the
-  //      encoder target, producing 3-5x cuts with BUR ~ 0.06.
-  //
-  // Both are fixed with a per-decision slew floor. Defaults were swept on
-  // flat200 (see agent/experiment_docs/PUDICA-rotary-fix.md): the congestion
-  // response may cut 30% per frame (0.70^10 = 1/35 in 0.33 s — still an order
-  // of magnitude faster than GCC's AIMD), the up-rule may only decay 5% per
-  // frame (0.95^30 = 1/5 per second, i.e. a time constant near the 200 ms
-  // recv-rate estimator window it is anchored to).
-  // Set PUDICA_ROTARY_FIX=0 to restore the pre-fix behaviour.
-  static const bool kRotaryFix = []() {
-    const char* e = std::getenv("PUDICA_ROTARY_FIX");
-    return !(e && std::atoi(e) == 0); }();
-  static const double kDrainDownStep = []() {
-    const char* e = std::getenv("PUDICA_DRAIN_DOWN_STEP");
-    return e ? std::atof(e) : 0.70; }();
-  static const double kRestoreDownStep = []() {
-    const char* e = std::getenv("PUDICA_RESTORE_DOWN_STEP");
-    return e ? std::atof(e) : 0.95; }();
-  static const double kDrainFloorRatio = []() {
-    const char* e = std::getenv("PUDICA_DRAIN_FLOOR");
-    return e ? std::atof(e) : 0.40; }();
-  if (kRotaryFix && new_target < old_target) {
-    double step = draining ? kDrainDownStep : kRestoreDownStep;
-    int64_t slew_floor = static_cast<int64_t>(old_target * step);
-    if (draining) {
-      // Never drain below a fraction of what the link is actually delivering:
-      // the queue drains as long as we send less than recv_rate.
-      slew_floor = std::max(
-          slew_floor, static_cast<int64_t>(recv_rate * kDrainFloorRatio));
+  if (pudica_legacy_) {
+    if (recv_rate <= 0) return;
+    if (old_target <= 0) old_target = recv_rate;
+    static const double kGammaUp = []() {
+      const char* e = std::getenv("PUDICA_GAMMA_UP");
+      return e ? std::atof(e) : 1.30;
+    }();
+    static const double kUpThresh = []() {
+      const char* e = std::getenv("PUDICA_UP_THRESHOLD");
+      return e ? std::atof(e) : 0.9;
+    }();
+    static const double kDrainThresh = []() {
+      const char* e = std::getenv("PUDICA_DRAIN_THRESHOLD");
+      return e ? std::atof(e) : 1.1;
+    }();
+    bool draining = false;
+    if (frame_bur < kUpThresh) {
+      new_target = static_cast<int64_t>(recv_rate * kGammaUp);
+      mode = "PUD-RESTORE";
+    } else if (frame_bur > kDrainThresh) {
+      double queue_delay_ms = (frame_bur - 1.0) * features_.L_ms;
+      if (queue_delay_ms < 0.0) queue_delay_ms = 0.0;
+      int64_t queue_bytes =
+          static_cast<int64_t>(queue_delay_ms * recv_rate / 8000.0);
+      int64_t drain_rate_bps =
+          (queue_bytes > 0) ? static_cast<int64_t>(queue_bytes * 8.0 / 0.200)
+                            : 0;
+      new_target = static_cast<int64_t>(config_.draining_target * recv_rate) -
+                   drain_rate_bps;
+      mode = "PUD-DRAIN";
+      draining = true;
+    } else {
+      new_target = recv_rate;
+      mode = "PUD-HOLD";
     }
-    new_target = std::max(new_target, slew_floor);
+    static const bool kRotaryFix = []() {
+      const char* e = std::getenv("PUDICA_ROTARY_FIX");
+      return !(e && std::atoi(e) == 0);
+    }();
+    static const double kDrainDownStep = []() {
+      const char* e = std::getenv("PUDICA_DRAIN_DOWN_STEP");
+      return e ? std::atof(e) : 0.70;
+    }();
+    static const double kRestoreDownStep = []() {
+      const char* e = std::getenv("PUDICA_RESTORE_DOWN_STEP");
+      return e ? std::atof(e) : 0.95;
+    }();
+    static const double kDrainFloorRatio = []() {
+      const char* e = std::getenv("PUDICA_DRAIN_FLOOR");
+      return e ? std::atof(e) : 0.40;
+    }();
+    if (kRotaryFix && new_target < old_target) {
+      double step = draining ? kDrainDownStep : kRestoreDownStep;
+      int64_t slew_floor = static_cast<int64_t>(old_target * step);
+      if (draining) {
+        slew_floor = std::max(
+            slew_floor, static_cast<int64_t>(recv_rate * kDrainFloorRatio));
+      }
+      new_target = std::max(new_target, slew_floor);
+    }
+    committed_out = new_target;
+  } else {
+    // Paper path: a missing recv window must not reset B. Cold start with
+    // no committed target and no recv still leaves GCC in charge.
+    if (recv_rate <= 0 && pudica_rtp_ctrl_.committed_bps <= 0 &&
+        old_target <= 0) {
+      return;
+    }
+    if (old_target > 0 && pudica_rtp_ctrl_.committed_bps <= 0) {
+      pudica_rtp_ctrl_.committed_bps = old_target;
+    }
+    double owd_s = 0.0;
+    if (pudica_frame_.first_send_us >= 0 && pudica_frame_.last_recv_us >= 0) {
+      owd_s = (pudica_frame_.last_recv_us - pudica_frame_.first_send_us) /
+              1e6;
+    }
+    if (owd_s <= 0.0) {
+      owd_s = std::max(0.0, frame_bur) * features_.L_ms / 1000.0;
+    }
+    int64_t rate_for_q = pudica_rtp_ctrl_.committed_bps > 0
+                             ? pudica_rtp_ctrl_.committed_bps
+                             : (recv_rate > 0 ? recv_rate : old_target);
+    int64_t inflight_bytes =
+        (rate_for_q > 0 && owd_s > 0.0)
+            ? static_cast<int64_t>(static_cast<double>(rate_for_q) * owd_s /
+                                   8.0)
+            : 0;
+    PudicaRtpRateCtrl::Input in;
+    in.frame_bur = frame_bur;
+    in.smoothed_bur = smoothed;
+    in.recv_rate_bps =
+        recv_rate > 0 ? recv_rate : pudica_rtp_ctrl_.committed_bps;
+    in.inflight_bytes = inflight_bytes;
+    in.now_us = now_us;
+    in.frame_send_us = pudica_frame_.first_send_us;
+    PudicaRtpRateCtrl::Output o = pudica_rtp_ctrl_.Update(in);
+    new_target = o.target_bps;
+    mode = o.mode;
+    consec = o.consecutive_high;
+    committed_out = o.committed_bps;
+    drain_recv_out = o.drain_recv_bps;
   }
 
   int64_t ceiling = (kPudMaxBps > 0) ? kPudMaxBps : config_.max_rate_bps;
@@ -2704,10 +2725,8 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
 
   unified_metrics_.mode = mode;
   unified_metrics_.rtp_allocated_mbps = new_target / 1'000'000.0;
+  unified_metrics_.smoothed_bur = smoothed;
 
-  // === Rotary diagnostics: per-frame controller trace ===
-  // Every decision the Pudica RTP controller makes, with the raw estimator
-  // internals that feed it. Written to $UNIFIED_CSV_DIR/pudica_ctrl.csv.
   if (!pudica_ctrl_csv_initialized_) {
     const char* dir = std::getenv("UNIFIED_CSV_DIR");
     if (dir && std::strlen(dir) > 0) {
@@ -2718,7 +2737,8 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
         pudica_ctrl_csv_
             << "t_ms,mode,bur,rtp_recv_mbps,total_recv_mbps,n_ack_samples,"
                "ack_span_ms,ack_bytes,old_target_mbps,new_target_mbps,"
-               "d_min_ms,frame_owd_ms,frame_pkts\n";
+               "d_min_ms,frame_owd_ms,frame_pkts,smoothed_bur,consec,"
+               "committed_mbps,drain_recv_mbps\n";
       }
       pudica_ctrl_csv_start_us_ = now_us;
       pudica_ctrl_csv_initialized_ = true;
@@ -2732,7 +2752,8 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
         : 0;
     double frame_owd_ms =
         (pudica_frame_.first_send_us >= 0 && pudica_frame_.last_recv_us >= 0)
-            ? (pudica_frame_.last_recv_us - pudica_frame_.first_send_us) / 1000.0
+            ? (pudica_frame_.last_recv_us - pudica_frame_.first_send_us) /
+                  1000.0
             : -1.0;
     pudica_ctrl_csv_ << std::fixed << std::setprecision(3)
                      << ((now_us - pudica_ctrl_csv_start_us_) / 1000.0) << ","
@@ -2742,14 +2763,21 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
                      << n_samples << "," << span_ms << ","
                      << rtp_samples_total_bytes_ << ","
                      << (old_target / 1e6) << "," << (new_target / 1e6) << ","
-                     << (pudica_d_min_us_ / 1000.0) << "," << frame_owd_ms << ","
-                     << pudica_frame_.frame_packets << "\n";
+                     << (pudica_d_min_us_ / 1000.0) << "," << frame_owd_ms
+                     << "," << pudica_frame_.frame_packets << ","
+                     << std::setprecision(6) << smoothed << ","
+                     << consec << ","
+                     << std::setprecision(3) << (committed_out / 1e6) << ","
+                     << (drain_recv_out / 1e6) << "\n";
   }
 
   static int64_t pud_log = 0;
   if (++pud_log % 30 == 0) {
-    fprintf(stderr, "[PUDICA-RTP] %s bur=%.3f recv=%.2fMbps target=%.2fMbps\n",
-            mode, frame_bur, recv_rate / 1e6, new_target / 1e6);
+    fprintf(stderr,
+            "[PUDICA-RTP] %s bur=%.3f Rtilde=%.3f recv=%.2fMbps "
+            "target=%.2fMbps consec=%d\n",
+            mode, frame_bur, smoothed, recv_rate / 1e6, new_target / 1e6,
+            consec);
   }
 }
 

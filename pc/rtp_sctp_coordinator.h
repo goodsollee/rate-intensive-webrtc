@@ -25,6 +25,7 @@
 #include "api/task_queue/task_queue_base.h"
 #include "pc/coordinator/mafs_config.h"
 #include "pc/coordinator/multi_agent_flow_coordinator.h"
+#include "pc/coordinator/pudica_rtp_rate.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/thread_annotations.h"
@@ -505,14 +506,11 @@ class RtpSctpCoordinator {
   // Adaptive pacing multiplier ρ
   static std::atomic<double> pudica_rho_;
 
-  // Smoothed BUR (weighted average over 200ms, 논문 Eq.6)
-  struct PudicaBurSample {
-    int64_t time_us;
-    double bur;
-    double bitrate_bps;
-  };
-  std::deque<PudicaBurSample> pudica_bur_history_;
+  // Smoothed BUR (Eq.6 + Appendix B, 200 ms window)
+  std::deque<PudicaBurSampleEq6> pudica_bur_history_;
   static constexpr int64_t kPudicaBurWindowUs = 200'000;  // 200ms in μs
+  PudicaRtpRateCtrl pudica_rtp_ctrl_;
+  bool pudica_legacy_ = false;  // PUDICA_LEGACY=1 → old recv-anchored 3-way branch
 
   // Pudica debug CSV
   std::ofstream pudica_csv_file_;
@@ -527,8 +525,9 @@ class RtpSctpCoordinator {
   // Pudica methods
   double PudicaComputeFrameBur(int64_t now_us);
   double PudicaSmoothedBur(int64_t now_us);
-  // Apollo: per-frame Pudica RTP-video rate controller. Called on each frame
-  // completion with the frame BUR; updates pudica_rtp_target_bps_.
+  // Per-frame Pudica RTP target (NSDI'24 §4.2–§4.3). Default is paper
+  // MI / AI-MD / fallback / 3-frame drain / drain-exit restore. PUDICA_LEGACY=1
+  // restores the old recv-anchored 3-way branch (J-251).
   void PudicaUpdateRtpTarget(double frame_bur, int64_t now_us);
 
   // ===== MAFS Flow Scheduling =====

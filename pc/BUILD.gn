@@ -2917,6 +2917,7 @@ rtc_library("rtp_sctp_coordinator") {
     "//modules/congestion_controller/goog_cc:*",
   ]
   sources = [
+    "coordinator/pudica_rtp_rate.h",
     "rtp_sctp_coordinator.cc",
     "rtp_sctp_coordinator.h",
     "rtp_sctp_shared_state.h",
