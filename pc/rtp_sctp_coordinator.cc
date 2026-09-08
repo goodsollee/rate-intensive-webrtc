@@ -302,10 +302,11 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
     pudica_rtp_target_bps_.store(0, std::memory_order_relaxed);
     pudica_rtp_ctrl_.cfg = PudicaRtpRateCtrl::Config::FromEnv();
     pudica_rtp_ctrl_.cfg.min_rate_bps = config_.min_rate_bps;
-    if (pudica_rtp_ctrl_.cfg.max_rate_bps <= 0 ||
-        pudica_rtp_ctrl_.cfg.max_rate_bps == 1'000'000'000) {
-      pudica_rtp_ctrl_.cfg.max_rate_bps = config_.max_rate_bps;
-    }
+    // Published B ceiling is PUDICA_MAX_RATE_KBPS / kPudicaAppCapBps (100 Mbps).
+    // Do not inherit BUR_MAX_RATE_MBPS (SCTP pacing, default 1000).
+    unified_metrics_.combine_mode = "rtp";
+    unified_metrics_.alloc_phase = "RTP";
+    unified_metrics_.sctp_allocated_mbps = 0.0;
     {
       const char* e = std::getenv("PUDICA_LEGACY");
       pudica_legacy_ = (e && std::atoi(e) != 0);
@@ -322,7 +323,8 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
                      << " alpha=" << pudica_rtp_ctrl_.cfg.alpha
                      << " gamma_mi=" << pudica_rtp_ctrl_.cfg.gamma_mi
                      << " gamma_md=" << pudica_rtp_ctrl_.cfg.gamma_md
-                     << " zeta=" << pudica_rtp_ctrl_.cfg.zeta;
+                     << " zeta=" << pudica_rtp_ctrl_.cfg.zeta
+                     << " max_mbps=" << (pudica_rtp_ctrl_.cfg.max_rate_bps / 1e6);
   }
 
   // Initialize MAFS flow coordinator if enabled
@@ -406,11 +408,14 @@ void RtpSctpCoordinator::LogToCsv(int64_t now_us) {
   if (!csv_file_.is_open()) return;
 
   int64_t logged_pacing_rate_mbps = 0;
-  if (config_.mode == CoordinatorMode::kAgentRtc ||
-      config_.mode == CoordinatorMode::kPudica) {
+  if (config_.mode == CoordinatorMode::kPudica) {
+    logged_pacing_rate_mbps =
+        static_cast<int64_t>(unified_metrics_.rtp_allocated_mbps);
+  } else if (config_.mode == CoordinatorMode::kAgentRtc) {
     logged_pacing_rate_mbps = pacing_rate_bps_.load() / 1'000'000;
   }
-  if (unified_metrics_.receiving_rate_kbps <= 0) {
+  if (config_.mode != CoordinatorMode::kPudica &&
+      unified_metrics_.receiving_rate_kbps <= 0) {
     unified_metrics_.receiving_rate_kbps = GetDirectSctpRecvRateBps() / 1000;
   }
   if (unified_metrics_.total_recv_kbps <= 0) {
@@ -563,6 +568,8 @@ int64_t RtpSctpCoordinator::GetPacingRate() const {
 // ============================================================
 
 void RtpSctpCoordinator::AllocateUnifiedRate() {
+  if (config_.mode == CoordinatorMode::kPudica) return;
+
   int64_t unified = pacing_rate_bps_.load(std::memory_order_relaxed);
   int64_t rtp_recv = GetRtpRecvRateBps();
   int64_t total_recv = GetTotalRecvRateBps();
@@ -828,15 +835,6 @@ void RtpSctpCoordinator::OnTwccFeedbackComplete(int64_t rtp_bytes_acked,
     return;
   }
 
-  // Dynamic rtp_max_rate_bps from GCC max_data_rate (only when alloc_dynamic)
-  if (self->features_.alloc_dynamic && max_data_rate_bps > 0 &&
-      max_data_rate_bps != self->config_.rtp_max_rate_bps) {
-    RTC_LOG(LS_INFO) << "[BUR-COORD] rtp_max updated: "
-                     << (self->config_.rtp_max_rate_bps / 1e6) << " -> "
-                     << (max_data_rate_bps / 1e6) << " Mbps (from GCC)";
-    self->config_.rtp_max_rate_bps = max_data_rate_bps;
-  }
-
   // RTP recv rate tracking [F5]
   if (self->features_.rtp_recv_rate && rtp_bytes_acked > 0) {
     self->rtp_samples_total_bytes_ += rtp_bytes_acked;
@@ -846,6 +844,21 @@ void RtpSctpCoordinator::OnTwccFeedbackComplete(int64_t rtp_bytes_acked,
       self->rtp_samples_total_bytes_ -= self->rtp_ack_samples_.front().bytes;
       self->rtp_ack_samples_.pop_front();
     }
+  }
+
+  // RTP-only pudica: recv window is enough. No SCTP combiner, no AgentRtc
+  // pacing, no GCC-driven rtp_max share.
+  if (self->config_.mode == CoordinatorMode::kPudica) {
+    return;
+  }
+
+  // Dynamic rtp_max_rate_bps from GCC max_data_rate (only when alloc_dynamic)
+  if (self->features_.alloc_dynamic && max_data_rate_bps > 0 &&
+      max_data_rate_bps != self->config_.rtp_max_rate_bps) {
+    RTC_LOG(LS_INFO) << "[BUR-COORD] rtp_max updated: "
+                     << (self->config_.rtp_max_rate_bps / 1e6) << " -> "
+                     << (max_data_rate_bps / 1e6) << " Mbps (from GCC)";
+    self->config_.rtp_max_rate_bps = max_data_rate_bps;
   }
 
   // Compute BUR and make rate decision
@@ -859,6 +872,8 @@ void RtpSctpCoordinator::OnTwccFeedbackComplete(int64_t rtp_bytes_acked,
 // ============================================================
 
 void RtpSctpCoordinator::ComputeBurAndDecide(int64_t now_ms) {
+  if (config_.mode == CoordinatorMode::kPudica) return;
+
   int64_t now_us = now_ms * 1000;
   const double L_ms = features_.L_ms;
 
@@ -1281,6 +1296,8 @@ void RtpSctpCoordinator::OnSackReceived(uint32_t cumulative_tsn_ack,
                                          int64_t bytes_acked,
                                          bool has_packet_loss,
                                          int64_t now_us) {
+  if (config_.mode == CoordinatorMode::kPudica) return;
+
   // Disabled mode: passive logging only
   if (config_.mode != CoordinatorMode::kAgentRtc &&
       config_.mode != CoordinatorMode::kFse &&
@@ -1515,8 +1532,7 @@ void RtpSctpCoordinator::OnSackReceived(uint32_t cumulative_tsn_ack,
 // ============================================================
 
 void RtpSctpCoordinator::CheckTimeouts(int64_t now_us) {
-  if (config_.mode != CoordinatorMode::kAgentRtc &&
-      config_.mode != CoordinatorMode::kPudica) return;
+  if (config_.mode != CoordinatorMode::kAgentRtc) return;
 
   // Don't timeout before first SACK (startup)
   if (last_sack_time_us_ == 0) {
@@ -2610,12 +2626,6 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
   int64_t committed_out = old_target;
   int64_t drain_recv_out = 0;
 
-  static const int64_t kPudMaxBps = []() {
-    const char* e = std::getenv("PUDICA_MAX_RATE_KBPS");
-    return e ? static_cast<int64_t>(std::atoll(e)) * 1000
-             : static_cast<int64_t>(0);
-  }();
-
   if (pudica_legacy_) {
     if (recv_rate <= 0) return;
     if (old_target <= 0) old_target = recv_rate;
@@ -2719,13 +2729,21 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
     drain_recv_out = o.drain_recv_bps;
   }
 
-  int64_t ceiling = (kPudMaxBps > 0) ? kPudMaxBps : config_.max_rate_bps;
+  int64_t ceiling = pudica_rtp_ctrl_.cfg.max_rate_bps;
+  if (ceiling <= 0) ceiling = kPudicaAppCapBps;
   new_target = std::max(config_.min_rate_bps, std::min(ceiling, new_target));
   pudica_rtp_target_bps_.store(new_target, std::memory_order_relaxed);
 
   unified_metrics_.mode = mode;
   unified_metrics_.rtp_allocated_mbps = new_target / 1'000'000.0;
+  unified_metrics_.unified_rate_mbps = new_target / 1'000'000.0;
+  unified_metrics_.sctp_allocated_mbps = 0.0;
+  unified_metrics_.combine_mode = "rtp";
+  unified_metrics_.alloc_phase = "RTP";
   unified_metrics_.smoothed_bur = smoothed;
+  unified_metrics_.recv_rate_mbps = recv_rate / 1'000'000.0;
+  unified_metrics_.rtp_recv_kbps = recv_rate / 1000;
+  LogToCsv(now_us);
 
   if (!pudica_ctrl_csv_initialized_) {
     const char* dir = std::getenv("UNIFIED_CSV_DIR");

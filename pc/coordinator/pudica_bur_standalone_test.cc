@@ -25,6 +25,7 @@ static int failed_count = 0;
 #define EXPECT_GT(a, b) do { if (!((a) > (b))) { fprintf(stderr, "  FAIL: %s > %s\n", #a, #b); failed_count++; } } while(0)
 #define EXPECT_LT(a, b) do { if (!((a) < (b))) { fprintf(stderr, "  FAIL: %s < %s\n", #a, #b); failed_count++; } } while(0)
 #define EXPECT_GE(a, b) do { if (!((a) >= (b))) { fprintf(stderr, "  FAIL: %s >= %s\n", #a, #b); failed_count++; } } while(0)
+#define EXPECT_LE(a, b) do { if (!((a) <= (b))) { fprintf(stderr, "  FAIL: %s <= %s\n", #a, #b); failed_count++; } } while(0)
 #define EXPECT_STREQ(a, b) do { \
   if (std::string(a) != std::string(b)) { \
     fprintf(stderr, "  FAIL: %s == %s (got '%s')\n", #a, #b, (a)); \
@@ -354,6 +355,26 @@ TEST(LowRecvDoesNotCollapseCommitted) {
   printf("  recv glitch 2 Mbps, BUR low: mode=%s target=%.2f\n", o.mode,
          o.target_bps / 1e6);
   EXPECT_GT(o.target_bps, 20'000'000);
+}
+
+// Application cap: default 100 Mbps. MI from 90 would be ~155 without clamp.
+TEST(AppCap100Mbps) {
+  PudicaRtpRateCtrl c;
+  EXPECT_NEAR(c.cfg.max_rate_bps / 1e6, 100.0, 0.01);
+  c.committed_bps = 90'000'000;
+  auto o = c.Update(MakeIn(0.27, 0.27, 50'000'000, 200000, 200000));
+  printf("  MI from 90: mode=%s target=%.2f (cap=100)\n", o.mode,
+         o.target_bps / 1e6);
+  EXPECT_STREQ(o.mode, "PUD-MI");
+  EXPECT_LE(o.target_bps, 100'000'000);
+  EXPECT_NEAR(o.target_bps / 1e6, 100.0, 0.01);
+  int64_t now = 200000;
+  for (int i = 0; i < 6; ++i) {
+    now += 200000;
+    o = c.Update(MakeIn(0.27, 0.27, 50'000'000, now, now));
+  }
+  printf("  after more MI: target=%.2f\n", o.target_bps / 1e6);
+  EXPECT_LE(o.target_bps, 100'000'000);
 }
 
 int main() {

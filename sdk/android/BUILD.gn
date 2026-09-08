@@ -134,6 +134,7 @@ if (is_android) {
     ]
 
     deps = [
+      ":finesse_frame_delay_jni",
       ":libjingle_peerconnection_jni",
       ":libjingle_peerconnection_metrics_default_jni",
       ":native_api_jni",
@@ -143,6 +144,20 @@ if (is_android) {
       "//third_party/jni_zero",
     ]
     output_extension = "so"
+  }
+
+  # FINESSE per-frame CSV (same schema as Linux FrameDelaySink). Android-only;
+  # Linux peerconnection_client does not compile this file.
+  rtc_library("finesse_frame_delay_jni") {
+    sources = [
+      "src/jni/finesse/frame_delay_sink.cc",
+      "src/jni/finesse/frame_delay_sink.h",
+      "src/jni/finesse/jni_frame_delay_sink.cc",
+    ]
+    deps = [
+      "../../api:media_stream_interface",
+      "../../api/video:video_frame",
+    ]
   }
 
   #######################

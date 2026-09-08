@@ -1415,6 +1415,12 @@ void DcSctpTransport::OnBurIntervalComplete(int64_t now_ms, int64_t L_ms) {
 // ===== Unified Metrics CSV Logging =====
 // ===== Bandwidth Reader Implementation (Shared Memory) =====
 void DcSctpTransport::InitBandwidthReader() {
+#if defined(WEBRTC_ANDROID)
+  // POSIX shm_open is not in Android bionic. HAFS BUR bandwidth shm is a
+  // Linux-emulator path; video-only phone RX does not need it.
+  RTC_LOG(LS_INFO) << "[BW-READER] skipped on Android (no shm_open)";
+  return;
+#else
   // Get namespace ID from environment (set by automated_experiment)
   const char* ns_id_env = std::getenv("NAMESPACE_ID");
   if (ns_id_env && std::strlen(ns_id_env) > 0) {
@@ -1444,6 +1450,7 @@ void DcSctpTransport::InitBandwidthReader() {
   
   shm_data_ = static_cast<const SharedBandwidthData*>(ptr);
   RTC_LOG(LS_INFO) << "[BW-READER] Shared memory initialized: " << shm_name_;
+#endif
 }
 
 void DcSctpTransport::CleanupBandwidthReader() {
@@ -1458,6 +1465,9 @@ void DcSctpTransport::CleanupBandwidthReader() {
 }
 
 double DcSctpTransport::GetAvailableBandwidthKbps() {
+#if defined(WEBRTC_ANDROID)
+  return -1.0;
+#else
   // Lazy init: retry shm_open if not yet connected (emulator may start later)
   if (!shm_data_ && shm_fd_ < 0 && !shm_name_.empty()) {
     shm_fd_ = shm_open(shm_name_.c_str(), O_RDONLY, 0666);
@@ -1478,6 +1488,7 @@ double DcSctpTransport::GetAvailableBandwidthKbps() {
     return -1.0;
   }
   return shm_data_->bandwidth_kbps.load(std::memory_order_relaxed);
+#endif
 }
 
 // ===== Unified Metrics CSV =====

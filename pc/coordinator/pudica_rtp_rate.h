@@ -33,6 +33,12 @@
 
 namespace webrtc {
 
+// Application bitrate cap. Matches the PeerConnection max used in this
+// testbed (KFT_MAX_BITRATE_KBPS default 100000). Paper §5.1 used 50 Mbps;
+// our encoder is 100. This is the published-B ceiling, not the I-formula
+// B_max (cfg.bmax_mbps, still paper 50 unless PUDICA_BMAX_MBPS is set).
+static constexpr int64_t kPudicaAppCapBps = 100'000'000;
+
 // One BUR sample for Eq.6. bitrate_bps is the encoding bitrate B_k of that
 // frame (paper Appendix B / Eq.6).
 struct PudicaBurSampleEq6 {
@@ -104,11 +110,11 @@ class PudicaRtpRateCtrl {
     double gamma_md = 0.05;       // Eq.10
     double zeta = 0.15;           // §4.3 temporary fallback
     double drain_horizon_s = 0.200;
-    double bmax_mbps = 50.0;      // paper application cap, used in I
+    double bmax_mbps = 50.0;      // paper §5.1 B_max, used in I only
     double aimd_a_bound = 0.10;   // |A|/B cap; paper says bounds exist, no number
     int64_t tau_reset_us = 5'000'000;
     int64_t min_rate_bps = 1'000'000;
-    int64_t max_rate_bps = 1'000'000'000;
+    int64_t max_rate_bps = kPudicaAppCapBps;  // published B ceiling (100 Mbps)
     int consecutive_drain = 3;
     double bur_high = 1.0;        // short-term BUR threshold
     double bur_recover = 1.0;     // drain-exit threshold
@@ -133,6 +139,7 @@ class PudicaRtpRateCtrl {
       c.tau_reset_us = tau_ms * 1000;
       int64_t max_kbps = i64("PUDICA_MAX_RATE_KBPS", 0);
       if (max_kbps > 0) c.max_rate_bps = max_kbps * 1000;
+      // Unset → 100 Mbps. Do not inherit BUR_MAX_RATE_MBPS (SCTP, default 1000).
       return c;
     }
   };

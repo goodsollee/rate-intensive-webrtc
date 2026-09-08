@@ -44,7 +44,7 @@ enum class CoordinatorMode {
   kDisabled,   // No pacing - send immediately
   kAgentRtc,   // BUR-based dynamic pacing
   kFse,        // FSEv2 coupled CC (priority-proportional rate redistribution)
-  kPudica,     // Pudica NSDI'24: RTP-only BUR measurement (rate control = AgentRtc)
+  kPudica,     // Pudica NSDI'24: RTP-only BUR + paper CC. SCTP combiner unused.
   kFseV2       // Lightweight: NC-mode SCTP CC + 1Hz fixed RTP override (test isolation)
 };
 
