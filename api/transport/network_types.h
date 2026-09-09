@@ -124,6 +124,15 @@ struct RTC_EXPORT SentPacket {
   int64_t sequence_number;
   // Tracked data in flight when the packet was sent, excluding unacked data.
   DataSize data_in_flight = DataSize::Zero();
+  // Frame identity, for rate controllers that measure per video frame rather
+  // than per transport send-time group (Pudica BUR). `rtp_timestamp` is the
+  // on-wire, post-StartTimestamp value, so all packets of one encoded frame
+  // share it; `video_media` is true only for an ORIGINAL video media packet
+  // (false for audio, padding, RTX and FEC). Both stay at their defaults on
+  // any path that does not populate them, and a reader must treat
+  // video_media == false as "no frame identity available".
+  uint32_t rtp_timestamp = 0;
+  bool video_media = false;
 };
 
 struct RTC_EXPORT ReceivedPacket {

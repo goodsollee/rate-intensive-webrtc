@@ -123,6 +123,12 @@ void TransportFeedbackAdapter::AddPacket(const RtpPacketToSend& packet_to_send,
   feedback.sent.size = DataSize::Bytes(packet_to_send.size() + overhead_bytes);
   feedback.sent.audio =
       packet_to_send.packet_type() == RtpPacketMediaType::kAudio;
+  // Frame identity for per-frame rate control (see SentPacket). Taken here
+  // because this is the last point that still holds the RtpPacketToSend; the
+  // struct is copied wholesale into PacketResult::sent_packet below.
+  feedback.sent.rtp_timestamp = packet_to_send.Timestamp();
+  feedback.sent.video_media =
+      packet_to_send.packet_type() == RtpPacketMediaType::kVideo;
   feedback.network_route = network_route_;
   feedback.sent.pacing_info = pacing_info;
   feedback.ssrc = packet_to_send.Ssrc();
