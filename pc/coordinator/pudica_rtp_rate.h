@@ -112,6 +112,121 @@ class PudicaRtpRateCtrl {
     double drain_horizon_s = 0.200;
     double bmax_mbps = 50.0;      // paper §5.1 B_max, used in I only
     double aimd_a_bound = 0.10;   // |A|/B cap; paper says bounds exist, no number
+    // Two OFF-BY-DEFAULT experiment knobs for the MI branch. MI is the one
+    // adjustment path with no bound of any kind: xi = gamma*((alpha+1)/2 - R)/R
+    // diverges as R -> 0, and R is small exactly when the controller has just
+    // throttled itself and the queue is empty. Measured on run 1788865209
+    // (40 Mbps link): 38% of MI steps had xi > 1, and B reached the 100 Mbps
+    // app cap from under 40 in a median of 1.44 s. AI-MD has aimd_a_bound for
+    // the same reason; MI has no equivalent.
+    //
+    // Both default to 0 = disabled, so the shipped behaviour is unchanged and
+    // these exist to be measured against each other, one run per knob:
+    //   xi_max     caps the STEP  (how fast B rises)
+    //   mi_recv_k  caps the LEVEL (B <= k * receiving_rate; MI is otherwise
+    //              entirely rate-blind, multiplying committed_bps, a number
+    //              that can be a stale echo of a rate that no longer flows)
+    double xi_max = 0.0;          // PUDICA_XI_MAX      (0 = unbounded)
+    double mi_recv_k = 0.0;       // PUDICA_MI_RECV_K   (0 = no clamp)
+    // Third MI knob, also OFF by default. xi_max and mi_recv_k both bound the
+    // NUMBER; this one bounds the CADENCE, and it is the one that follows the
+    // paper's own sentence: "the next adjustment is postponed until the
+    // feedback regarding the current adjustment is received ... to prevent
+    // overaggressive rate increases". The wait below already implements that
+    // sentence literally -- measured on run 1788919321, 0 of 321 consecutive
+    // MI steps were closer than one frame apart, and the median gap (170 ms)
+    // is one frame OWD (147 ms) plus one frame interval. It still ramped
+    // 2.2 -> 18.6 Mbps in 1.07 s, because one OWD on this link is 150 ms and
+    // the step is multiplicative: 0.3 per step at 6.6 steps/s is x5.6 per
+    // second.
+    //
+    // The reason the literal rule does not bite is that the feedback it waits
+    // for carries no information about the adjustment. B was raised to 9.6
+    // Mbps at t=22.58 and the sender's actual rate over the next 200 ms was
+    // 1.33 Mbps (14% of it) -- the encoder had not adopted the new target yet.
+    // So the frame that released the wait queued as if 1.3 Mbps were being
+    // sent, BUR stayed low, and MI read "still headroom" and raised again.
+    // Six rounds of that reached 15.2 Mbps on an 8 Mbps link.
+    //
+    // mi_send_ratio closes it: hold until the sender has actually OFFERED at
+    // least this fraction of the committed rate since the decision. No link
+    // estimate and no new constant about the network -- it only asks whether
+    // the last increase was carried out before allowing the next one.
+    //
+    // Deadlock is not a risk: DRAIN, the drain exit and FALLBACK are all
+    // evaluated BEFORE this gate, so holding forever blocks only increases,
+    // and an increase that the sender cannot realise is one that should not
+    // happen.
+    double mi_send_ratio = 0.0;   // PUDICA_MI_SEND_RATIO (0 = no gate)
+    // [A23] Upper bound on how long (b) may hold, ms. 0 = unbounded (the
+    // shipped behaviour, and the defect below).
+    //
+    // The "Deadlock is not a risk" claim above is wrong and was retracted: it
+    // reasoned that holding blocks only INCREASES, which is true, and then
+    // assumed an increase the sender cannot realise is one that should not
+    // happen -- which is false right after a collapse, when the sender cannot
+    // realise ANY rate for reasons that have nothing to do with the target.
+    // The gate then waits on the encoder while the encoder waits on the gate.
+    //
+    // Measured, run 1788934307 (fastdrop: 200 -> 3 Mbps for ONE second -> 40):
+    // B froze at 3.84 Mbps from t=22.089 to t=29.953 -- 7.87 s -- with
+    // mi_need_ms = 0.000 throughout (so (c) was satisfied and only (b) held)
+    // while sent/committed crawled 0.13 -> 0.70 and BUR read 0.03-0.09 against
+    // a true link utilisation of 0.02-0.08 on a 40 Mbps link. Full recovery
+    // from the one-second outage took 16 s. The same lock cost 3.43 s in the
+    // deepdip run 1788934092 (B pinned at 4.33 on a 7.32 Mbps payload link).
+    //
+    // Past the cap the question stops carrying information: if the sender
+    // still cannot offer the current target after this long, the target is not
+    // what limits it, and holding only freezes the controller at a rate its
+    // own BUR says is far below capacity. (a) and (c) still gate MI, so the
+    // cadence stays bounded -- this removes a stall, not a brake.
+    double mi_send_hold_ms = 0.0; // PUDICA_MI_SEND_HOLD_MS (0 = unbounded)
+    // Fourth MI knob, OFF by default. mi_send_ratio waits for the ENCODER to
+    // realise the new target; this waits for the MEASUREMENT to be about it.
+    //
+    // MI does not read one frame's delay, it reads smoothed_bur -- Eq.6 over a
+    // 200 ms window (kPudicaBurWindowUs) whose recency weight (k+20) is nearly
+    // flat, so one fresh sample barely moves it. A sample's timestamp is its
+    // FEEDBACK time, and the frame it describes was sent one OWD earlier, so at
+    // decision time T the window describes frames SENT in
+    // [T - OWD - 200ms, T - OWD]. For that window to be entirely about the
+    // previous adjustment, decisions must be at least OWD + 200 ms apart.
+    //
+    // Measured on run 1788919321: required 347 ms (OWD p50 147 + 200), actual
+    // median gap 170 ms -- 49% of it. The share of the window describing
+    // post-adjustment sends was p50 = 15%, and only 34 of 321 steps reached
+    // 100%. On the ramp that produced the 231 KB resolution-switch keyframe the
+    // decision that set B to 15.16 Mbps read a window that was 83% about the
+    // rate before it.
+    //
+    // Unlike mi_send_ratio this cannot deadlock: the condition is monotonic in
+    // time, so it always opens. That property is why it is preferred -- see
+    // run 1788925150, where mi_send_ratio locked MI out for the whole run.
+    //
+    // K = 1.0 is one full window. No new constant about the network: OWD is
+    // measured per frame and 200 ms is Eq.6's own window.
+    double mi_settle_k = 0.0;     // PUDICA_MI_SETTLE_K (0 = no settle wait)
+    // DRAIN knob, OFF by default. §4.3: "the volume of self-induced queued
+    // data is quantified by measuring the number of in-flight packets".
+    //
+    // The shipped path reconstructs that volume from BUR instead:
+    //   queue = recv x frame_bur x L        (A11)
+    // which is algebraically the same quantity -- but frame_bur is ONE frame's
+    // OWD, unsmoothed. Measured on run 1788928047 t=43.6-43.9, alpha*recv held
+    // flat at 37.5-39.2 Mbps while drain_rate swung 8.1 <-> 24.1 (3x) purely
+    // from frame_bur 2.36 -> 3.12 -> 1.67, and B fell 39 -> 15 Mbps with it.
+    // One of those swings is the frame's own emission span (100 ms) dropping
+    // out of D. That is the whole 2.5 s oscillation.
+    //
+    // data_in_flight is a transport counter over hundreds of packets, so the
+    // single-frame noise term does not exist there. What it does carry is the
+    // BDP: in_flight ~= recv x D = recv x D_min + recv x (D - D_min), and only
+    // the second half is self-induced. A11 already paid for this lesson from
+    // the other direction -- using the full D made drain_rate ~= 0.6 x rate on
+    // an empty queue. So the BDP is subtracted here too; taking the paper's
+    // sentence literally without it would roughly DOUBLE drain_rate.
+    bool drain_inflight = false;  // PUDICA_DRAIN_INFLIGHT
     int64_t tau_reset_us = 5'000'000;
     int64_t min_rate_bps = 1'000'000;
     int64_t max_rate_bps = kPudicaAppCapBps;  // published B ceiling (100 Mbps)
@@ -135,6 +250,12 @@ class PudicaRtpRateCtrl {
       c.zeta = d("PUDICA_ZETA", 0.15);
       c.bmax_mbps = d("PUDICA_BMAX_MBPS", 50.0);
       c.aimd_a_bound = d("PUDICA_AIMD_A_BOUND", 0.10);
+      c.xi_max = d("PUDICA_XI_MAX", 0.0);
+      c.mi_recv_k = d("PUDICA_MI_RECV_K", 0.0);
+      c.mi_send_hold_ms = d("PUDICA_MI_SEND_HOLD_MS", 0.0);
+      c.mi_send_ratio = d("PUDICA_MI_SEND_RATIO", 0.0);
+      c.mi_settle_k = d("PUDICA_MI_SETTLE_K", 0.0);
+      c.drain_inflight = d("PUDICA_DRAIN_INFLIGHT", 0.0) != 0.0;
       int64_t tau_ms = i64("PUDICA_TAU_RESET_MS", 5000);
       c.tau_reset_us = tau_ms * 1000;
       int64_t max_kbps = i64("PUDICA_MAX_RATE_KBPS", 0);
@@ -144,6 +265,13 @@ class PudicaRtpRateCtrl {
     }
   };
 
+  // Decision instant of a pending MI/AI-MD, or -1 when none is pending. The
+  // caller sums offered bytes from here so the gate's interval and the
+  // measurement's interval are the same by construction.
+  int64_t MiDecisionUs() const {
+    return mi_pending_ ? mi_decision_now_us_ : -1;
+  }
+
   struct Input {
     double frame_bur = 0.0;
     double smoothed_bur = 0.0;
@@ -151,6 +279,22 @@ class PudicaRtpRateCtrl {
     int64_t inflight_bytes = 0;    // paper: in-flight volume for draining_rate
     int64_t now_us = 0;
     int64_t frame_send_us = 0;     // first-packet send time of the BUR frame
+    // Media bytes the sender put on the wire over exactly `sent_span_us`,
+    // ending now and starting at the later of the pending MI decision and the
+    // send window's own left edge. Both are filled by the caller so the sum and
+    // the span cannot disagree: dividing bytes capped by a 2 s window by an
+    // unbounded elapsed time made the measured rate DECAY the longer the gate
+    // held, which locked MI out for a whole run (1788925150).
+    int64_t sent_bytes_since_decision = 0;
+    int64_t sent_span_us = 0;
+    // One-way delay of the frame reporting this BUR, and the width of the Eq.6
+    // smoothing window -- the two terms of the settle horizon.
+    int64_t frame_owd_us = 0;
+    int64_t bur_window_us = 0;
+    // Measured outstanding bytes (BDP + self-induced queue) and the D_min used
+    // to split them. Only read when cfg.drain_inflight is set.
+    int64_t inflight_meas_bytes = 0;
+    int64_t d_min_us = 0;
   };
 
   struct Output {
@@ -161,6 +305,16 @@ class PudicaRtpRateCtrl {
     int64_t committed_bps = 0;
     int64_t drain_recv_bps = 0;
     double xi_or_A = 0.0;  // MI ξ or AI-MD A (Mbps)
+    // Rate the sender actually offered since the pending decision, bps.
+    // -1 when nothing is pending or the interval is too short to divide by.
+    double mi_send_bps = -1.0;
+    // Settle horizon still owed at this tick, µs. -1 when nothing is pending
+    // or mi_settle_k is off; 0 once satisfied.
+    int64_t mi_need_us = -1;
+    // DRAIN diagnostics: the two terms of B = alpha*recv - drain_rate, and the
+    // queue volume they came from. -1 when this tick is not a DRAIN.
+    double drain_rate_bps = -1.0;
+    double drain_queue_bytes = -1.0;
   };
 
   Config cfg;
@@ -224,11 +378,22 @@ class PudicaRtpRateCtrl {
                         ? (drain_recv_sum_ / drain_recv_n_)
                         : static_cast<double>(committed_bps);
       drain_recv_bps_ = static_cast<int64_t>(recv);
-      double drain_rate = 0.0;
-      if (in.inflight_bytes > 0 && cfg.drain_horizon_s > 0.0) {
-        drain_rate = static_cast<double>(in.inflight_bytes) * 8.0 /
-                     cfg.drain_horizon_s;
+      double queue_bytes = 0.0;
+      if (cfg.drain_inflight) {
+        // Paper path: measured in-flight, minus the part that is merely on the
+        // wire. recv is the bottleneck rate (A11), so BDP = recv * D_min.
+        const double bdp_bytes = recv * (static_cast<double>(in.d_min_us) / 1e6) / 8.0;
+        queue_bytes = static_cast<double>(in.inflight_meas_bytes) - bdp_bytes;
+        if (queue_bytes < 0.0) queue_bytes = 0.0;
+      } else {
+        queue_bytes = static_cast<double>(in.inflight_bytes);
       }
+      double drain_rate = 0.0;
+      if (queue_bytes > 0.0 && cfg.drain_horizon_s > 0.0) {
+        drain_rate = queue_bytes * 8.0 / cfg.drain_horizon_s;
+      }
+      out.drain_rate_bps = drain_rate;
+      out.drain_queue_bytes = queue_bytes;
       committed_bps =
           static_cast<int64_t>(cfg.alpha * recv - drain_rate);
       mi_pending_ = false;
@@ -254,9 +419,43 @@ class PudicaRtpRateCtrl {
     // in the text, but then A accumulates tens of Mbps per second; we apply
     // the same wait to AI-MD (J-251). Feedback of an adjustment is a frame
     // whose send time is at/after the decision's recv now (≈ one RTT).
-    if (mi_pending_ && in.frame_send_us > 0 && mi_decision_now_us_ > 0 &&
-        in.frame_send_us < mi_decision_now_us_) {
-      return Finish(out, "PUD-HOLD", in);
+    if (mi_pending_ && in.frame_send_us > 0 && mi_decision_now_us_ > 0) {
+      // (a) paper's rule, unchanged: the reporting frame must have been sent
+      //     at or after the decision.
+      bool stale_frame = in.frame_send_us < mi_decision_now_us_;
+      // (b) mi_send_ratio: and the sender must have actually offered the rate
+      //     it committed to. Averaged over [decision, now], so it starts near
+      //     zero and rises as feedback for the new bytes arrives -- the gate
+      //     opens when the offer is real, not when the clock says so.
+      bool offer_unrealised = false;
+      if (cfg.mi_send_ratio > 0.0 && committed_bps > 0 && in.sent_span_us > 0) {
+        double sent_bps = static_cast<double>(in.sent_bytes_since_decision) *
+                          8.0 * 1e6 / static_cast<double>(in.sent_span_us);
+        out.mi_send_bps = sent_bps;
+        offer_unrealised =
+            sent_bps < cfg.mi_send_ratio * static_cast<double>(committed_bps);
+        // [A23] ...but only for a bounded time after the decision.
+        if (offer_unrealised && cfg.mi_send_hold_ms > 0.0 &&
+            (in.now_us - mi_decision_now_us_) >
+                static_cast<int64_t>(cfg.mi_send_hold_ms * 1000.0)) {
+          offer_unrealised = false;
+        }
+      }
+      // (c) mi_settle_k: and smoothed_bur must have had time to become a
+      //     measurement OF the new rate — one OWD for the first post-decision
+      //     frame to report, plus K Eq.6 windows for the window to turn over.
+      bool not_settled = false;
+      if (cfg.mi_settle_k > 0.0 && in.bur_window_us > 0) {
+        int64_t need_us =
+            std::max<int64_t>(0, in.frame_owd_us) +
+            static_cast<int64_t>(cfg.mi_settle_k *
+                                 static_cast<double>(in.bur_window_us));
+        int64_t waited_us = in.now_us - mi_decision_now_us_;
+        out.mi_need_us = std::max<int64_t>(0, need_us - waited_us);
+        not_settled = waited_us < need_us;
+      }
+      if (stale_frame || offer_unrealised || not_settled)
+        return Finish(out, "PUD-HOLD", in);
     }
     mi_pending_ = false;
 
@@ -264,8 +463,16 @@ class PudicaRtpRateCtrl {
       double R = std::max(in.smoothed_bur, 1e-3);
       double xi = cfg.gamma_mi * (((cfg.alpha + 1.0) / 2.0) - R) / R;
       if (xi < 0.0) xi = 0.0;
+      if (cfg.xi_max > 0.0 && xi > cfg.xi_max) xi = cfg.xi_max;
       committed_bps = static_cast<int64_t>(
           static_cast<double>(committed_bps) * (1.0 + xi));
+      // Level clamp: never aim more than k x what is actually arriving. Guarded
+      // on recv_rate_bps > 0 so a feedback gap cannot clamp B to zero.
+      if (cfg.mi_recv_k > 0.0 && in.recv_rate_bps > 0) {
+        int64_t ceiling = static_cast<int64_t>(cfg.mi_recv_k *
+                                               static_cast<double>(in.recv_rate_bps));
+        if (ceiling > 0 && committed_bps > ceiling) committed_bps = ceiling;
+      }
       mi_pending_ = true;
       mi_decision_now_us_ = in.now_us;
       out.xi_or_A = xi;

@@ -8,6 +8,7 @@
  *  be found in the AUTHORS file in the root of the source tree.
  */
 
+#include "modules/pacing/pacing_controller.h"
 #include "modules/congestion_controller/goog_cc/goog_cc_network_control.h"
 
 #include <stdio.h>
@@ -526,8 +527,25 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
   bandwidth_estimation_->SetAcknowledgedRate(acknowledged_bitrate,
                                              report.feedback_time);
   for (const auto& feedback : report.SortedByReceiveTime()) {
+    // [A22] Pudica's Eq.5 probes carry kPudicaProbeClusterId (-100) purely as a
+    // TAG so delay_based_bwe.cc can route them to the coordinator; they are NOT
+    // GoogCC bandwidth probes. pacing_controller.h claimed "GCC ProbeController
+    // only processes probe_cluster_id >= 0, so -100 is ignored" -- but the test
+    // here is != kNotAProbe (-1), so -100 fell straight through into
+    // ProbeBitrateEstimator, which immediately fails
+    //   RTC_CHECK(pacing_info.probe_cluster_min_probes > 0)   (-1 vs 0)
+    // because pudica_info sets only the cluster id. PUDICA_PROBING=1 therefore
+    // aborted the sender ~2.7 s in, on every build, which is why probe_count
+    // was 0 in every run of this series.
+    //
+    // Excluded rather than given a min_probes value on purpose: these are
+    // 50-byte padding bursts placed in the inter-frame gap to measure LINK
+    // OCCUPANCY, and letting ProbeBitrateEstimator read them as a probe cluster
+    // would feed GoogCC a bandwidth estimate derived from 200 bytes.
     if (feedback.sent_packet.pacing_info.probe_cluster_id !=
-        PacedPacketInfo::kNotAProbe) {
+            PacedPacketInfo::kNotAProbe &&
+        feedback.sent_packet.pacing_info.probe_cluster_id !=
+            PacingController::kPudicaProbeClusterId) {
       probe_bitrate_estimator_->HandleProbeAndEstimateBitrate(feedback);
     }
   }

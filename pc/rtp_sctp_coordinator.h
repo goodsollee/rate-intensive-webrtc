@@ -231,11 +231,17 @@ class RtpSctpCoordinator {
                                       int64_t max_data_rate_bps = -1);
 
   // ===== Pudica: per-packet OWD feedback (called from DelayBasedBwe) =====
+  // `rtp_timestamp` is the on-wire timestamp of the frame this packet belongs
+  // to; it delimits the BUR accumulator. `is_frame_last` is the transport
+  // send-time group boundary, used only when rtp_timestamp is unavailable.
   static void OnPudicaPacketFeedback(int64_t transport_seq,
                                       int64_t send_time_us,
                                       int64_t recv_time_us,
                                       bool is_probe,
-                                      bool is_frame_last);
+                                      bool is_frame_last,
+                                      uint32_t rtp_timestamp = 0,
+                                      int64_t size_bytes = 0,
+                                      int64_t inflight_bytes = 0);
 
   // Pudica: adaptive pacing multiplier (read by PacingController)
   static double GetPudicaPacingMultiplier();
@@ -482,8 +488,37 @@ class RtpSctpCoordinator {
   };
   PudicaFrameInfo pudica_frame_;
 
+  // [MI-SEND-GATE] Original video media bytes that reached the wire, keyed by
+  // SEND time (not feedback time), over a 2 s trailing window. The MI
+  // wait-for-feedback rule needs "did the sender actually offer the rate it
+  // just committed to", and no existing series answers that: recv_rate is
+  // bottleneck-limited (it measures the link) and the ack window is keyed by
+  // feedback arrival. A sample lands here only when its feedback arrives, so
+  // bytes still in flight are deliberately not counted yet — that is the
+  // conservative direction for a gate that exists to wait.
+  struct SendSample {
+    int64_t send_time_us;
+    int64_t bytes;
+  };
+  std::deque<SendSample> pudica_send_samples_;
+  // [DRAIN-INFLIGHT] Outstanding bytes reported with the most recent video
+  // media feedback. One OWD stale by construction — it is the queue the acked
+  // packet actually saw, which is the same instant the frame's BUR describes.
+  int64_t pudica_inflight_meas_bytes_ = 0;
+  static constexpr int64_t kPudicaSendWindowUs = 2'000'000;
+
   // D_min: minimum packet OWD over 10-second window (μs)
   double pudica_d_min_us_ = -1.0;
+  // Emission span of the last frame (last_send - first_send), subtracted from
+  // D before Eq.1. Logged as span_ms in pudica_ctrl.csv: when it approaches or
+  // exceeds L the sender, not the network, is what D was measuring.
+  double pudica_frame_span_us_ = 0.0;
+  // On-wire RTP timestamp of the frame currently accumulating in
+  // pudica_frame_. Sentinel: pudica_frame_rtp_ts_valid_ == false means the
+  // accumulator has no frame identity and the transport group boundary is
+  // being used instead.
+  uint32_t pudica_frame_rtp_ts_ = 0;
+  bool pudica_frame_rtp_ts_valid_ = false;
   std::deque<std::pair<int64_t, double>> pudica_owd_window_;  // (time_us, owd_us)
   static constexpr int64_t kPudicaDminWindowUs = 10'000'000;  // 10 seconds in μs
 

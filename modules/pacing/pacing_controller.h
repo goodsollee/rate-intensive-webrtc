@@ -302,8 +302,10 @@ class PacingController {
  public:
   static void SetPudicaProbing(bool enabled, int num_probes = 4);
   static void SetPudicaRho(double rho);
-  // Pudica probe packets use this cluster ID for identification in TWCC feedback.
-  // GCC ProbeController only processes probe_cluster_id >= 0, so -100 is ignored.
+  // Pudica probe packets use this cluster ID for identification in TWCC
+  // feedback. NOTE: GoogCC does NOT ignore negative ids on its own -- it tests
+  // != kNotAProbe (-1). goog_cc_network_control.cc excludes this id explicitly;
+  // see [A22]. Without that exclusion PUDICA_PROBING=1 aborts the sender.
   static constexpr int kPudicaProbeClusterId = -100;
 };
 }  // namespace webrtc

@@ -307,21 +307,60 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
       threshold_ms,
       detector_state);
 
-  // Pudica: per-packet OWD feedback for frame-level BUR measurement
-  if (packet_feedback.receive_time.IsFinite()) {
-    // Detect frame boundary: calculated_deltas means a new send-time group
-    // (frame) was completed. The current packet starts the next frame.
+  // Pudica: per-packet OWD feedback for frame-level BUR measurement.
+  //
+  // VIDEO ONLY. Two reasons, both measured on run e2e_finesse_pudica_1788854690:
+  //
+  // 1. `is_frame_last` below is an InterArrivalDelta send-time GROUP boundary,
+  //    not a video frame boundary. WebRTC-Bwe-SeparateAudioPackets is off by
+  //    default, so audio shares video_inter_arrival_delta_ and an audio packet
+  //    that lands outside a video burst closes the frame accumulator and then
+  //    forms a group of its own. BUR = (last_recv - first_send)/L over a
+  //    ONE-packet group is that packet's own OWD minus D_min: no serialization,
+  //    no queue accumulation, so it reads ~0 no matter how deep the queue is.
+  //    Measured: 846/2870 samples (29%) had frame_pkts==1 with bur p50 = p90 =
+  //    0.030 (a constant, i.e. no information), against 0.485/1.939 for real
+  //    >=30-packet frames. The bias is one-directional — DRAIN and FALLBACK
+  //    never fired on such a sample (0%), while 57% of the MI steps that
+  //    actually raised B did, ramping the target to the 100 Mbps app cap.
+  //
+  // 2. D_min must come from the same packet population as D. A small audio
+  //    packet serializes faster, so letting it set the 10-second minimum in
+  //    OnPudicaPacketFeedback would subtract a floor the video frames can
+  //    never reach.
+  //
+  // `video_media` narrows this to ORIGINAL video media: no audio, padding, RTX
+  // or FEC. It supersedes an earlier `!audio` test, which let padding through
+  // (492 packets against 3784 audio ones on that run) and, more importantly,
+  // could not carry the frame identity the boundary below now needs.
+  if (packet_feedback.receive_time.IsFinite() &&
+      packet_feedback.sent_packet.video_media) {
     // Pudica probes are identified by their probe_cluster_id (set in PacingController).
     bool is_probe = (packet_feedback.sent_packet.pacing_info.probe_cluster_id
                      == PacingController::kPudicaProbeClusterId);
-    // Frame last = when InterArrivalDelta computed deltas (previous frame ended)
+    // `calculated_deltas` is an InterArrivalDelta send-time GROUP boundary and
+    // is passed only as a fallback: it is NOT a frame boundary. Under
+    // congestion arrivals bunch below kBurstDeltaThreshold and BelongsToBurst()
+    // merges frame after frame into one group, so a group can span seven
+    // frames (measured, run 1788856257 t=49.573 s: 961 packets). The
+    // coordinator prefers rtp_timestamp, which changes exactly once per encoded
+    // frame, and falls back to this only when no identity is available.
     bool is_frame_last = calculated_deltas;
     RtpSctpCoordinator::OnPudicaPacketFeedback(
         packet_feedback.sent_packet.sequence_number,
         packet_feedback.sent_packet.send_time.us(),
         packet_feedback.receive_time.us(),
         is_probe,
-        is_frame_last);
+        is_frame_last,
+        packet_feedback.sent_packet.rtp_timestamp,
+        // [MI-SEND-GATE] Size on the wire, so the coordinator can measure the
+        // rate the sender ACTUALLY offered, keyed by send time.
+        static_cast<int64_t>(packet_feedback.sent_packet.size.bytes()),
+        // [DRAIN-INFLIGHT] Outstanding (sent, not yet acked) bytes as of this
+        // packet's send instant — the paper's "number of in-flight packets".
+        // Acked bytes are already removed by InFlightBytesTracker, so this is
+        // BDP + self-induced queue and the BDP still has to come off.
+        static_cast<int64_t>(packet_feedback.sent_packet.data_in_flight.bytes()));
   }
 }
 
