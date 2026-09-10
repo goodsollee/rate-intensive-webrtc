@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -454,7 +455,8 @@ class VideoStreamEncoderUnderTest : public VideoStreamEncoder {
       int64_t round_trip_time_ms,
       double cwnd_reduce_ratio) {
     OnBitrateUpdated(target_bitrate, stable_target_bitrate, link_allocation,
-                     fraction_lost, round_trip_time_ms, cwnd_reduce_ratio);
+                     fraction_lost, round_trip_time_ms, cwnd_reduce_ratio,
+                     /*is_overused_for_encoder=*/1.0);
     // Bitrate is updated on the encoder queue.
     WaitUntilTaskQueueIsIdle();
   }
@@ -859,6 +861,13 @@ class VideoStreamEncoderTest : public ::testing::Test {
  public:
   static constexpr TimeDelta kDefaultTimeout = TimeDelta::Seconds(1);
 
+  // Production caches this process-level setting. Run this fixture in fresh
+  // processes for unset/0/1; do not mutate the environment within a test.
+  static bool NoFrameDropRequested() {
+    const char* value = std::getenv("KFT_NO_FRAME_DROP");
+    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
+  }
+
   VideoStreamEncoderTest()
       : video_send_config_(VideoSendStream::Config(nullptr)),
         codec_width_(320),
@@ -1254,6 +1263,11 @@ class VideoStreamEncoderTest : public ::testing::Test {
       return last_encoder_complexity_;
     }
 
+    std::vector<int64_t> EncodedInputTimestamps() const {
+      MutexLock lock(&local_mutex_);
+      return encoded_input_timestamps_;
+    }
+
    private:
     int32_t Encode(const VideoFrame& input_image,
                    const std::vector<VideoFrameType>* frame_types) override {
@@ -1273,6 +1287,7 @@ class VideoStreamEncoderTest : public ::testing::Test {
 
         timestamp_ = input_image.rtp_timestamp();
         ntp_time_ms_ = input_image.ntp_time_ms();
+        encoded_input_timestamps_.push_back(ntp_time_ms_);
         last_input_width_ = input_image.width();
         last_input_height_ = input_image.height();
         last_update_rect_ = input_image.update_rect();
@@ -1361,6 +1376,7 @@ class VideoStreamEncoderTest : public ::testing::Test {
     rtc::Event continue_encode_event_;
     uint32_t timestamp_ RTC_GUARDED_BY(local_mutex_) = 0;
     int64_t ntp_time_ms_ RTC_GUARDED_BY(local_mutex_) = 0;
+    std::vector<int64_t> encoded_input_timestamps_ RTC_GUARDED_BY(local_mutex_);
     int last_input_width_ RTC_GUARDED_BY(local_mutex_) = 0;
     int last_input_height_ RTC_GUARDED_BY(local_mutex_) = 0;
     bool quality_scaling_ RTC_GUARDED_BY(local_mutex_) = true;
@@ -1876,7 +1892,58 @@ TEST_F(VideoStreamEncoderTest, DropsPendingFramesOnSlowEncode) {
   source.IncomingCapturedFrame(CreateFrame(2, nullptr));
   WaitForEncodedFrame(2);
   video_stream_encoder_->Stop();
-  EXPECT_EQ(1, dropped_count);
+  EXPECT_EQ(NoFrameDropRequested() ? 0 : 1, dropped_count);
+  EXPECT_EQ(fake_encoder_.EncodedInputTimestamps(),
+            NoFrameDropRequested() ? std::vector<int64_t>({1, 2})
+                                   : std::vector<int64_t>({2}));
+}
+
+TEST_F(VideoStreamEncoderTest, NoFrameDropQueueOverloadFiniteBurstDrainsOnce) {
+  test::FrameForwarder source;
+  video_stream_encoder_->SetSource(&source,
+                                   DegradationPreference::MAINTAIN_FRAMERATE);
+  video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+      kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0);
+  std::vector<VideoStreamEncoderObserver::DropReason> drops;
+  stats_proxy_->SetDroppedFrameCallback(
+      [&drops](VideoStreamEncoderObserver::DropReason reason) {
+        drops.push_back(reason);
+      });
+
+  // The simulated encoder queue is deliberately not advanced during capture.
+  // Actual FrameCadenceAdapter marks every input except the last overloaded.
+  constexpr int kBurst = 16;
+  std::vector<int64_t> expected;
+  for (int64_t timestamp = 1; timestamp <= kBurst; ++timestamp) {
+    source.IncomingCapturedFrame(CreateFrame(timestamp, nullptr));
+    if (NoFrameDropRequested() || timestamp == kBurst)
+      expected.push_back(timestamp);
+  }
+  WaitForEncodedFrame(kBurst);
+  EXPECT_EQ(fake_encoder_.EncodedInputTimestamps(), expected);
+  EXPECT_EQ(drops.size(), NoFrameDropRequested() ? 0u : kBurst - 1u);
+  for (auto reason : drops)
+    EXPECT_EQ(reason, VideoStreamEncoderObserver::DropReason::kEncoderQueue);
+
+  // A duplicate timestamp remains a hard intake rejection in either mode.
+  drops.clear();
+  source.IncomingCapturedFrame(CreateFrame(kBurst, nullptr));
+  video_stream_encoder_->WaitUntilTaskQueueIsIdle();
+  ASSERT_EQ(drops.size(), 1u);
+  EXPECT_EQ(drops.front(), VideoStreamEncoderObserver::DropReason::kBadTimestamp);
+  EXPECT_EQ(fake_encoder_.EncodedInputTimestamps(), expected);
+
+  // Advance the existing diagnostic clock so this fresh-process test also
+  // emits the observed/drop/bypass FATE counts for the finite burst.
+  AdvanceTime(TimeDelta::Seconds(1));
+  source.IncomingCapturedFrame(CreateFrame(kBurst + 1, nullptr));
+  WaitForEncodedFrame(kBurst + 1);
+  expected.push_back(kBurst + 1);
+  EXPECT_EQ(fake_encoder_.EncodedInputTimestamps(), expected);
+  video_stream_encoder_->Stop();
+  source.IncomingCapturedFrame(CreateFrame(kBurst + 2, nullptr));
+  video_stream_encoder_->WaitUntilTaskQueueIsIdle();
+  EXPECT_EQ(fake_encoder_.EncodedInputTimestamps(), expected);
 }
 
 TEST_F(VideoStreamEncoderTest, NativeFrameWithoutI420SupportGetsDelivered) {
@@ -2957,8 +3024,9 @@ TEST_F(VideoStreamEncoderTest, TestCpuDowngrades_BalancedMode) {
 
 TEST_F(VideoStreamEncoderTest,
        SinkWantsNotChangedByResourceLimitedBeforeDegradationPreferenceChange) {
-  video_stream_encoder_->OnBitrateUpdated(kTargetBitrate, kTargetBitrate,
-                                          kTargetBitrate, 0, 0, 0);
+  video_stream_encoder_->OnBitrateUpdated(
+      kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0,
+      /*is_overused_for_encoder=*/1.0);
   EXPECT_THAT(video_source_.sink_wants(), UnlimitedSinkWants());
 
   const int kFrameWidth = 1280;
@@ -9690,7 +9758,7 @@ TEST(VideoStreamEncoderFrameCadenceTest,
   // Both layers enabled at 1 MBit/s.
   video_stream_encoder->OnBitrateUpdated(
       DataRate::KilobitsPerSec(1000), DataRate::KilobitsPerSec(1000),
-      DataRate::KilobitsPerSec(1000), 0, 0, 0);
+      DataRate::KilobitsPerSec(1000), 0, 0, 0, /*is_overused_for_encoder=*/1.0);
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(0, /*enabled=*/true));
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(1, /*enabled=*/true));
   factory.DepleteTaskQueues();
@@ -9699,15 +9767,16 @@ TEST(VideoStreamEncoderFrameCadenceTest,
   // Layer 1 disabled at 200 KBit/s.
   video_stream_encoder->OnBitrateUpdated(
       DataRate::KilobitsPerSec(200), DataRate::KilobitsPerSec(200),
-      DataRate::KilobitsPerSec(200), 0, 0, 0);
+      DataRate::KilobitsPerSec(200), 0, 0, 0, /*is_overused_for_encoder=*/1.0);
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(0, /*enabled=*/true));
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(1, /*enabled=*/false));
   factory.DepleteTaskQueues();
   Mock::VerifyAndClearExpectations(adapter_ptr);
 
   // All layers off at suspended video.
-  video_stream_encoder->OnBitrateUpdated(DataRate::Zero(), DataRate::Zero(),
-                                         DataRate::Zero(), 0, 0, 0);
+  video_stream_encoder->OnBitrateUpdated(
+      DataRate::Zero(), DataRate::Zero(), DataRate::Zero(), 0, 0, 0,
+      /*is_overused_for_encoder=*/1.0);
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(0, /*enabled=*/false));
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(1, /*enabled=*/false));
   factory.DepleteTaskQueues();
@@ -9716,7 +9785,7 @@ TEST(VideoStreamEncoderFrameCadenceTest,
   // Both layers enabled again back at 1 MBit/s.
   video_stream_encoder->OnBitrateUpdated(
       DataRate::KilobitsPerSec(1000), DataRate::KilobitsPerSec(1000),
-      DataRate::KilobitsPerSec(1000), 0, 0, 0);
+      DataRate::KilobitsPerSec(1000), 0, 0, 0, /*is_overused_for_encoder=*/1.0);
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(0, /*enabled=*/true));
   EXPECT_CALL(*adapter_ptr, UpdateLayerStatus(1, /*enabled=*/true));
   factory.DepleteTaskQueues();
@@ -9750,7 +9819,7 @@ TEST(VideoStreamEncoderFrameCadenceTest, UpdatesQualityConvergence) {
                                          kMaxPayloadLength);
   video_stream_encoder->OnBitrateUpdated(
       DataRate::KilobitsPerSec(1000), DataRate::KilobitsPerSec(1000),
-      DataRate::KilobitsPerSec(1000), 0, 0, 0);
+      DataRate::KilobitsPerSec(1000), 0, 0, 0, /*is_overused_for_encoder=*/1.0);
 
   // Pass a frame which has unconverged results.
   PassAFrame(encoder_queue, video_stream_encoder_callback, /*ntp_time_ms=*/1);

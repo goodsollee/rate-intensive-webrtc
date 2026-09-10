@@ -73,7 +73,10 @@ namespace {
 // KFT_CWND_FORENSICS=1.
 //
 //   captured  frames handed to the encoder by the source
-//   qoverload dropped at intake: a newer frame is already in flight
+//   qoverload observed cadence overload: a newer frame is already in flight
+//   qoverload_dropped actual intake drops attributed to cadence overload
+//   qoverload_bypassed overload inputs allowed into MaybeEncodeVideoFrame;
+//                     this is not proof of a successful encode
 //   paused    dropped because encoder_target == 0 (EncoderPaused)
 //   dropper   dropped by the leaky-bucket FrameDropper (kMediaOptimization)
 //   encoded   actually encoded
@@ -82,6 +85,7 @@ namespace {
 // was actually told, after allocation, not the transport estimate.
 struct FrameFate {
   int captured = 0, qoverload = 0, paused = 0, dropper = 0, encoded = 0;
+  int qoverload_dropped = 0, qoverload_bypassed = 0;
   int64_t last_ms = 0;
   static bool On() { return true; }  // [T11-DIAG] temporarily ungated
   void Tick(int64_t now_ms, int target_kbps) {
@@ -90,22 +94,27 @@ struct FrameFate {
     if (now_ms - last_ms < 1000) return;
     fprintf(stderr,
             "KFTF FATE t_ms=%lld captured=%d qoverload=%d paused=%d "
-            "dropper=%d encoded=%d target_kbps=%d\n",
+            "dropper=%d encoded=%d target_kbps=%d "
+            "qoverload_dropped=%d qoverload_bypassed=%d\n",
             static_cast<long long>(now_ms), captured, qoverload, paused,
-            dropper, encoded, target_kbps);
+            dropper, encoded, target_kbps, qoverload_dropped,
+            qoverload_bypassed);
     captured = qoverload = paused = dropper = encoded = 0;
+    qoverload_dropped = qoverload_bypassed = 0;
     last_ms = now_ms;
   }
 };
 FrameFate g_fate;
 
-// [NODROP] SparkRTC's disable_frame_drop, ported. Blocks all three doors a
-// frame can be thrown out of before it reaches the codec:
+// [NODROP] SparkRTC's disable_frame_drop, ported. Bypasses these policy drops:
 //   1. EncoderPaused()   - target == 0
 //   2. FrameDropper      - the leaky bucket
 //   3. congestion window - cwnd_reduce_ratio
-// Unset => stock behaviour. Note this only stops WebRTC-level dropping; libvpx
-// still has its own rc_dropframe_thresh.
+//   4. cadence overload  - a newer frame is queued
+// Unset => stock behaviour. Timestamp validation, Stop and codec failures are
+// unchanged. Bypassing overload creates no retry queue and does not bound
+// backlog when sustained input exceeds encoder service. The codec has its own
+// dropping mechanisms, including libvpx rc_dropframe_thresh.
 bool NoFrameDrop() {
   static const bool on = [] {
     const char* e = getenv("KFT_NO_FRAME_DROP");
@@ -1611,10 +1620,18 @@ void VideoStreamEncoder::OnFrame(Timestamp post_time,
   bool cwnd_frame_drop =
       cwnd_frame_drop_interval_ &&
       (cwnd_frame_counter_++ % cwnd_frame_drop_interval_.value() == 0);
+  const bool queue_overload_drop = queue_overload && !NoFrameDrop();
   ++g_fate.captured;
   if (queue_overload) ++g_fate.qoverload;
+  if (queue_overload && !cwnd_frame_drop) {
+    if (queue_overload_drop) {
+      ++g_fate.qoverload_dropped;
+    } else {
+      ++g_fate.qoverload_bypassed;
+    }
+  }
   // [T11] Tick here, not deeper in: every captured frame reaches this line,
-  // whereas MaybeEncodeVideoFrame is skipped entirely on queue_overload and
+  // whereas MaybeEncodeVideoFrame is skipped on a queue_overload drop and
   // returns early when the encoder is paused — the two cases the log most
   // needs to report.
   g_fate.Tick(rtc::TimeMillis(),
@@ -1622,7 +1639,7 @@ void VideoStreamEncoder::OnFrame(Timestamp post_time,
                   ? static_cast<int>(
                         last_encoder_rate_settings_->encoder_target.kbps())
                   : -1);
-  if (!queue_overload && !cwnd_frame_drop) {
+  if (!queue_overload_drop && !cwnd_frame_drop) {
     MaybeEncodeVideoFrame(incoming_frame, post_time.us());
   } else {
     if (cwnd_frame_drop) {

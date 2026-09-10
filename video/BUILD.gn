@@ -768,6 +768,72 @@ if (rtc_include_tests) {
     }
   }
 
+  # Runs the existing encoder/cadence fixture without unrelated video mock
+  # interfaces. Each no-frame-drop mode is exercised in a fresh process.
+  rtc_test("no_frame_drop_qoverload_tests") {
+    testonly = true
+    sources = [ "video_stream_encoder_unittest.cc" ]
+    deps = [
+      ":frame_cadence_adapter",
+      ":video",
+      ":video_stream_encoder_impl",
+      "../api:field_trials_view",
+      "../api:mock_fec_controller_override",
+      "../api:mock_video_codec_factory",
+      "../api:mock_video_encoder",
+      "../api:rtp_parameters",
+      "../api/environment:environment",
+      "../api/environment:environment_factory",
+      "../api/task_queue:default_task_queue_factory",
+      "../api/task_queue:task_queue",
+      "../api/units:data_rate",
+      "../api/units:time_delta",
+      "../api/video:builtin_video_bitrate_allocator_factory",
+      "../api/video:encoded_image",
+      "../api/video:resolution",
+      "../api/video:video_adaptation",
+      "../api/video:video_bitrate_allocation",
+      "../api/video:video_frame",
+      "../api/video_codecs:video_codecs_api",
+      "../api/video_codecs:vp8_temporal_layers_factory",
+      "../call/adaptation:resource_adaptation_test_utilities",
+      "../common_video:common_video",
+      "../common_video:frame_instrumentation_data",
+      "../media:rtc_audio_video",
+      "../media:rtc_internal_video_codecs",
+      "../media:video_adapter",
+      "../modules/video_coding:codec_globals_headers",
+      "../modules/video_coding:video_codec_interface",
+      "../modules/video_coding:video_coding_utility",
+      "../modules/video_coding:webrtc_h264",
+      "../modules/video_coding:webrtc_vp8",
+      "../modules/video_coding:webrtc_vp9",
+      "../modules/video_coding:webrtc_vp9_helpers",
+      "../modules/video_coding/codecs/av1:libaom_av1_encoder",
+      "../rtc_base:gunit_helpers",
+      "../rtc_base:logging",
+      "../rtc_base:macromagic",
+      "../rtc_base:refcount",
+      "../rtc_base:rtc_base_tests_utils",
+      "../rtc_base:rtc_event",
+      "../rtc_base/experiments:encoder_info_settings",
+      "../rtc_base/synchronization:mutex",
+      "../system_wrappers:metrics",
+      "../test:encoder_settings",
+      "../test:fake_video_codecs",
+      "../test:scoped_key_value_config",
+      "../test:test_common",
+      "../test:test_main",
+      "../test:test_support",
+      "../test:video_test_common",
+      "../test/time_controller",
+      "../third_party/abseil-cpp/absl/memory:memory",
+      "../third_party/abseil-cpp/absl/types:variant",
+      "../video/config:encoder_config",
+      "../video/config:streams_config",
+    ]
+  }
+
   # TODO(pbos): Rename test suite.
   rtc_library("video_tests") {
     testonly = true
