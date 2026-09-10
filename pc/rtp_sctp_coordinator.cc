@@ -18,9 +18,12 @@
 #include "media/sctp/dcsctp_transport.h"
 #include "rtc_base/logging.h"
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sys/stat.h>
 
 namespace webrtc {
@@ -41,8 +44,12 @@ double ReadEnvDouble(const char* name, double default_value) {
   const char* env = std::getenv(name);
   if (env) {
     char* end;
+    errno = 0;
     double val = std::strtod(env, &end);
-    if (end != env && *end == '\0') return val;
+    if (end != env && *end == '\0' && errno != ERANGE &&
+        std::isfinite(val)) {
+      return val;
+    }
   }
   return default_value;
 }
@@ -51,10 +58,52 @@ int64_t ReadEnvInt64(const char* name, int64_t default_value) {
   const char* env = std::getenv(name);
   if (env) {
     char* end;
+    errno = 0;
     long long val = std::strtoll(env, &end, 10);
-    if (end != env && *end == '\0') return static_cast<int64_t>(val);
+    if (end != env && *end == '\0' && errno != ERANGE) {
+      return static_cast<int64_t>(val);
+    }
   }
   return default_value;
+}
+
+bool ReadBoundedEnvDouble(const char* name,
+                          double default_value,
+                          double min_value,
+                          double max_value,
+                          double* value) {
+  const char* env = std::getenv(name);
+  if (!env) {
+    *value = default_value;
+    return true;
+  }
+  char* end;
+  errno = 0;
+  const double parsed = std::strtod(env, &end);
+  const bool valid = end != env && *end == '\0' && errno != ERANGE &&
+                     std::isfinite(parsed) && parsed >= min_value &&
+                     parsed <= max_value;
+  *value = valid ? parsed : default_value;
+  return valid;
+}
+
+bool ReadBoundedEnvInt(const char* name,
+                       int default_value,
+                       int min_value,
+                       int max_value,
+                       int* value) {
+  const char* env = std::getenv(name);
+  if (!env) {
+    *value = default_value;
+    return true;
+  }
+  char* end;
+  errno = 0;
+  const long long parsed = std::strtoll(env, &end, 10);
+  const bool valid = end != env && *end == '\0' && errno != ERANGE &&
+                     parsed >= min_value && parsed <= max_value;
+  *value = valid ? static_cast<int>(parsed) : default_value;
+  return valid;
 }
 
 bool ReadEnvBool(const char* name, bool default_value) {
@@ -121,15 +170,25 @@ CoordinatorFeatures ReadFeatures() {
   f.rtp_recv_rate = ReadEnvBool("BUR_RTP_RECV", true);
   f.total_recv_rate = ReadEnvBool("BUR_TOTAL_RECV", true);
   f.combine_weight = ReadEnvDouble("BUR_COMBINE_WEIGHT", 0.5);
-  f.L_ms = ReadEnvDouble("BUR_L_MS", 33.0);
+  const bool l_valid =
+      ReadBoundedEnvDouble("BUR_L_MS", 33.0, 1.0, 1000.0, &f.L_ms);
   f.alloc_dynamic = ReadEnvBool("BUR_ALLOC_DYNAMIC", true);
   f.unified_rtp_rate_ctrl = ReadEnvBool("UNIFIED_RTP_RATE_CTRL", false);
   f.max_rtp_share = ReadEnvDouble("UNIFIED_MAX_RTP_SHARE", 0.5);
   // Pudica
-  f.pudica_probing = ReadEnvBool("PUDICA_PROBING", false);
+  const bool probing_requested = ReadEnvBool("PUDICA_PROBING", false);
   f.sctp_pacing_bypass = ReadEnvBool("SCTP_PACING_BYPASS", false);
   f.measure_only = ReadEnvBool("BUR_MEASURE_ONLY", false);
-  f.pudica_num_probes = static_cast<int>(ReadEnvInt64("PUDICA_NUM_PROBES", 4));
+  const bool n_valid = ReadBoundedEnvInt(
+      "PUDICA_NUM_PROBES", 4, 1, 64, &f.pudica_num_probes);
+  f.pudica_probing = probing_requested && l_valid && n_valid;
+  if (probing_requested && (!l_valid || !n_valid)) {
+    RTC_LOG(LS_ERROR)
+        << "[PUDICA] Probe injection disabled: invalid environment"
+        << " L_valid=" << l_valid << " N_valid=" << n_valid
+        << " resolved_L_ms=" << f.L_ms
+        << " resolved_num_probes=" << f.pudica_num_probes;
+  }
   f.pudica_gamma_rho = ReadEnvDouble("PUDICA_GAMMA_RHO", 1.25);
   // SCTP frame-burst probing
   f.sctp_burst_probe = ReadEnvBool("SCTP_BURST_PROBE", false);
@@ -180,8 +239,15 @@ CoordinatorConfig CoordinatorConfig::FromEnvironment() {
   // BUR > spike_threshold, excess_delay > spike_threshold × L_ms.
   // So missing feedback for that duration = same severity as one spike tick.
   // Explicit BUR_FEEDBACK_TIMEOUT_MS / BUR_TIMEOUT_MS env overrides this.
-  double l_ms = ReadEnvDouble("BUR_L_MS", 33.0);
-  int64_t auto_timeout_ms = static_cast<int64_t>(cfg.spike_threshold * l_ms);
+  double l_ms = 33.0;
+  ReadBoundedEnvDouble("BUR_L_MS", 33.0, 1.0, 1000.0, &l_ms);
+  const double auto_timeout = cfg.spike_threshold * l_ms;
+  const int64_t auto_timeout_ms =
+      std::isfinite(auto_timeout) && auto_timeout >= 0.0 &&
+              auto_timeout <=
+                  static_cast<double>(std::numeric_limits<int64_t>::max())
+          ? static_cast<int64_t>(auto_timeout)
+          : 66;
   cfg.timeout_ms       = ReadEnvInt64("BUR_FEEDBACK_TIMEOUT_MS",
                            ReadEnvInt64("BUR_TIMEOUT_MS", auto_timeout_ms));
   cfg.rate_decision_interval_ms = ReadEnvInt64("BUR_RATE_DECISION_INTERVAL_MS", 33);
@@ -313,10 +379,23 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
     }
     // Activate probe injection in PacingController
     if (features_.pudica_probing) {
-      PacingController::SetPudicaProbing(true, features_.pudica_num_probes);
+      PacingController::SetPudicaProbing(
+          true, features_.pudica_num_probes,
+          TimeDelta::Micros(static_cast<int64_t>(features_.L_ms * 1000.0)));
+    } else {
+      PacingController::SetPudicaProbing(false, features_.pudica_num_probes,
+                                         TimeDelta::Zero());
     }
+    const bool probing_requested = ReadEnvBool("PUDICA_PROBING", false);
     RTC_LOG(LS_INFO) << "[PUDICA] Initialized: L_ms=" << features_.L_ms
-                     << " probing=" << features_.pudica_probing
+                     << " L_us="
+                     << static_cast<int64_t>(features_.L_ms * 1000.0)
+                     << " L_source="
+                     << (std::getenv("BUR_L_MS") ? "env" : "default")
+                     << " probing_configured=" << probing_requested
+                     << " probing_effective=" << features_.pudica_probing
+                     << " probing_config_valid="
+                     << (!probing_requested || features_.pudica_probing)
                      << " num_probes=" << features_.pudica_num_probes
                      << " gamma_rho=" << features_.pudica_gamma_rho
                      << " paper_cc=" << (!pudica_legacy_ ? 1 : 0)

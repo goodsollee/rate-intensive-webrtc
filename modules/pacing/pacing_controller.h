@@ -31,6 +31,7 @@
 #include "modules/pacing/prioritized_packet_queue.h"
 #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"
 #include "modules/rtp_rtcp/source/rtp_packet_to_send.h"
+#include "rtc_base/synchronization/mutex.h"
 #include "system_wrappers/include/clock.h"
 
 namespace webrtc {
@@ -289,18 +290,34 @@ class PacingController {
   // === Pudica probe injection (NSDI'24) ===
   // Sends small padding packets between video frames for BUR measurement.
   // Activated by RtpSctpCoordinator when COORDINATOR_MODE=pudica.
-  static bool pudica_probing_enabled_;
-  static int pudica_num_probes_;
-  static double pudica_rho_override_;
+  struct PudicaProbeConfig {
+    bool enabled = false;
+    int num_probes = 4;
+    int64_t frame_interval_us = 0;
+    double rho = 0.0;
+    uint64_t revision = 0;
+  };
+  static Mutex& PudicaConfigMutex();
+  static PudicaProbeConfig& MutablePudicaProbeConfig();
+  static PudicaProbeConfig ReadPudicaProbeConfig();
+  void RefreshPudicaProbeConfig();
+  PudicaProbeConfig pudica_config_snapshot_;
   int pudica_probes_remaining_ = 0;
   Timestamp pudica_frame_end_time_ = Timestamp::MinusInfinity();
   Timestamp pudica_next_probe_time_ = Timestamp::MinusInfinity();
   TimeDelta pudica_probe_interval_ = TimeDelta::Zero();
   Timestamp pudica_gap_end_time_ = Timestamp::MinusInfinity();  // ρ-based video hold
   Timestamp pudica_frame_send_start_ = Timestamp::MinusInfinity();  // first video pkt of frame
+  int pudica_marker_count_ = 0;
+  int pudica_total_probe_packets_ = 0;
 
  public:
-  static void SetPudicaProbing(bool enabled, int num_probes = 4);
+  // `frame_interval` is the same configured L used by Pudica's BUR model.
+  // Experiments use process-fixed configuration; invalid input disables the
+  // optional probe path rather than retaining a previous configuration.
+  static void SetPudicaProbing(bool enabled,
+                               int num_probes,
+                               TimeDelta frame_interval);
   static void SetPudicaRho(double rho);
   // Pudica probe packets use this cluster ID for identification in TWCC feedback.
   // GCC ProbeController only processes probe_cluster_id >= 0, so -100 is ignored.

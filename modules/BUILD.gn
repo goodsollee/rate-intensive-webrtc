@@ -230,6 +230,13 @@ if (rtc_include_tests && !build_with_chromium) {
       "video_coding/timing:timing_unittests",
     ]
 
+    # goog_cc's custom RtpSctpCoordinator calls the concrete dcsctp transport
+    # priority API. Pull the implementation into this aggregate test binary;
+    # production targets already get it through the media transport factory.
+    if (rtc_build_dcsctp) {
+      deps += [ "../media:rtc_data_dcsctp_transport" ]
+    }
+
     if (rtc_desktop_capture_supported) {
       deps += [ "desktop_capture:desktop_capture_unittests" ]
     }

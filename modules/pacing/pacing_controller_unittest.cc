@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -292,6 +293,11 @@ class PacingControllerTest : public ::testing::Test {
  protected:
   PacingControllerTest() : clock_(123456), trials_("") {}
 
+  void TearDown() override {
+    PacingController::SetPudicaProbing(false, 4, TimeDelta::Zero());
+    PacingController::SetPudicaRho(0.0);
+  }
+
   void SendAndExpectPacket(PacingController* pacer,
                            RtpPacketMediaType type,
                            uint32_t ssrc,
@@ -349,6 +355,165 @@ class PacingControllerTest : public ::testing::Test {
   ::testing::NiceMock<MockPacingControllerCallback> callback_;
   ExplicitKeyValueConfig trials_;
 };
+
+TEST_F(PacingControllerTest,
+       PudicaProbeUsesConfigured60FpsCadenceAndAccountsLateWakeOnce) {
+  PacingController::SetPudicaProbing(
+      true, 4, TimeDelta::Micros(16667));
+  PacingController::SetPudicaRho(2.0);
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 1,
+                           clock_.TimeInMilliseconds(), 100);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 1, _, false, false));
+  const Timestamp frame_send = clock_.CurrentTime();
+  pacer.ProcessPackets();
+
+  // (1 - 1/2) * 16667 / (4 + 1) truncates to 1666 us.
+  EXPECT_EQ(pacer.NextSendTime(), frame_send + TimeDelta::Micros(1666));
+
+  // Wake after several nominal probe intervals. Exactly one probe opportunity
+  // is emitted and charged; missed probes are not collapsed into one burst.
+  clock_.AdvanceTime(TimeDelta::Millis(5));
+  EXPECT_CALL(callback_, SendPadding(50)).WillOnce(Return(50));
+  EXPECT_CALL(callback_, SendPacket(0, 0, _, false, true)).Times(1);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.CurrentBufferLevel(), DataSize::Bytes(50));
+  EXPECT_EQ(pacer.NextSendTime(),
+            clock_.CurrentTime() + TimeDelta::Micros(1666));
+  pacer.ProcessPackets();
+}
+
+TEST_F(PacingControllerTest, PudicaProbeUsesConfigured30FpsCadence) {
+  PacingController::SetPudicaProbing(
+      true, 4, TimeDelta::Micros(33333));
+  PacingController::SetPudicaRho(2.0);
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 2,
+                           clock_.TimeInMilliseconds(), 1000);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 2, _, false, false));
+  const Timestamp frame_send = clock_.CurrentTime();
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.NextSendTime(), frame_send + TimeDelta::Micros(3333));
+}
+
+TEST_F(PacingControllerTest, PudicaInvalidProbeConfigurationFailsClosed) {
+  PacingController::SetPudicaProbing(true, 0, TimeDelta::Micros(16667));
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 3,
+                           clock_.TimeInMilliseconds(), 1000);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 3, _, false, false));
+  EXPECT_CALL(callback_, SendPadding).Times(0);
+  pacer.ProcessPackets();
+  clock_.AdvanceTime(TimeDelta::Millis(50));
+  pacer.ProcessPackets();
+}
+
+TEST_F(PacingControllerTest, PudicaNonfiniteAndOversizedConfigurationFailsClosed) {
+  PacingController::SetPudicaProbing(true, 65, TimeDelta::Micros(16667));
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::PlusInfinity());
+  PacingController::SetPudicaRho(
+      std::numeric_limits<double>::quiet_NaN());
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 4,
+                           clock_.TimeInMilliseconds(), 1000);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 4, _, false, false));
+  EXPECT_CALL(callback_, SendPadding).Times(0);
+  pacer.ProcessPackets();
+  clock_.AdvanceTime(TimeDelta::Millis(50));
+  pacer.ProcessPackets();
+}
+
+TEST_F(PacingControllerTest, PudicaDoesNotProbeWhenFrameConsumesPeriod) {
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::Micros(16667));
+  PacingController::SetPudicaRho(2.0);
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  const int64_t capture_time_ms = clock_.TimeInMilliseconds();
+  auto first = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 5,
+                           capture_time_ms, 1000);
+  pacer.EnqueuePacket(std::move(first));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 5, _, false, false));
+  pacer.ProcessPackets();
+
+  clock_.AdvanceTime(TimeDelta::Millis(20));
+  auto marker = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 6,
+                            capture_time_ms, 1000);
+  marker->SetMarker(true);
+  pacer.EnqueuePacket(std::move(marker));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 6, _, false, false));
+  EXPECT_CALL(callback_, SendPadding).Times(0);
+  pacer.ProcessPackets();
+  clock_.AdvanceTime(TimeDelta::Millis(5));
+  pacer.ProcessPackets();
+}
+
+TEST_F(PacingControllerTest, PudicaRhoNearOneProducesNoProbeWindow) {
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::Micros(16667));
+  PacingController::SetPudicaRho(1.000001);
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 7,
+                           clock_.TimeInMilliseconds(), 1000);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 7, _, false, false));
+  EXPECT_CALL(callback_, SendPadding).Times(0);
+  pacer.ProcessPackets();
+  clock_.AdvanceTime(TimeDelta::Millis(5));
+  pacer.ProcessPackets();
+}
+
+TEST_F(PacingControllerTest, PudicaInvalidRhoUsesFiniteDefault) {
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::Micros(16667));
+  PacingController::SetPudicaRho(
+      std::numeric_limits<double>::quiet_NaN());
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 9,
+                           clock_.TimeInMilliseconds(), 1000);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 9, _, false, false));
+  const Timestamp frame_send = clock_.CurrentTime();
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.NextSendTime(), frame_send + TimeDelta::Micros(1666));
+}
+
+TEST_F(PacingControllerTest, PudicaDisableAndReenableDropsStaleProbeState) {
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::Micros(16667));
+  PacingController::SetPudicaRho(2.0);
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  auto frame = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, 8,
+                           clock_.TimeInMilliseconds(), 1000);
+  frame->SetMarker(true);
+  pacer.EnqueuePacket(std::move(frame));
+  EXPECT_CALL(callback_, SendPacket(kVideoSsrc, 8, _, false, false));
+  pacer.ProcessPackets();
+
+  PacingController::SetPudicaProbing(false, 4, TimeDelta::Zero());
+  clock_.AdvanceTime(TimeDelta::Millis(2));
+  EXPECT_CALL(callback_, SendPadding).Times(0);
+  pacer.ProcessPackets();
+
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::Micros(16667));
+  pacer.ProcessPackets();
+  clock_.AdvanceTime(TimeDelta::Millis(5));
+  pacer.ProcessPackets();
+}
 
 TEST_F(PacingControllerTest, DefaultNoPaddingInSilence) {
   const test::ExplicitKeyValueConfig trials("");

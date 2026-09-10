@@ -64,21 +64,76 @@ const TimeDelta PacingController::kMaxEarlyProbeProcessing =
     TimeDelta::Millis(1);
 
 // Pudica static members
-bool PacingController::pudica_probing_enabled_ = false;
-int PacingController::pudica_num_probes_ = 4;
-double PacingController::pudica_rho_override_ = 0;
+Mutex& PacingController::PudicaConfigMutex() {
+  static Mutex& mutex = *new Mutex();
+  return mutex;
+}
 
-void PacingController::SetPudicaProbing(bool enabled, int num_probes) {
-  pudica_probing_enabled_ = enabled;
-  pudica_num_probes_ = num_probes;
+PacingController::PudicaProbeConfig&
+PacingController::MutablePudicaProbeConfig() {
+  static PudicaProbeConfig& config = *new PudicaProbeConfig();
+  return config;
+}
+
+void PacingController::SetPudicaProbing(bool enabled,
+                                        int num_probes,
+                                        TimeDelta frame_interval) {
+  const bool valid = !enabled ||
+      (num_probes > 0 && num_probes <= 64 && frame_interval.IsFinite() &&
+       frame_interval >= TimeDelta::Millis(1) &&
+       frame_interval <= TimeDelta::Seconds(1));
+  if (!valid) {
+    MutexLock lock(&PudicaConfigMutex());
+    PudicaProbeConfig& config = MutablePudicaProbeConfig();
+    config.enabled = false;
+    config.frame_interval_us = 0;
+    ++config.revision;
+    RTC_LOG(LS_ERROR) << "[PUDICA] Probe injection disabled: invalid N/L, N="
+                      << num_probes << " L_us="
+                      << (frame_interval.IsFinite() ? frame_interval.us() : -1);
+    return;
+  }
+  {
+    MutexLock lock(&PudicaConfigMutex());
+    PudicaProbeConfig& config = MutablePudicaProbeConfig();
+    config.enabled = enabled;
+    config.num_probes = num_probes;
+    config.frame_interval_us = enabled ? frame_interval.us() : 0;
+    ++config.revision;
+  }
   if (enabled) {
     RTC_LOG(LS_INFO) << "[PUDICA] Probe injection enabled: num_probes="
-                     << num_probes;
+                     << num_probes << " L_us=" << frame_interval.us();
   }
 }
 
 void PacingController::SetPudicaRho(double rho) {
-  pudica_rho_override_ = rho;
+  const bool valid = std::isfinite(rho) && rho > 1.0;
+  const double resolved_rho = valid ? rho : 2.0;
+  MutexLock lock(&PudicaConfigMutex());
+  MutablePudicaProbeConfig().rho = resolved_rho;
+  if (!valid) {
+    RTC_LOG(LS_WARNING) << "[PUDICA] Invalid rho=" << rho
+                        << "; using rho=2";
+  }
+}
+
+PacingController::PudicaProbeConfig
+PacingController::ReadPudicaProbeConfig() {
+  MutexLock lock(&PudicaConfigMutex());
+  return MutablePudicaProbeConfig();
+}
+
+void PacingController::RefreshPudicaProbeConfig() {
+  PudicaProbeConfig next = ReadPudicaProbeConfig();
+  if (next.revision != pudica_config_snapshot_.revision) {
+    pudica_probes_remaining_ = 0;
+    pudica_next_probe_time_ = Timestamp::MinusInfinity();
+    pudica_probe_interval_ = TimeDelta::Zero();
+    pudica_gap_end_time_ = Timestamp::MinusInfinity();
+    pudica_frame_send_start_ = Timestamp::MinusInfinity();
+  }
+  pudica_config_snapshot_ = next;
 }
 
 PacingController::PacingController(Clock* clock,
@@ -413,7 +468,9 @@ Timestamp PacingController::NextSendTime() const {
   }
 
   // Pudica: wake up for deferred probe sending or gap end
-  if (pudica_probing_enabled_) {
+  const PudicaProbeConfig pudica_config = ReadPudicaProbeConfig();
+  if (pudica_config.revision == pudica_config_snapshot_.revision &&
+      pudica_config.enabled) {
     if (pudica_probes_remaining_ > 0 && pudica_next_probe_time_.IsFinite()) {
       next_send_time = std::min(next_send_time, pudica_next_probe_time_);
     }
@@ -430,6 +487,7 @@ void PacingController::ProcessPackets() {
     packet_sender->OnBatchComplete();
   };
   const Timestamp now = CurrentTime();
+  RefreshPudicaProbeConfig();
   Timestamp target_send_time = now;
 
   if (ShouldSendKeepalive(now)) {
@@ -539,7 +597,7 @@ void PacingController::ProcessPackets() {
       }
 
       // Pudica: track frame send start (first video pkt after gap)
-      if (pudica_probing_enabled_ &&
+      if (pudica_config_snapshot_.enabled &&
           packet_type == RtpPacketMediaType::kVideo &&
           pudica_frame_send_start_.IsMinusInfinity()) {
         pudica_frame_send_start_ = now;
@@ -547,7 +605,7 @@ void PacingController::ProcessPackets() {
 
       // Pudica: detect video frame end (marker bit) before packet is moved
       bool pudica_frame_ended = false;
-      if (pudica_probing_enabled_ &&
+      if (pudica_config_snapshot_.enabled &&
           packet_type == RtpPacketMediaType::kVideo &&
           rtp_packet->Marker()) {
         pudica_frame_ended = true;
@@ -562,20 +620,20 @@ void PacingController::ProcessPackets() {
 
       // Pudica: schedule deferred probe packets after frame ends
       if (pudica_frame_ended) {
-        static int marker_count = 0;
-        marker_count++;
+        ++pudica_marker_count_;
         // Compute T_packet = (1-1/ρ) × L / (N+1)
-        double rho = pudica_rho_override_ > 1.0 ? pudica_rho_override_ : 2.0;
-        constexpr double kL_us = 33333.0;  // 30fps frame interval in μs
+        const double rho_configured = pudica_config_snapshot_.rho;
+        const double rho = rho_configured > 1.0 ? rho_configured : 2.0;
+        const int num_probes = pudica_config_snapshot_.num_probes;
+        const double kL_us = static_cast<double>(
+            pudica_config_snapshot_.frame_interval_us);
         double T_packet_us = (1.0 - 1.0 / rho) * kL_us /
-                             (pudica_num_probes_ + 1);
+                             (num_probes + 1);
         T_packet_us = std::max(T_packet_us, 500.0);  // min 0.5ms
 
-        pudica_probes_remaining_ = pudica_num_probes_;
         pudica_probe_interval_ = TimeDelta::Micros(
             static_cast<int64_t>(T_packet_us));
         pudica_frame_end_time_ = now;
-        pudica_next_probe_time_ = now + pudica_probe_interval_;
 
         // ρ-based gap: hold video for remaining time in frame interval.
         // gap = min((1-1/ρ)×L, L - frame_send_time) — never exceeds frame interval.
@@ -587,12 +645,20 @@ void PacingController::ProcessPackets() {
         double gap_us = std::min(desired_gap_us, remaining_us);
         pudica_gap_end_time_ = now + TimeDelta::Micros(
             static_cast<int64_t>(gap_us));
+        pudica_probes_remaining_ = std::min(
+            num_probes,
+            static_cast<int>(gap_us / pudica_probe_interval_.us()));
+        pudica_next_probe_time_ = pudica_probes_remaining_ > 0
+            ? now + pudica_probe_interval_
+            : Timestamp::MinusInfinity();
         pudica_frame_send_start_ = Timestamp::MinusInfinity();  // reset for next frame
 
-        if (marker_count % 100 == 0) {
-          fprintf(stderr, "[PUDICA-MARKER] markers=%d T_pkt=%.1fms gap=%.1f/%.1fms rho=%.1f send=%.1fms\n",
-                  marker_count, T_packet_us / 1000.0, gap_us / 1000.0,
-                  desired_gap_us / 1000.0, rho, frame_send_us / 1000.0);
+        if (pudica_marker_count_ % 100 == 0) {
+          fprintf(stderr, "[PUDICA-MARKER] markers=%d L=%.3fms T_pkt=%.3fms gap=%.3f/%.3fms probes=%d rho=%.3f send=%.3fms\n",
+                  pudica_marker_count_, kL_us / 1000.0,
+                  T_packet_us / 1000.0, gap_us / 1000.0,
+                  desired_gap_us / 1000.0, pudica_probes_remaining_, rho,
+                  frame_send_us / 1000.0);
         }
       }
 
@@ -623,24 +689,50 @@ void PacingController::ProcessPackets() {
   }
 
   // Pudica: deferred probe sending at T_packet intervals
-  if (pudica_probing_enabled_ && pudica_probes_remaining_ > 0) {
-    while (pudica_probes_remaining_ > 0 && now >= pudica_next_probe_time_) {
-      auto padding = packet_sender_->GeneratePadding(DataSize::Bytes(50));
-      if (padding.empty()) break;
-      for (auto& p : padding) {
-        PacedPacketInfo pudica_info;
-        pudica_info.probe_cluster_id = kPudicaProbeClusterId;
-        packet_sender_->SendPacket(std::move(p), pudica_info);
+  if (pudica_config_snapshot_.enabled &&
+      pudica_probes_remaining_ > 0 && now >= pudica_gap_end_time_) {
+    pudica_probes_remaining_ = 0;
+    pudica_next_probe_time_ = Timestamp::MinusInfinity();
+  }
+  if (pudica_config_snapshot_.enabled &&
+      pudica_probes_remaining_ > 0 && now >= pudica_next_probe_time_) {
+    const Timestamp scheduled_probe_time = pudica_next_probe_time_;
+    const int64_t late_us =
+        std::max<int64_t>(0, (now - scheduled_probe_time).us());
+    auto padding = packet_sender_->GeneratePadding(DataSize::Bytes(50));
+    DataSize probe_data = DataSize::Zero();
+    int probe_packets = 0;
+    for (auto& p : padding) {
+      DataSize packet_size = DataSize::Bytes(
+          p->payload_size() + p->padding_size());
+      if (include_overhead_) {
+        packet_size += DataSize::Bytes(p->headers_size()) +
+                       transport_overhead_per_packet_;
       }
-      pudica_probes_remaining_--;
-      pudica_next_probe_time_ += pudica_probe_interval_;
+      PacedPacketInfo pudica_info;
+      pudica_info.probe_cluster_id = kPudicaProbeClusterId;
+      packet_sender_->SendPacket(std::move(p), pudica_info);
+      OnPacketSent(RtpPacketMediaType::kPadding, packet_size, now);
+      probe_data += packet_size;
+      ++probe_packets;
+    }
+    // A late wake never collapses several scheduled probes into one burst.
+    // A failed padding generation is also retried on a future interval rather
+    // than busy-looping at an already-expired timestamp.
+    if (probe_packets > 0) {
+      --pudica_probes_remaining_;
+    }
+    pudica_next_probe_time_ = now + pudica_probe_interval_;
 
-      static int total_probes = 0;
-      total_probes++;
-      if (total_probes % 400 == 0) {
-        fprintf(stderr, "[PUDICA-PROBE] total=%d interval_us=%lld\n",
-                total_probes, (long long)pudica_probe_interval_.us());
-      }
+    pudica_total_probe_packets_ += probe_packets;
+    if (probe_packets > 0 && pudica_total_probe_packets_ % 400 == 0) {
+      fprintf(stderr,
+              "[PUDICA-PROBE] total=%d interval_us=%lld scheduled_us=%lld actual_us=%lld late_us=%lld packets=%d bytes=%lld\n",
+              pudica_total_probe_packets_,
+              (long long)pudica_probe_interval_.us(),
+              (long long)scheduled_probe_time.us(), (long long)now.us(),
+              (long long)late_us, probe_packets,
+              (long long)probe_data.bytes());
     }
   }
 
@@ -737,7 +829,8 @@ std::unique_ptr<RtpPacketToSend> PacingController::GetPendingPacket(
 
   // Pudica gap enforcement: hold video/FEC packets during agnostic period.
   // Audio (prio 0) and retransmissions (prio 1-2) pass through.
-  if (pudica_probing_enabled_ && now < pudica_gap_end_time_) {
+  if (pudica_config_snapshot_.enabled &&
+      now < pudica_gap_end_time_) {
     // Adapted to baseline PrioritizedPacketQueue API (no
     // TopActivePriorityLevel()): the top active priority level is 3
     // (video/FEC) exactly when no audio or retransmission packets are queued
