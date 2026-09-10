@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "pc/rtp_sctp_coordinator.h"
+#include "pc/coordinator/gecko_controller.h"  // [Gecko S4] per-frame delay -> N_bad
 #include "modules/pacing/pacing_controller.h"
 
 #include "api/field_trials_view.h"
@@ -346,6 +347,14 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
     // coordinator prefers rtp_timestamp, which changes exactly once per encoded
     // frame, and falls back to this only when no identity is available.
     bool is_frame_last = calculated_deltas;
+    // [Gecko S4] the same original-video-media population, probes excluded,
+    // feeds the Gecko sender's per-frame delay (docs/GECKO_PLAN.md S4).
+    if (!is_probe) {
+      gecko::GeckoController::Get().OnPacketFeedback(
+          packet_feedback.sent_packet.send_time.us(),
+          packet_feedback.receive_time.us(),
+          packet_feedback.sent_packet.rtp_timestamp, is_frame_last);
+    }
     RtpSctpCoordinator::OnPudicaPacketFeedback(
         packet_feedback.sent_packet.sequence_number,
         packet_feedback.sent_packet.send_time.us(),

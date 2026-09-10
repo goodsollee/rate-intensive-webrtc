@@ -23,6 +23,8 @@
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/trace_event.h"
+#include "rtc_base/time_utils.h"
+#include "pc/coordinator/gecko_controller.h"  // [Gecko S3] RTCP echo detection
 
 namespace webrtc {
 
@@ -290,6 +292,20 @@ void RtpTransport::OnReadPacket(rtc::PacketTransportInternal* transport,
   }
 
   if (packet_type == cricket::RtpPacketType::kRtcp) {
+    // [Gecko S3] The router's alert is the last forwarded RTCP datagram sent
+    // again, twice. Detected HERE, before SrtpTransport::UnprotectRtcp, where
+    // a copy would only be a replay to reject; a duplicate is dropped so the
+    // RTCP machinery never sees it twice (matters for plaintext RTCP runs).
+    if (webrtc::gecko::GeckoController::Get().Enabled()) {
+      const int64_t now_us = received_packet.arrival_time()
+                                 ? received_packet.arrival_time()->us()
+                                 : rtc::TimeMicros();
+      if (webrtc::gecko::GeckoController::Get().OnRtcpDatagram(
+              received_packet.payload().data(), received_packet.payload().size(),
+              now_us)) {
+        return;
+      }
+    }
     OnRtcpPacketReceived(received_packet);
   } else {
     OnRtpPacketReceived(received_packet);

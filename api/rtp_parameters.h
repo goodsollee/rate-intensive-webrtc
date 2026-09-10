@@ -379,6 +379,11 @@ struct RTC_EXPORT RtpExtension {
   // video frame). Custom extension used for network-assisted selective drop.
   static constexpr char kPduSetInfoUri[] = "urn:3gpp:pdu-set-info";
 
+  // [Gecko S1] Header extension carrying the Gecko sender answer (low 2 bits:
+  // 0 none, 1 no-flush, 2 flush). Offered right after kPduSetInfoUri so it is
+  // id 8 on the wire; the emulator reads that fixed id (GECKO_EXT_ID).
+  static constexpr char kGeckoFlagUri[] = "urn:x-finesse:gecko-flag";
+
   // Header extension for Mixer-to-Client audio levels per CSRC as defined in
   // https://tools.ietf.org/html/rfc6465
   static constexpr char kCsrcAudioLevelsUri[] =

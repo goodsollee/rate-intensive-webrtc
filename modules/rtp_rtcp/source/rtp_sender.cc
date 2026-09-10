@@ -93,6 +93,7 @@ constexpr RtpExtensionSize kVideoExtensionSizes[] = {
     CreateMaxExtensionSize<RtpMid>(),
     CreateMaxExtensionSize<CorruptionDetectionExtension>(),
     CreateExtensionSize<PduSetInfoExtension>(),
+    CreateExtensionSize<GeckoFlagExtension>(),  // [Gecko S1]
     {RtpGenericFrameDescriptorExtension00::kId,
      RtpGenericFrameDescriptorExtension00::kMaxSizeBytes},
 };
@@ -126,6 +127,7 @@ bool IsNonVolatile(RTPExtensionType type) {
     case kRtpExtensionGenericFrameDescriptor:
     case kRtpExtensionDependencyDescriptor:
     case kRtpExtensionPduSetInfo:
+    case kRtpExtensionGeckoFlag:  // [Gecko S1] reserved on every video packet
       return true;
     case kRtpExtensionInbandComfortNoise:
     case kRtpExtensionAbsoluteCaptureTime:

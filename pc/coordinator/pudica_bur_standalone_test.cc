@@ -235,6 +235,7 @@ static PudicaRtpRateCtrl::Input MakeIn(double bur, double rtilde, int64_t recv,
   in.frame_bur = bur;
   in.smoothed_bur = rtilde;
   in.recv_rate_bps = recv;
+  in.ack_recv_bps = recv;  // [A39] a measured recv, unless a test says otherwise
   in.inflight_bytes = inflight;
   in.now_us = now_us;
   in.frame_send_us = send_us;
@@ -244,6 +245,10 @@ static PudicaRtpRateCtrl::Input MakeIn(double bur, double rtilde, int64_t recv,
 // J-251 (1)(3): low BUR is MI from committed B, not recv × 1.30.
 TEST(RestoreOnlyAfterDrain) {
   PudicaRtpRateCtrl c;
+  // [A32] Subject is the branch, not the delivered-rate ceiling: these
+  // cases drive B deliberately above recv, which the ceiling exists to
+  // stop. AckCeilingBoundsMi covers the ceiling itself.
+  c.cfg.ack_ceil_k = 0.0;
   c.committed_bps = 50'000'000;
   auto o = c.Update(MakeIn(0.27, 0.27, 5'000'000, 200000, 200000));
   printf("  low-BUR without drain: mode=%s target=%.2f Mbps (committed was 50)\n",
@@ -290,6 +295,47 @@ TEST(SingleHighIsFallbackNotDrain) {
   EXPECT_GT(o2.target_bps, 70'000'000);
 }
 
+// [A30] Drain exit must not CUT the target. Reproduces run 1789024044
+// t=54.43-54.48: DRAIN had committed 8.20 Mbps, then recv momentarily read
+// 1.85 (an average over the outage that just ended) and the literal paper rule
+// republished 1.85 -- a 4.4x cut at the moment of recovery, which then held for
+// 18.4 s because the encoder could not realise it and the MI gate stayed shut.
+TEST(DrainExitNeverLowersTarget) {
+  PudicaRtpRateCtrl c;
+  int64_t now = 100000;
+  // Enter drain while the link is still healthy, so DRAIN's own averaged recv
+  // keeps committed well above what recv reads later (the real run: DRAIN held
+  // 8.20 Mbps built from a recv average, then exit saw an instantaneous 1.85).
+  for (int i = 0; i < 3; ++i) {
+    now += 33000;
+    c.Update(MakeIn(4.0, 3.0, 20'000'000, now, now, 2'000));
+  }
+  int64_t drained = c.committed_bps;
+  printf("  after drain: committed=%.2f Mbps\n", drained / 1e6);
+  // Queue clears, but recv is still the outage average and reads BELOW it.
+  now += 33000;
+  auto o = c.Update(MakeIn(0.21, 0.3, 1'850'000, now, now));
+  printf("  drain exit: mode=%s committed=%.2f (recv was 1.85)\n",
+         o.mode, o.committed_bps / 1e6);
+  EXPECT_STREQ(o.mode, "PUD-RESTORE");
+  EXPECT_GE(o.committed_bps, drained);
+  // With the paper's literal rule the cut still happens.
+  PudicaRtpRateCtrl c2;
+  c2.cfg = c.cfg;
+  c2.cfg.restore_no_lower = false;
+  now = 100000;
+  for (int i = 0; i < 3; ++i) {
+    now += 33000;
+    c2.Update(MakeIn(4.0, 3.0, 20'000'000, now, now, 2'000));
+  }
+  int64_t drained2 = c2.committed_bps;
+  now += 33000;
+  auto o2 = c2.Update(MakeIn(0.21, 0.3, 1'850'000, now, now));
+  printf("  literal rule: committed=%.2f (was %.2f)\n",
+         o2.committed_bps / 1e6, drained2 / 1e6);
+  EXPECT_NEAR(o2.committed_bps / 1e6, 1.85, 0.01);
+}
+
 // Three consecutive BUR>1 enters Eq.11 drain.
 TEST(DrainOnThreeConsecutive) {
   PudicaRtpRateCtrl c;
@@ -309,6 +355,10 @@ TEST(DrainOnThreeConsecutive) {
 // MI waits until a frame sent at/after the decision now.
 TEST(MiWaitsForFeedback) {
   PudicaRtpRateCtrl c;
+  // [A32] Subject is the branch, not the delivered-rate ceiling: these
+  // cases drive B deliberately above recv, which the ceiling exists to
+  // stop. AckCeilingBoundsMi covers the ceiling itself.
+  c.cfg.ack_ceil_k = 0.0;
   c.committed_bps = 10'000'000;
   auto o1 = c.Update(MakeIn(0.2, 0.2, 8'000'000, 100000, 50000));
   int64_t after_mi = o1.target_bps;
@@ -327,6 +377,10 @@ TEST(MiWaitsForFeedback) {
 // HOLD / AI-MD must not snap B to recv_rate.
 TEST(AimdDoesNotSnapToRecv) {
   PudicaRtpRateCtrl c;
+  // [A32] Subject is the branch, not the delivered-rate ceiling: these
+  // cases drive B deliberately above recv, which the ceiling exists to
+  // stop. AckCeilingBoundsMi covers the ceiling itself.
+  c.cfg.ack_ceil_k = 0.0;
   c.committed_bps = 35'000'000;
   auto o = c.Update(MakeIn(0.95, 0.90, 12'000'000, 200000, 200000));
   printf("  AI-MD: mode=%s target=%.2f recv=12\n", o.mode, o.target_bps / 1e6);
@@ -350,6 +404,10 @@ TEST(Eq6WeightsPreferRecent) {
 // keeps committed B. (Coordinator skip is the other half; here recv=committed.)
 TEST(LowRecvDoesNotCollapseCommitted) {
   PudicaRtpRateCtrl c;
+  // [A32] Subject is the branch, not the delivered-rate ceiling: these
+  // cases drive B deliberately above recv, which the ceiling exists to
+  // stop. AckCeilingBoundsMi covers the ceiling itself.
+  c.cfg.ack_ceil_k = 0.0;
   c.committed_bps = 40'000'000;
   auto o = c.Update(MakeIn(0.27, 0.27, 2'000'000, 200000, 200000));
   printf("  recv glitch 2 Mbps, BUR low: mode=%s target=%.2f\n", o.mode,
@@ -360,6 +418,10 @@ TEST(LowRecvDoesNotCollapseCommitted) {
 // Application cap: default 100 Mbps. MI from 90 would be ~155 without clamp.
 TEST(AppCap100Mbps) {
   PudicaRtpRateCtrl c;
+  // [A32] Subject is the branch, not the delivered-rate ceiling: these
+  // cases drive B deliberately above recv, which the ceiling exists to
+  // stop. AckCeilingBoundsMi covers the ceiling itself.
+  c.cfg.ack_ceil_k = 0.0;
   EXPECT_NEAR(c.cfg.max_rate_bps / 1e6, 100.0, 0.01);
   c.committed_bps = 90'000'000;
   auto o = c.Update(MakeIn(0.27, 0.27, 50'000'000, 200000, 200000));
@@ -375,6 +437,165 @@ TEST(AppCap100Mbps) {
   }
   printf("  after more MI: target=%.2f\n", o.target_bps / 1e6);
   EXPECT_LE(o.target_bps, 100'000'000);
+}
+
+// [A32] The delivered-rate ceiling is the only bound MI has now that the two
+// realisation gates are gone. Three properties, in the order they matter:
+//   1. it bounds the level      -- B never exceeds k x max(recv) over the window
+//   2. it does not deadlock     -- recv rises => the ceiling rises, so B follows
+//   3. it survives a glitch     -- one low recv frame inside the window does not
+//                                  pull the ceiling down, because it is a MAX
+TEST(AckCeilingBoundsMi) {
+  PudicaRtpRateCtrl c;
+  // [A36] Subject is the multiplicative ceiling; the shipped 2 Mbps
+  // additive headroom would mask it at these rates.
+  c.cfg.ack_ceil_headroom_mbps = 0.0;
+  EXPECT_NEAR(c.cfg.ack_ceil_k, 1.5, 1e-9);
+  c.committed_bps = 8'000'000;
+  int64_t now = 100000;
+  // 1. Six MI steps at a steady 8 Mbps recv. Unbounded MI multiplies by
+  //    (1 + xi) every step; the ceiling pins it at 1.5 x 8 = 12.
+  PudicaRtpRateCtrl::Output o;
+  for (int i = 0; i < 6; ++i) {
+    now += 33000;
+    o = c.Update(MakeIn(0.27, 0.27, 8'000'000, now, now));
+  }
+  printf("  6 MI steps at recv=8: mode=%s target=%.2f (ceil=%.2f)\n", o.mode,
+         o.target_bps / 1e6, o.ack_ceil_bps / 1e6);
+  EXPECT_NEAR(o.target_bps / 1e6, 12.0, 0.01);
+  EXPECT_NEAR(o.ack_ceil_bps / 1e6, 12.0, 0.01);
+
+  // 2. recv steps up to 40 Mbps: the ceiling must open, not hold.
+  for (int i = 0; i < 6; ++i) {
+    now += 33000;
+    o = c.Update(MakeIn(0.27, 0.27, 40'000'000, now, now));
+  }
+  printf("  recv steps to 40: target=%.2f (ceil=%.2f)\n", o.target_bps / 1e6,
+         o.ack_ceil_bps / 1e6);
+  EXPECT_NEAR(o.ack_ceil_bps / 1e6, 60.0, 0.01);
+  EXPECT_GT(o.target_bps, 12'000'000);
+
+  // 3. One 2 Mbps glitch frame inside the 500 ms window leaves the max, and
+  //    therefore the ceiling, where it was.
+  now += 33000;
+  o = c.Update(MakeIn(0.27, 0.27, 2'000'000, now, now));
+  printf("  after 2 Mbps glitch: ceil=%.2f\n", o.ack_ceil_bps / 1e6);
+  EXPECT_NEAR(o.ack_ceil_bps / 1e6, 60.0, 0.01);
+
+  // 4. [A33] A blackout long enough to age the window out drops the CEILING,
+  //    but must not drop B: lowering is DRAIN/fallback/next-delay's job, and
+  //    they read the queue instead of the delivered rate.
+  now += 600000;
+  o = c.Update(MakeIn(0.27, 0.27, 2'000'000, now, now));
+  printf("  after 600 ms blackout: ceil=%.2f target=%.2f\n",
+         o.ack_ceil_bps / 1e6, o.target_bps / 1e6);
+  EXPECT_NEAR(o.ack_ceil_bps / 1e6, 3.0, 0.01);
+  EXPECT_NEAR(o.target_bps / 1e6, 60.0, 0.01);
+}
+
+// [A33] The defect the increase-only rule exists to remove, reproduced from
+// run 1789032702 t=21-24 s: an empty queue (BUR ~ 0.03), a wide-open link, and
+// an encoder realising ~54% of its target. Under the two-sided ceiling that is
+// a loop gain of 1.5 x 0.54 = 0.81, and committed fell 2.50 -> 1.18 Mbps with
+// MI firing the whole way.
+TEST(AckCeilingDoesNotRatchetDown) {
+  PudicaRtpRateCtrl c;
+  // [A36] Subject is the multiplicative ceiling; the shipped 2 Mbps
+  // additive headroom would mask it at these rates.
+  c.cfg.ack_ceil_headroom_mbps = 0.0;
+  c.committed_bps = 2'500'000;
+  int64_t now = 100000;
+  PudicaRtpRateCtrl::Output o;
+  double low = 1e18;
+  for (int i = 0; i < 30; ++i) {
+    now += 33000;
+    // recv = 54% of the committed rate, the measured realisation.
+    int64_t recv = static_cast<int64_t>(0.54 * c.committed_bps);
+    o = c.Update(MakeIn(0.03, 0.03, recv, now, now));
+    low = std::min(low, o.target_bps / 1e6);
+  }
+  printf("  30 frames at realisation 0.54: target=%.2f (min seen %.2f)\n",
+         o.target_bps / 1e6, low);
+  // The ceiling may refuse to let B grow -- that is its job -- but it must
+  // never have pushed B below where it started.
+  EXPECT_GE(low, 2.49);
+}
+
+// [A39] Reproduced from run 1789042110 t=27.14-27.98 s. Right after a
+// blackout the ack window holds 1-13 samples over 0-5 ms, the measured recv is
+// 0, and the caller hands the controller committed_bps in its place. The
+// ceiling must not take that for a delivered rate: fed its own output it is
+// 1.5 x committed + headroom, and MI compounded 1.5x per step to the 100 Mbps
+// cap (7.73 -> 13.59 -> 22.39 -> 35.58 -> 55.37 -> 85.06 -> 100).
+TEST(AckCeilingIgnoresCommittedFallback) {
+  PudicaRtpRateCtrl c;
+  // [A36] Subject is the multiplicative ceiling; the shipped 2 Mbps
+  // additive headroom would mask it at these rates.
+  c.cfg.ack_ceil_headroom_mbps = 0.0;
+  c.committed_bps = 3'620'000;
+  int64_t now = 100000;
+  // One measured frame (the RESTORE at 27.14 s read recv = 3.62).
+  PudicaRtpRateCtrl::Output o = c.Update(MakeIn(0.03, 0.08, 3'620'000, now, now));
+  // Then eight MI decisions ~125 ms apart with nothing measured, filled the way
+  // rtp_sctp_coordinator.cc fills them.
+  for (int i = 0; i < 8; ++i) {
+    now += 125000;
+    PudicaRtpRateCtrl::Input in =
+        MakeIn(0.06, 0.08, c.committed_bps, now, now);
+    in.ack_recv_bps = 0;
+    o = c.Update(in);
+  }
+  printf("  8 MI steps on recv=0: mode=%s target=%.2f (ceil=%.2f)\n", o.mode,
+         o.target_bps / 1e6, o.ack_ceil_bps / 1e6);
+  // Bounded by the one delivered rate it has seen, 1.5 x 3.62 = 5.43.
+  EXPECT_LE(o.target_bps, 5'430'001);
+}
+
+// [A41] Steady window of run 1789041793 (38-42 s): D - D_min p50 26 ms, span
+// 14 ms against an Eq.2 span of 9.7 ms. The tail queued 12 ms, so the
+// bottleneck was the slower of the two and Eq.1 applies whole: 0.78, where
+// A10's (D - span - D_min) / L reads 0.36. Measured utilisation was 0.76.
+TEST(UtilBurIsEq1WhenTheTailQueued) {
+  const double L = 33333.0;
+  double r = webrtc::PudicaUtilBur(/*D=*/126000, /*d_min=*/100000,
+                                   /*span=*/14000, /*intended=*/9700, L);
+  printf("  util BUR=%.3f (A10 would read %.3f)\n", r, (26000.0 - 14000.0) / L);
+  EXPECT_NEAR(r, 26000.0 / L, 1e-9);
+}
+
+// [A41] An emission-limited frame: the tail arrived within the send-side
+// timestamp resolution of its send, so the bottleneck kept up and D - D_min
+// is the pacer's own span. Only the part beyond Eq.2's L/rho is removed --
+// the rest is what Eq.2 asked for and belongs in Eq.1.
+TEST(UtilBurRemovesOnlyThePacerOverrun) {
+  const double L = 33333.0;
+  double r = webrtc::PudicaUtilBur(/*D=*/120500, /*d_min=*/100000,
+                                   /*span=*/20000, /*intended=*/6000, L);
+  printf("  util BUR=%.3f (Eq.1 alone would read %.3f)\n", r, 20500.0 / L);
+  EXPECT_NEAR(r, (20500.0 - 14000.0) / L, 1e-9);
+}
+
+// [A41] The post-DRAIN jump, reduced to Eq.6. Link C = 34 Mbps, committed
+// B = 50, and the encoder in its VBV deficit producing a tenth of that. Each
+// frame reads its true utilisation b_k / C. With B_k = the target (what the
+// history stored before) R~ is the tiny b/C and MI fires; with B_k = the
+// frame's realised bitrate, B/B_k puts every sample back at the current rate
+// and R~ = B/C = 1.47 -- above alpha, so AI-MD, as the link is overloaded at B.
+TEST(Eq6WithRealisedBitrateReadsBOverC) {
+  const double C = 34e6, B = 50e6;
+  std::deque<PudicaBurSampleEq6> as_target, as_realised;
+  for (int i = 0; i < 6; ++i) {
+    const double b_k = 0.1 * B * (0.8 + 0.08 * i);  // 4.0-6.0 Mbps frames
+    const int64_t t = 30000 * i;
+    as_target.push_back({t, b_k / C, B});
+    as_realised.push_back({t, b_k / C, b_k});
+  }
+  double old_r = PudicaSmoothBurEq6(as_target, B, 150000, 200000);
+  double new_r = PudicaSmoothBurEq6(as_realised, B, 150000, 200000);
+  printf("  R~ with B_k=target %.3f, with B_k=realised %.3f (B/C=%.3f)\n",
+         old_r, new_r, B / C);
+  EXPECT_LT(old_r, 0.85);
+  EXPECT_NEAR(new_r, B / C, 1e-6);
 }
 
 int main() {

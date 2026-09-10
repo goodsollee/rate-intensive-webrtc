@@ -412,6 +412,23 @@ class PduSetInfoExtension {
                     const PduSetInfo& pdu_set_info);
 };
 
+// [Gecko S1] One octet; low 2 bits = the sender's answer to a Gecko alert
+// (0 none, 1 no-flush, 2 flush). Reserved on every video packet (so the
+// per-packet layout is constant) and rewritten in place per frame.
+class GeckoFlagExtension {
+ public:
+  using value_type = uint8_t;
+  static constexpr RTPExtensionType kId = kRtpExtensionGeckoFlag;
+  static constexpr uint8_t kValueSizeBytes = 1;
+  static constexpr absl::string_view Uri() {
+    return RtpExtension::kGeckoFlagUri;
+  }
+
+  static bool Parse(rtc::ArrayView<const uint8_t> data, uint8_t* flag);
+  static size_t ValueSize(uint8_t /*flag*/) { return kValueSizeBytes; }
+  static bool Write(rtc::ArrayView<uint8_t> data, uint8_t flag);
+};
+
 class VideoFrameTrackingIdExtension {
  public:
   using value_type = uint16_t;

@@ -887,6 +887,9 @@ WebRtcVideoEngine::GetRtpHeaderExtensions() const {
         // is offered with extension ID 7; on-path network elements
         // (emulator/BPF) identify it by that fixed numeric ID on the wire.
         webrtc::RtpExtension::kPduSetInfoUri,
+        // [Gecko S1] position 8 -> extension ID 8, likewise read by numeric
+        // id on the wire (emulator GECKO_EXT_ID). Shifts the ids below by one.
+        webrtc::RtpExtension::kGeckoFlagUri,
         webrtc::RtpExtension::kVideoTimingUri,
         webrtc::RtpExtension::kColorSpaceUri, webrtc::RtpExtension::kMidUri,
         webrtc::RtpExtension::kRidUri, webrtc::RtpExtension::kRepairedRidUri}) {

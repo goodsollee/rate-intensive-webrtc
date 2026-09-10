@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -291,17 +292,59 @@ class PacingController {
   // Activated by RtpSctpCoordinator when COORDINATOR_MODE=pudica.
   static bool pudica_probing_enabled_;
   static int pudica_num_probes_;
-  static double pudica_rho_override_;
+  // [A25] Eq.2 adaptive pacing. `pudica_bur_` is the live BUR (R) the
+  // controller last measured; PudicaRho() turns it into ρ. Atomic because it
+  // is written from the feedback thread and read from the pacer thread.
+  static std::atomic<double> pudica_bur_;
+  static bool pudica_intra_frame_pacing_;
+  // [A28] Set once when COORDINATOR_MODE=pudica. Gates the next-delay ledger
+  // only. Deliberately NOT pudica_probing_enabled_ or
+  // pudica_intra_frame_pacing_: both are independently switchable arms, and
+  // next delay must survive PUDICA_PROBING=0 and
+  // PUDICA_INTRA_FRAME_PACING=0 alike.
+  static bool pudica_mode_;
+  // Media rate for the frame currently being spread (zero = not in a frame).
+  DataRate pudica_frame_rate_ = DataRate::Zero();
   int pudica_probes_remaining_ = 0;
   Timestamp pudica_frame_end_time_ = Timestamp::MinusInfinity();
   Timestamp pudica_next_probe_time_ = Timestamp::MinusInfinity();
   TimeDelta pudica_probe_interval_ = TimeDelta::Zero();
   Timestamp pudica_gap_end_time_ = Timestamp::MinusInfinity();  // ρ-based video hold
   Timestamp pudica_frame_send_start_ = Timestamp::MinusInfinity();  // first video pkt of frame
+  // [A25] How many frames overran L and had their Eq.2 rate discarded, i.e.
+  // how often `packet_size + QueueSizeData()` under-measured the frame.
+  int pudica_frame_deadline_hits_ = 0;
 
  public:
   static void SetPudicaProbing(bool enabled, int num_probes = 4);
-  static void SetPudicaRho(double rho);
+  // [A27] PUDICA_RHO, or 0 when unset/empty. Values <= 1 are not a pin.
+  static double PudicaRhoOverride();
+  // [A25] Eq.2: publish the BUR the pacing multiplier is derived from. Called
+  // once per frame from RtpSctpCoordinator::PudicaUpdateRtpTarget(), which is
+  // the only place a BUR exists. A no-op path (never called) leaves ρ at its
+  // static default, so this cannot break a non-Pudica run.
+  static void SetPudicaBur(double bur);
+  // [A25] ρ = γ_ρ / min(R, 1)  (Pudica NSDI'24 Eq.2, γ_ρ = 1.25).
+  // Exposed so the frame-spread span, the inter-frame gap and the probe
+  // spacing all read the SAME ρ; they were three literal 2.0s before.
+  static double PudicaRho();
+  // [A41] Whether Eq.2 spreads each frame over L/ρ -- i.e. whether L/ρ is a
+  // span the pacer was asked to honour. The utilisation BUR needs it to tell
+  // the pacer's own overrun apart from the bottleneck's serialisation.
+  static bool PudicaIntraFramePacing() { return pudica_intra_frame_pacing_; }
+  // [A28] §4.3 next delay. The ledger of frames that are fully sent but whose
+  // feedback has not come back yet. Recorded here rather than in the
+  // coordinator because the send instant is only known at the pacer, and the
+  // whole point of the signal is that it is measured on the SENDER's clock --
+  // it must keep working when the link stops returning anything.
+  static void PudicaRecordFrameSent(int64_t send_us);
+  // [A28] Enables the next-delay ledger. Called once at Pudica init.
+  static void SetPudicaMode(bool enabled);
+  // Send time of the earliest still-unacknowledged frame ("the next
+  // to-be-received frame"), or 0 when nothing is outstanding. Pops everything
+  // at or below `acked_through_us` first, so the caller's watermark is what
+  // defines "acknowledged".
+  static int64_t PudicaOldestUnackedSendUs(int64_t acked_through_us);
   // Pudica probe packets use this cluster ID for identification in TWCC
   // feedback. NOTE: GoogCC does NOT ignore negative ids on its own -- it tests
   // != kNotAProbe (-1). goog_cc_network_control.cc excludes this id explicitly;

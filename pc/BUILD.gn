@@ -2871,6 +2871,8 @@ rtc_library("compute_emulation") {
     "coordinator/compute_metrics_logger.h",
     "coordinator/emulated_compute_backend.h",
     "coordinator/query_tracker.h",
+    "coordinator/gecko_decider.h",
+    "coordinator/gecko_controller.h",
   ]
   deps = [
     "../rtc_base:logging",

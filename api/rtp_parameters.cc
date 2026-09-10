@@ -196,7 +196,8 @@ bool RtpExtension::IsSupportedForVideo(absl::string_view uri) {
          uri == webrtc::RtpExtension::kVideoLayersAllocationUri ||
          uri == webrtc::RtpExtension::kVideoFrameTrackingIdUri ||
          uri == webrtc::RtpExtension::kCorruptionDetectionUri ||
-         uri == webrtc::RtpExtension::kPduSetInfoUri;
+         uri == webrtc::RtpExtension::kPduSetInfoUri ||
+         uri == webrtc::RtpExtension::kGeckoFlagUri;
 }
 
 bool RtpExtension::IsEncryptionSupported(absl::string_view uri) {
