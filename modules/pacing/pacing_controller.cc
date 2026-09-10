@@ -14,6 +14,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -50,6 +52,13 @@ bool IsDisabled(const FieldTrialsView& field_trials, absl::string_view key) {
 
 bool IsEnabled(const FieldTrialsView& field_trials, absl::string_view key) {
   return absl::StartsWith(field_trials.Lookup(key), "Enabled");
+}
+
+bool PreserveQueuedFramesOnKeyframe() {
+  const char* value = std::getenv("KFT_NO_FRAME_DROP");
+  // Match the existing VideoStreamEncoder and VP8 no-frame-drop helpers.
+  return value && value[0] != '\0' &&
+         !(value[0] == '0' && value[1] == '\0');
 }
 
 }  // namespace
@@ -156,6 +165,7 @@ PacingController::PacingController(Clock* clock,
       keyframe_flushing_(
           configuration.keyframe_flushing ||
           IsEnabled(field_trials_, "WebRTC-Pacer-KeyframeFlushing")),
+      preserve_queued_frames_on_keyframe_(PreserveQueuedFramesOnKeyframe()),
       transport_overhead_per_packet_(DataSize::Zero()),
       send_burst_interval_(configuration.send_burst_interval),
       last_timestamp_(clock_->CurrentTime()),
@@ -286,11 +296,32 @@ void PacingController::EnqueuePacket(std::unique_ptr<RtpPacketToSend> packet) {
     // First packet of a keyframe (and no keyframe packets currently in the
     // queue). Flush any pending packets currently in the queue for that stream
     // in order to get the new keyframe out as quickly as possible.
-    packet_queue_.RemovePacketsForSsrc(packet->Ssrc());
-    std::optional<uint32_t> rtx_ssrc =
-        packet_sender_->GetRtxSsrcForMedia(packet->Ssrc());
-    if (rtx_ssrc) {
-      packet_queue_.RemovePacketsForSsrc(*rtx_ssrc);
+    if (preserve_queued_frames_on_keyframe_) {
+      // Keep ordinary queue priority/FIFO and debt; enqueue the new packet
+      // exactly once below. These are whole-queue counts before enqueue, not
+      // per-SSRC victims or successful-send receipts. Bound logging per pacer.
+      constexpr unsigned kReceiptLimit = 16;
+      if (keyframe_preserve_receipts_ < kReceiptLimit) {
+        ++keyframe_preserve_receipts_;
+        std::fprintf(stderr,
+                     "KFTF KF_FLUSH_BYPASS t_ms=%lld ssrc=%u rtp_ts=%u "
+                     "seq=%u queue_pkts_before=%d queue_payload_bytes_before=%lld "
+                     "receipt_n=%u receipt_limit=%u\n",
+                     static_cast<long long>(clock_->TimeInMilliseconds()),
+                     packet->Ssrc(), packet->Timestamp(),
+                     static_cast<unsigned>(packet->SequenceNumber()),
+                     packet_queue_.SizeInPackets(),
+                     static_cast<long long>(
+                         packet_queue_.SizeInPayloadBytes().bytes()),
+                     keyframe_preserve_receipts_, kReceiptLimit);
+      }
+    } else {
+      packet_queue_.RemovePacketsForSsrc(packet->Ssrc());
+      std::optional<uint32_t> rtx_ssrc =
+          packet_sender_->GetRtxSsrcForMedia(packet->Ssrc());
+      if (rtx_ssrc) {
+        packet_queue_.RemovePacketsForSsrc(*rtx_ssrc);
+      }
     }
   }
 

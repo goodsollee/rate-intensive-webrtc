@@ -18,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,27 @@ using ::webrtc::test::ExplicitKeyValueConfig;
 
 namespace webrtc {
 namespace {
+class ScopedNoFrameDropEnv {
+ public:
+  explicit ScopedNoFrameDropEnv(const char* value) {
+    if (const char* previous = std::getenv("KFT_NO_FRAME_DROP"))
+      previous_ = previous;
+    Set(value);
+  }
+  ~ScopedNoFrameDropEnv() {
+    Set(previous_ ? previous_->c_str() : nullptr);
+  }
+  static void Set(const char* value) {
+    if (value)
+      setenv("KFT_NO_FRAME_DROP", value, 1);
+    else
+      unsetenv("KFT_NO_FRAME_DROP");
+  }
+
+ private:
+  std::optional<std::string> previous_;
+};
+
 constexpr DataRate kFirstClusterRate = DataRate::KilobitsPerSec(900);
 constexpr DataRate kSecondClusterRate = DataRate::KilobitsPerSec(1800);
 
@@ -2512,6 +2534,7 @@ TEST_F(PacingControllerTest, DoesNotPadIfProcessThreadIsBorked) {
 }
 
 TEST_F(PacingControllerTest, FlushesPacketsOnKeyFrames) {
+  ScopedNoFrameDropEnv no_frame_drop(nullptr);
   const uint32_t kSsrc = 12345;
   const uint32_t kRtxSsrc = 12346;
 
@@ -2548,6 +2571,192 @@ TEST_F(PacingControllerTest, FlushesPacketsOnKeyFrames) {
                                     /*is_padding=*/false));
   AdvanceTimeUntil(pacer->NextSendTime());
   pacer->ProcessPackets();
+}
+
+class NoFrameDropKeyframeTest
+    : public PacingControllerTest,
+      public ::testing::WithParamInterface<const char*> {};
+
+TEST_P(NoFrameDropKeyframeTest, MatchesExistingNoFrameDropEnvironment) {
+  ScopedNoFrameDropEnv no_frame_drop(GetParam());
+  const bool preserve = GetParam() && GetParam()[0] != '\0' &&
+                        std::string(GetParam()) != "0";
+  constexpr uint32_t kSsrc = 12345;
+  constexpr uint32_t kRtxSsrc = 12346;
+  const test::ExplicitKeyValueConfig trials(
+      "WebRTC-Pacer-KeyframeFlushing/Enabled/");
+  PacingController::Configuration config;
+  config.drain_large_queues = false;
+  config.send_burst_interval = TimeDelta::Zero();
+  NiceMock<MockPacketSender> sender;
+  PacingController pacer(&clock_, &sender, trials, config);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  pacer.SetCongested(true);
+  if (preserve) {
+    EXPECT_CALL(sender, GetRtxSsrcForMedia(kSsrc)).Times(0);
+  } else {
+    EXPECT_CALL(sender, GetRtxSsrcForMedia(kSsrc)).WillOnce(Return(kRtxSsrc));
+  }
+  EXPECT_CALL(sender, OnAbortedRetransmissions(_, _)).Times(0);
+
+  std::vector<const RtpPacketToSend*> expected;
+  auto enqueue = [&](RtpPacketMediaType type, uint32_t ssrc, uint16_t seq,
+                     size_t bytes, bool kf, bool first) {
+    auto packet = BuildPacket(type, ssrc, seq, /*capture_time_ms=*/seq, bytes);
+    packet->set_is_key_frame(kf);
+    packet->set_first_packet_of_frame(first);
+    packet->SetTimestamp(9000 + seq);
+    const RtpPacketToSend* identity = packet.get();
+    pacer.EnqueuePacket(std::move(packet));
+    return identity;
+  };
+  auto* p1 = enqueue(RtpPacketMediaType::kVideo, kSsrc, 1, 100, false, true);
+  auto* rtx = enqueue(RtpPacketMediaType::kRetransmission, kRtxSsrc, 10, 200,
+                      false, false);
+  auto* p2 = enqueue(RtpPacketMediaType::kVideo, kSsrc, 2, 300, false, true);
+  EXPECT_EQ(pacer.QueueSizePackets(), 3u);
+  const DataSize debt_before = pacer.CurrentBufferLevel();
+  auto* k1 = enqueue(RtpPacketMediaType::kVideo, kSsrc, 3, 400, true, true);
+  auto* k2 = enqueue(RtpPacketMediaType::kVideo, kSsrc, 4, 500, true, false);
+  auto* p3 = enqueue(RtpPacketMediaType::kVideo, kSsrc, 5, 600, false, true);
+  EXPECT_EQ(pacer.CurrentBufferLevel(), debt_before);
+  EXPECT_EQ(pacer.QueueSizePackets(), preserve ? 6u : 3u);
+  EXPECT_EQ(pacer.QueueSizeData(), DataSize::Bytes(preserve ? 2100 : 1500));
+  EXPECT_CALL(sender, SendPacket(_, _)).Times(0);
+  pacer.ProcessPackets();
+  EXPECT_EQ(pacer.QueueSizePackets(), preserve ? 6u : 3u);
+  ::testing::Mock::VerifyAndClearExpectations(&sender);
+
+  // Normal retransmission priority precedes video; video stays FIFO. Retaining
+  // packets must not become a global FIFO or a special keyframe-priority path.
+  expected = preserve ? std::vector<const RtpPacketToSend*>{rtx, p1, p2, k1, k2, p3}
+                      : std::vector<const RtpPacketToSend*>{k1, k2, p3};
+  size_t sent = 0;
+  size_t sent_bytes = 0;
+  EXPECT_CALL(sender, SendPacket(_, _)).Times(expected.size())
+      .WillRepeatedly([&](std::unique_ptr<RtpPacketToSend> packet,
+                         const PacedPacketInfo& info) {
+        ASSERT_LT(sent, expected.size());
+        EXPECT_EQ(packet.get(), expected[sent++]);
+        EXPECT_EQ(packet->Timestamp(), 9000u + packet->SequenceNumber());
+        EXPECT_EQ(info.probe_cluster_id, PacedPacketInfo::kNotAProbe);
+        sent_bytes += packet->payload_size();
+      });
+  pacer.SetCongested(false);
+  for (int i = 0; i < 20 && pacer.QueueSizePackets(); ++i) {
+    AdvanceTimeUntil(pacer.NextSendTime());
+    pacer.ProcessPackets();
+  }
+  EXPECT_EQ(sent, expected.size());
+  EXPECT_EQ(sent_bytes, preserve ? 2100u : 1500u);
+  EXPECT_EQ(pacer.QueueSizePackets(), 0u);
+  pacer.ProcessPackets();  // A second call cannot replay any original packet.
+}
+
+INSTANTIATE_TEST_SUITE_P(ExistingEnvironment,
+                        NoFrameDropKeyframeTest,
+                        ::testing::Values(nullptr, "0", "1", "", "true", "01", "2"));
+
+TEST_F(PacingControllerTest, NoFrameDropKeyframeSettingIsPerConstruction) {
+  ScopedNoFrameDropEnv no_frame_drop("1");
+  PacingController::Configuration config;
+  config.keyframe_flushing = true;
+  PacingController preserved(&clock_, &callback_, trials_, config);
+  ScopedNoFrameDropEnv::Set("0");
+  PacingController flushed(&clock_, &callback_, trials_, config);
+  ScopedNoFrameDropEnv::Set("1");
+  for (PacingController* pacer : {&preserved, &flushed}) {
+    pacer->SetPacingRates(kTargetRate, DataRate::Zero());
+    pacer->EnqueuePacket(video_.BuildNextPacket(100));
+    auto packet = video_.BuildNextPacket(200);
+    packet->set_is_key_frame(true);
+    packet->set_first_packet_of_frame(true);
+    pacer->EnqueuePacket(std::move(packet));
+  }
+  EXPECT_EQ(preserved.QueueSizePackets(), 2u);
+  EXPECT_EQ(flushed.QueueSizePackets(), 1u);
+}
+
+TEST_F(PacingControllerTest, NoFrameDropDoesNotBlockExplicitStreamRemoval) {
+  ScopedNoFrameDropEnv no_frame_drop("1");
+  PacingController pacer(&clock_, &callback_, trials_);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  pacer.EnqueuePacket(video_.BuildNextPacket(100));
+  pacer.EnqueuePacket(audio_.BuildNextPacket(200));
+  pacer.RemovePacketsForSsrc(kVideoSsrc);
+  EXPECT_EQ(pacer.QueueSizePackets(), 1u);
+  EXPECT_EQ(pacer.QueueSizeData(), DataSize::Bytes(200));
+}
+
+TEST_F(PacingControllerTest, NoFrameDropKeyframeTimingMatchesNoFlushControl) {
+  ScopedNoFrameDropEnv no_frame_drop("1");
+  auto run = [&](bool flushing) {
+    SimulatedClock clock(1000000);
+    NiceMock<MockPacketSender> sender;
+    PacingController::Configuration config;
+    config.keyframe_flushing = flushing;
+    config.send_burst_interval = TimeDelta::Zero();
+    config.drain_large_queues = false;
+    PacingController pacer(&clock, &sender, trials_, config);
+    pacer.SetPacingRates(DataRate::KilobitsPerSec(80), DataRate::Zero());
+    std::vector<std::array<int64_t, 4>> result;
+    EXPECT_CALL(sender, SendPacket(_, _)).Times(5)
+        .WillRepeatedly([&](std::unique_ptr<RtpPacketToSend> packet,
+                           const PacedPacketInfo&) {
+          result.push_back({clock.CurrentTime().us(), packet->Ssrc(),
+                            packet->SequenceNumber(),
+                            static_cast<int64_t>(packet->payload_size())});
+        });
+    for (uint16_t seq = 1; seq <= 5; ++seq) {
+      const bool rtx = seq == 2;
+      auto packet = BuildPacket(rtx ? RtpPacketMediaType::kRetransmission
+                                    : RtpPacketMediaType::kVideo,
+                                rtx ? 456 : 123, seq, seq, 100 * seq);
+      packet->set_is_key_frame(seq == 3 || seq == 4);
+      packet->set_first_packet_of_frame(seq == 3);
+      pacer.EnqueuePacket(std::move(packet));
+    }
+    for (int i = 0; i < 20 && pacer.QueueSizePackets(); ++i) {
+      clock.AdvanceTime(std::max(TimeDelta::Zero(),
+                                pacer.NextSendTime() - clock.CurrentTime()));
+      pacer.ProcessPackets();
+    }
+    EXPECT_EQ(pacer.QueueSizePackets(), 0u);
+    result.push_back({pacer.CurrentBufferLevel().bytes(),
+                      pacer.NextSendTime().us(), 0, 0});
+    return result;
+  };
+  const auto control = run(false);
+  const auto preserved = run(true);
+  EXPECT_EQ(preserved, control);
+}
+
+TEST_F(PacingControllerTest, NoFrameDropKeyframeReceiptsAreBounded) {
+  ScopedNoFrameDropEnv no_frame_drop("1");
+  PacingController::Configuration config;
+  config.keyframe_flushing = true;
+  PacingController pacer(&clock_, &callback_, trials_, config);
+  pacer.SetPacingRates(kTargetRate, DataRate::Zero());
+  ::testing::internal::CaptureStderr();
+  for (int i = 0; i < 20; ++i) {
+    auto packet = video_.BuildNextPacket(100);
+    packet->set_is_key_frame(true);
+    packet->set_first_packet_of_frame(true);
+    pacer.EnqueuePacket(std::move(packet));
+    EXPECT_EQ(pacer.QueueSizePackets(), 1u);
+    AdvanceTimeUntil(pacer.NextSendTime());
+    pacer.ProcessPackets();
+    EXPECT_EQ(pacer.QueueSizePackets(), 0u);
+  }
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  size_t count = 0;
+  for (size_t pos = 0;
+       (pos = log.find("KFTF KF_FLUSH_BYPASS ", pos)) != std::string::npos;
+       ++pos)
+    ++count;
+  EXPECT_EQ(count, 16u);
+  EXPECT_NE(log.find("receipt_n=16 receipt_limit=16"), std::string::npos);
+  EXPECT_EQ(log.find("receipt_n=17"), std::string::npos);
 }
 
 TEST_F(PacingControllerTest, CanControlQueueSizeUsingTtl) {

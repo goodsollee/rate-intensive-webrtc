@@ -247,6 +247,10 @@ class PacingController {
   const bool ignore_transport_overhead_;
   const bool fast_retransmissions_;
   const bool keyframe_flushing_;
+  // Sample once per pacer, using the existing no-frame-drop env semantics:
+  // nonempty except exact "0". Explicit SSRC removal/TTL are unchanged.
+  const bool preserve_queued_frames_on_keyframe_;
+  unsigned keyframe_preserve_receipts_ = 0;
   DataRate max_rate = DataRate::BitsPerSec(100'000'000);
   DataSize transport_overhead_per_packet_;
   TimeDelta send_burst_interval_;
