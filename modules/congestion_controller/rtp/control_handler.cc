@@ -11,6 +11,7 @@
 #include "modules/congestion_controller/rtp/control_handler.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "api/units/data_rate.h"
@@ -25,6 +26,8 @@ void CongestionControlHandler::SetTargetRate(
     TargetTransferRate new_target_rate) {
   RTC_DCHECK_RUN_ON(&sequenced_checker_);
   RTC_CHECK(new_target_rate.at_time.IsFinite());
+  if (!std::isfinite(new_target_rate.is_overused_for_encoder))
+    new_target_rate.is_overused_for_encoder = 1.0;
   last_incoming_ = new_target_rate;
 }
 
@@ -58,6 +61,8 @@ std::optional<TargetTransferRate> CongestionControlHandler::GetUpdate() {
       (!new_outgoing.target_rate.IsZero() &&
        (last_reported_->network_estimate.loss_rate_ratio !=
             new_outgoing.network_estimate.loss_rate_ratio ||
+        last_reported_->is_overused_for_encoder !=
+            new_outgoing.is_overused_for_encoder ||
         last_reported_->network_estimate.round_trip_time !=
             new_outgoing.network_estimate.round_trip_time))) {
     if (encoder_paused_in_last_report_ != pause_encoding)

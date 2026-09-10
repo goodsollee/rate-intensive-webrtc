@@ -359,9 +359,6 @@ class VideoStreamEncoder : public VideoStreamEncoderInterface,
   // trusted rate controller. This is determined on a per-frame basis, as the
   // encoder behavior might dynamically change.
   bool force_disable_frame_dropper_ RTC_GUARDED_BY(encoder_queue_) = false;
-  // [MAE] Latest ungated delay-trend ratio from the congestion controller.
-  // 1.0 means "no congestion signal"; the encoder tightens its VBV above that.
-  double last_is_overused_for_encoder_ RTC_GUARDED_BY(encoder_queue_) = 1.0;
   // Incremented on worker thread whenever `frame_dropper_` determines that a
   // frame should be dropped. Decremented on whichever thread runs
   // OnEncodedImage(), which is only called by one thread but not necessarily

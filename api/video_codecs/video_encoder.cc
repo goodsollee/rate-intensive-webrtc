@@ -298,8 +298,10 @@ VideoEncoder::RateControlParameters::RateControlParameters(
 
 bool VideoEncoder::RateControlParameters::operator==(
     const VideoEncoder::RateControlParameters& rhs) const {
-  return std::tie(bitrate, framerate_fps, bandwidth_allocation) ==
-         std::tie(rhs.bitrate, rhs.framerate_fps, rhs.bandwidth_allocation);
+  return std::tie(bitrate, framerate_fps, bandwidth_allocation,
+                  is_overused_for_encoder) ==
+         std::tie(rhs.bitrate, rhs.framerate_fps, rhs.bandwidth_allocation,
+                  rhs.is_overused_for_encoder);
 }
 
 bool VideoEncoder::RateControlParameters::operator!=(

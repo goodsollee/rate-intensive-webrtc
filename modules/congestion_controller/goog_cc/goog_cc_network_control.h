@@ -76,11 +76,15 @@ class GoogCcNetworkController : public NetworkControllerInterface {
 
  private:
   friend class GoogCcStatePrinter;
+  friend class GoogCcNetworkControllerTestPeer;
   std::vector<ProbeClusterConfig> ResetConstraints(
       TargetRateConstraints new_constraints);
   void ClampConstraints();
   void MaybeTriggerOnNetworkChanged(NetworkControlUpdate* update,
                                     Timestamp at_time);
+  void MaybeTriggerOnEncoderSignalChanged(NetworkControlUpdate* update,
+                                         Timestamp at_time,
+                                         double encoder_signal);
   // [L4Span L3, J-137/J-138] GCC + CE brake. Reads the per-packet ECN carried
   // by RFC 8888 CCFB feedback and, once per RTT window that saw any CE, caps
   // the send target at target*(1 - alpha/2); a CE-free window releases the cap.
@@ -151,6 +155,8 @@ class GoogCcNetworkController : public NetworkControllerInterface {
 
   std::optional<uint8_t> last_estimated_fraction_loss_ = 0;
   TimeDelta last_estimated_round_trip_time_ = TimeDelta::PlusInfinity();
+  double last_encoder_signal_ = 1.0;
+  std::optional<TargetTransferRate> last_target_rate_message_;
 
   double pacing_factor_;
   DataRate min_total_allocated_bitrate_;

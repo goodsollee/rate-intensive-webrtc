@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -32,6 +33,7 @@
 #include "api/units/timestamp.h"
 #include "call/video_receive_stream.h"
 #include "logging/rtc_event_log/mock/mock_rtc_event_log.h"
+#include "modules/congestion_controller/goog_cc/goog_cc_network_control.h"
 #include "test/field_trial.h"
 #include "test/gtest.h"
 #include "test/scenario/call_client.h"
@@ -43,6 +45,35 @@ using ::testing::IsEmpty;
 using ::testing::NiceMock;
 
 namespace webrtc {
+// Supply a detector sample while keeping the actual BWE state fixed. This
+// exercises the production emission/dedup path without changing the estimator.
+class GoogCcNetworkControllerTestPeer {
+ public:
+  static NetworkControlUpdate EncoderSignal(GoogCcNetworkController& controller,
+                                           Timestamp at_time,
+                                           double signal) {
+    NetworkControlUpdate update;
+    controller.MaybeTriggerOnEncoderSignalChanged(&update, at_time, signal);
+    return update;
+  }
+  static void FillCongestionWindow(GoogCcNetworkController& controller) {
+    ASSERT_TRUE(controller.congestion_window_pushback_controller_);
+    controller.congestion_window_pushback_controller_->SetDataWindow(
+        DataSize::Bytes(10000));
+    controller.congestion_window_pushback_controller_->UpdateOutstandingData(
+        20000);
+  }
+  static NetworkControlUpdate NetworkChange(GoogCcNetworkController& controller,
+                                           Timestamp at_time) {
+    NetworkControlUpdate update;
+    controller.MaybeTriggerOnNetworkChanged(&update, at_time);
+    return update;
+  }
+  static double DetectorSignal(const GoogCcNetworkController& controller) {
+    return controller.delay_based_bwe_->aggressive_state();
+  }
+};
+
 namespace test {
 namespace {
 // Count dips from a constant high bandwidth level within a short window.
@@ -291,6 +322,154 @@ class NetworkControllerTestFixture {
   const Environment env_ = CreateEnvironment(&event_log_);
   GoogCcNetworkControllerFactory factory_;
 };
+
+TEST(GoogCcNetworkControllerTest, MaeOnlyRiseDuplicateAndFall) {
+  NetworkControllerConfig config(CreateEnvironment());
+  config.constraints.at_time = Timestamp::Millis(1000);
+  config.constraints.starting_rate = DataRate::KilobitsPerSec(300);
+  GoogCcNetworkController controller(config, GoogCcConfig());
+  const Timestamp now = Timestamp::Millis(1000);
+  auto initial = controller.OnProcessInterval({.at_time = now});
+  ASSERT_TRUE(initial.target_rate);
+  EXPECT_DOUBLE_EQ(initial.target_rate->is_overused_for_encoder, 1.0);
+  EXPECT_FALSE(GoogCcNetworkControllerTestPeer::EncoderSignal(controller, now,
+                                                            1.0).target_rate);
+  const auto baseline = *initial.target_rate;
+  for (double signal : {1.5, 1.75, 1.0}) {
+    auto update = GoogCcNetworkControllerTestPeer::EncoderSignal(controller, now,
+                                                               signal);
+    ASSERT_TRUE(update.target_rate);
+    EXPECT_DOUBLE_EQ(update.target_rate->is_overused_for_encoder, signal);
+    EXPECT_EQ(update.target_rate->target_rate, baseline.target_rate);
+    EXPECT_EQ(update.target_rate->stable_target_rate, baseline.stable_target_rate);
+    EXPECT_EQ(update.target_rate->network_estimate.loss_rate_ratio,
+              baseline.network_estimate.loss_rate_ratio);
+    EXPECT_EQ(update.target_rate->network_estimate.round_trip_time,
+              baseline.network_estimate.round_trip_time);
+    EXPECT_DOUBLE_EQ(update.target_rate->cwnd_reduce_ratio,
+                     baseline.cwnd_reduce_ratio);
+    EXPECT_FALSE(update.pacer_config);
+    EXPECT_TRUE(update.probe_cluster_configs.empty());
+    EXPECT_DOUBLE_EQ(controller.GetNetworkState(now)
+                         .target_rate->is_overused_for_encoder,
+                     signal);
+    EXPECT_FALSE(GoogCcNetworkControllerTestPeer::EncoderSignal(controller, now,
+                                                              signal).target_rate);
+  }
+}
+
+TEST(GoogCcNetworkControllerTest, MaeNonfiniteReturnsToNeutralOnce) {
+  NetworkControllerConfig config(CreateEnvironment());
+  config.constraints.at_time = Timestamp::Millis(1000);
+  config.constraints.starting_rate = DataRate::KilobitsPerSec(300);
+  GoogCcNetworkController controller(config, GoogCcConfig());
+  const Timestamp now = Timestamp::Millis(1000);
+  controller.OnProcessInterval({.at_time = now});
+  for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity(),
+                         -std::numeric_limits<double>::infinity()}) {
+    ASSERT_TRUE(GoogCcNetworkControllerTestPeer::EncoderSignal(controller, now,
+                                                            1.5).target_rate);
+    auto update = GoogCcNetworkControllerTestPeer::EncoderSignal(controller, now,
+                                                               invalid);
+    ASSERT_TRUE(update.target_rate);
+    EXPECT_DOUBLE_EQ(update.target_rate->is_overused_for_encoder, 1.0);
+    EXPECT_FALSE(update.pacer_config);
+    EXPECT_TRUE(update.probe_cluster_configs.empty());
+    EXPECT_FALSE(GoogCcNetworkControllerTestPeer::EncoderSignal(controller, now,
+                                                              invalid).target_rate);
+    EXPECT_DOUBLE_EQ(controller.GetNetworkState(now)
+                         .target_rate->is_overused_for_encoder,
+                     1.0);
+  }
+}
+
+TEST(GoogCcNetworkControllerTest, MaeOnlyDoesNotAdvanceCongestionWindowPushback) {
+  for (const char* trial : {
+           "WebRTC-CongestionWindow/QueueSize:800,MinBitrate:30000/",
+           "WebRTC-CongestionWindow/QueueSize:800,MinBitrate:30000,DropFrame:true/"}) {
+    ScopedFieldTrials trials(trial);
+    NetworkControllerConfig config(CreateEnvironment());
+    const Timestamp now = Timestamp::Millis(1000);
+    config.constraints.at_time = now;
+    config.constraints.starting_rate = DataRate::KilobitsPerSec(300);
+    GoogCcNetworkController control(config, GoogCcConfig());
+    GoogCcNetworkController changed(config, GoogCcConfig());
+    control.OnProcessInterval({.at_time = now});
+    changed.OnProcessInterval({.at_time = now});
+    GoogCcNetworkControllerTestPeer::FillCongestionWindow(control);
+    GoogCcNetworkControllerTestPeer::FillCongestionWindow(changed);
+    auto baseline = GoogCcNetworkControllerTestPeer::NetworkChange(control, now);
+    auto same = GoogCcNetworkControllerTestPeer::NetworkChange(changed, now);
+    ASSERT_TRUE(baseline.target_rate);
+    ASSERT_TRUE(same.target_rate);
+    for (double signal : {1.5, 1.75, 1.0}) {
+      auto edge = GoogCcNetworkControllerTestPeer::EncoderSignal(changed, now,
+                                                               signal);
+      ASSERT_TRUE(edge.target_rate);
+      EXPECT_EQ(edge.target_rate->target_rate, baseline.target_rate->target_rate);
+      EXPECT_EQ(edge.target_rate->stable_target_rate,
+                baseline.target_rate->stable_target_rate);
+      EXPECT_DOUBLE_EQ(edge.target_rate->cwnd_reduce_ratio,
+                       baseline.target_rate->cwnd_reduce_ratio);
+      EXPECT_FALSE(edge.pacer_config);
+      EXPECT_TRUE(edge.probe_cluster_configs.empty());
+    }
+    // Hidden CWND ratio must still produce the same next regular update.
+    auto next_control = GoogCcNetworkControllerTestPeer::NetworkChange(control, now);
+    auto next_changed = GoogCcNetworkControllerTestPeer::NetworkChange(changed, now);
+    ASSERT_TRUE(next_control.target_rate);
+    ASSERT_TRUE(next_changed.target_rate);
+    EXPECT_EQ(next_control.target_rate->target_rate,
+              next_changed.target_rate->target_rate);
+    EXPECT_DOUBLE_EQ(next_control.target_rate->cwnd_reduce_ratio,
+                     next_changed.target_rate->cwnd_reduce_ratio);
+  }
+}
+
+TEST(GoogCcNetworkControllerTest, MaeTracksActualTransportFeedbackTrend) {
+  NetworkControllerConfig config(CreateEnvironment());
+  config.constraints.at_time = Timestamp::Millis(1000);
+  config.constraints.starting_rate = DataRate::KilobitsPerSec(300);
+  GoogCcNetworkController controller(config, GoogCcConfig());
+  controller.OnProcessInterval({.at_time = Timestamp::Millis(1000)});
+  double previous_signal = 1.0;
+  int rises = 0;
+  int returns_to_neutral = 0;
+  int signal_only_updates = 0;
+  for (int i = 0; i < 300; ++i) {
+    // Constant delay, then a growing queue, then a draining queue. All inputs
+    // are ordinary arrived transport packets; no detector/private state write.
+    const int delay_ms = i < 60 ? 20 : i < 160 ? 20 + 2 * (i - 60)
+                                             : std::max(20, 220 - 2 * (i - 160));
+    const Timestamp sent = Timestamp::Millis(1000 + i * 10);
+    const Timestamp received = sent + TimeDelta::Millis(delay_ms);
+    TransportPacketsFeedback feedback;
+    feedback.feedback_time = received + TimeDelta::Millis(10);
+    feedback.packet_feedbacks.push_back(
+        CreatePacketResult(received, sent, 1000, PacedPacketInfo()));
+    feedback.packet_feedbacks.back().sent_packet.sequence_number = i;
+    const auto update = controller.OnTransportPacketsFeedback(feedback);
+    const double signal = GoogCcNetworkControllerTestPeer::DetectorSignal(controller);
+    EXPECT_DOUBLE_EQ(controller.GetNetworkState(feedback.feedback_time)
+                         .target_rate->is_overused_for_encoder,
+                     signal);
+    if (signal != previous_signal) {
+      ASSERT_TRUE(update.target_rate);
+      EXPECT_DOUBLE_EQ(update.target_rate->is_overused_for_encoder, signal);
+      if (signal > 1.0 && previous_signal == 1.0)
+        ++rises;
+      if (signal == 1.0 && previous_signal > 1.0)
+        ++returns_to_neutral;
+      if (!update.pacer_config)
+        ++signal_only_updates;
+    }
+    previous_signal = signal;
+  }
+  EXPECT_GT(rises, 0);
+  EXPECT_GT(returns_to_neutral, 0);
+  EXPECT_GT(signal_only_updates, 0);
+}
 
 TEST(GoogCcNetworkControllerTest,
      InitializeTargetRateOnFirstProcessIntervalAfterNetworkAvailable) {

@@ -13,6 +13,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -582,6 +583,11 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
   if (result.updated) {
     // Update the estimate in the ProbeController, in case we want to probe.
     MaybeTriggerOnNetworkChanged(&update, report.feedback_time);
+  } else {
+    // A trend-only edge must not advance the stateful CWND pushback, ALR or
+    // probe controllers. Only copy the last published rate message.
+    MaybeTriggerOnEncoderSignalChanged(
+        &update, report.feedback_time, delay_based_bwe_->aggressive_state());
   }
 
   recovered_from_overuse = result.recovered_from_overuse;
@@ -643,6 +649,7 @@ NetworkControlUpdate GoogCcNetworkController::GetNetworkState(
 
   update.target_rate->at_time = at_time;
   update.target_rate->target_rate = last_pushback_target_rate_;
+  update.target_rate->is_overused_for_encoder = last_encoder_signal_;
   update.target_rate->stable_target_rate =
       bandwidth_estimation_->GetEstimatedLinkCapacity();
   update.pacer_config = GetPacingRates(at_time);
@@ -650,9 +657,29 @@ NetworkControlUpdate GoogCcNetworkController::GetNetworkState(
   return update;
 }
 
+void GoogCcNetworkController::MaybeTriggerOnEncoderSignalChanged(
+    NetworkControlUpdate* update,
+    Timestamp at_time,
+    double encoder_signal) {
+  encoder_signal = std::isfinite(encoder_signal) ? encoder_signal : 1.0;
+  if (!last_target_rate_message_ || encoder_signal == last_encoder_signal_)
+    return;
+  last_encoder_signal_ = encoder_signal;
+  auto message = *last_target_rate_message_;
+  message.at_time = at_time;
+  message.network_estimate.at_time = at_time;
+  message.network_estimate.bwe_period = delay_based_bwe_->GetExpectedBwePeriod();
+  message.is_overused_for_encoder = encoder_signal;
+  last_target_rate_message_ = message;
+  update->target_rate = message;
+}
+
 void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
     NetworkControlUpdate* update,
     Timestamp at_time) {
+  const double raw_encoder_signal = delay_based_bwe_->aggressive_state();
+  const double encoder_signal =
+      std::isfinite(raw_encoder_signal) ? raw_encoder_signal : 1.0;
   uint8_t fraction_loss = bandwidth_estimation_->fraction_loss();
   TimeDelta round_trip_time = bandwidth_estimation_->round_trip_time();
   DataRate loss_based_target_rate = bandwidth_estimation_->target_rate();
@@ -677,18 +704,21 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
       bandwidth_estimation_->GetEstimatedLinkCapacity();
   stable_target_rate = std::min(stable_target_rate, pushback_target_rate);
 
-  if ((loss_based_target_rate != last_loss_based_target_rate_) ||
+  const bool rate_changed =
+      (loss_based_target_rate != last_loss_based_target_rate_) ||
       (loss_based_state != last_loss_base_state_) ||
       (fraction_loss != last_estimated_fraction_loss_) ||
       (round_trip_time != last_estimated_round_trip_time_) ||
       (pushback_target_rate != last_pushback_target_rate_) ||
-      (stable_target_rate != last_stable_target_rate_)) {
+      (stable_target_rate != last_stable_target_rate_);
+  if (rate_changed) {
     last_loss_based_target_rate_ = loss_based_target_rate;
     last_pushback_target_rate_ = pushback_target_rate;
     last_estimated_fraction_loss_ = fraction_loss;
     last_estimated_round_trip_time_ = round_trip_time;
     last_stable_target_rate_ = stable_target_rate;
     last_loss_base_state_ = loss_based_state;
+    last_encoder_signal_ = encoder_signal;
 
     alr_detector_->SetEstimatedBitrate(loss_based_target_rate.bps());
 
@@ -707,12 +737,12 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
     target_rate_msg.network_estimate.round_trip_time = round_trip_time;
     target_rate_msg.network_estimate.loss_rate_ratio = fraction_loss / 255.0f;
     target_rate_msg.network_estimate.bwe_period = bwe_period;
-    // [MAE] Ride the same message the encoder already receives. Set
-    // unconditionally: it costs one double, and gating it here would make the
-    // A/B depend on two things at once. The encoder decides whether to use it.
-    target_rate_msg.is_overused_for_encoder = delay_based_bwe_->aggressive_state();
+    // The codec retains its own MAE opt-in; a signal-only edge is still an
+    // update, including a return to the neutral value.
+    target_rate_msg.is_overused_for_encoder = encoder_signal;
 
     update->target_rate = target_rate_msg;
+    last_target_rate_message_ = target_rate_msg;
 
     auto probes = probe_controller_->SetEstimatedBitrate(
         loss_based_target_rate,
@@ -726,6 +756,8 @@ void GoogCcNetworkController::MaybeTriggerOnNetworkChanged(
     RTC_LOG(LS_VERBOSE) << "bwe " << at_time.ms() << " pushback_target_bps="
                         << last_pushback_target_rate_.bps()
                         << " estimate_bps=" << loss_based_target_rate.bps();
+  } else {
+    MaybeTriggerOnEncoderSignalChanged(update, at_time, encoder_signal);
   }
 }
 

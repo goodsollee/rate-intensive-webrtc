@@ -453,10 +453,11 @@ class VideoStreamEncoderUnderTest : public VideoStreamEncoder {
       DataRate link_allocation,
       uint8_t fraction_lost,
       int64_t round_trip_time_ms,
-      double cwnd_reduce_ratio) {
+      double cwnd_reduce_ratio,
+      double is_overused_for_encoder = 1.0) {
     OnBitrateUpdated(target_bitrate, stable_target_bitrate, link_allocation,
                      fraction_lost, round_trip_time_ms, cwnd_reduce_ratio,
-                     /*is_overused_for_encoder=*/1.0);
+                     is_overused_for_encoder);
     // Bitrate is updated on the encoder queue.
     WaitUntilTaskQueueIsIdle();
   }
@@ -1697,6 +1698,107 @@ TEST_F(VideoStreamEncoderTest, EncodeOneFrame) {
   video_source_.IncomingCapturedFrame(CreateFrame(1, &frame_destroyed_event));
   WaitForEncodedFrame(1);
   EXPECT_TRUE(frame_destroyed_event.Wait(kDefaultTimeout));
+  video_stream_encoder_->Stop();
+}
+
+TEST_F(VideoStreamEncoderTest, MaeRateControlEqualityIncludesSignal) {
+  VideoEncoder::RateControlParameters neutral;
+  EXPECT_DOUBLE_EQ(neutral.is_overused_for_encoder, 1.0);
+  auto changed = neutral;
+  EXPECT_EQ(changed, neutral);
+  changed.is_overused_for_encoder = 1.5;
+  EXPECT_NE(changed, neutral);
+  changed.is_overused_for_encoder = 1.0;
+  EXPECT_EQ(changed, neutral);
+  video_stream_encoder_->Stop();
+}
+
+TEST_F(VideoStreamEncoderTest, MaeOnlyRiseDuplicateAndFallReachSetRates) {
+  video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+      kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0);
+  video_source_.IncomingCapturedFrame(CreateFrame(1, codec_width_, codec_height_));
+  WaitForEncodedFrame(1);
+  auto baseline = fake_encoder_.GetAndResetLastRateControlSettings();
+  ASSERT_TRUE(baseline);
+  EXPECT_DOUBLE_EQ(baseline->is_overused_for_encoder, 1.0);
+  for (double signal : {1.5, 1.75, 1.0}) {
+    const int before = fake_encoder_.GetNumSetRates();
+    video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+        kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, signal);
+    EXPECT_EQ(fake_encoder_.GetNumSetRates(), before + 1);
+    auto rates = fake_encoder_.GetAndResetLastRateControlSettings();
+    ASSERT_TRUE(rates);
+    EXPECT_DOUBLE_EQ(rates->is_overused_for_encoder, signal);
+    EXPECT_EQ(rates->bitrate, baseline->bitrate);
+    EXPECT_EQ(rates->target_bitrate, baseline->target_bitrate);
+    EXPECT_EQ(rates->bandwidth_allocation, baseline->bandwidth_allocation);
+    EXPECT_DOUBLE_EQ(rates->framerate_fps, baseline->framerate_fps);
+    video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+        kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, signal);
+    EXPECT_EQ(fake_encoder_.GetNumSetRates(), before + 1);
+    EXPECT_FALSE(fake_encoder_.GetAndResetLastRateControlSettings());
+  }
+  video_stream_encoder_->Stop();
+}
+
+TEST_F(VideoStreamEncoderTest, MaeNonfiniteAndZeroRateSafety) {
+  video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+      kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0);
+  video_source_.IncomingCapturedFrame(CreateFrame(1, codec_width_, codec_height_));
+  WaitForEncodedFrame(1);
+  for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::infinity(),
+                         -std::numeric_limits<double>::infinity()}) {
+    video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+        kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, 1.5);
+    const int before = fake_encoder_.GetNumSetRates();
+    video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+        kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, invalid);
+    EXPECT_EQ(fake_encoder_.GetNumSetRates(), before + 1);
+    auto rates = fake_encoder_.GetAndResetLastRateControlSettings();
+    ASSERT_TRUE(rates);
+    EXPECT_DOUBLE_EQ(rates->is_overused_for_encoder, 1.0);
+    video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+        kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, invalid);
+    EXPECT_EQ(fake_encoder_.GetNumSetRates(), before + 1);
+  }
+  const int before_pause = fake_encoder_.GetNumSetRates();
+  video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+      DataRate::Zero(), DataRate::Zero(), DataRate::Zero(), 0, 0, 0, 1.5);
+  EXPECT_EQ(fake_encoder_.GetNumSetRates(), before_pause);
+  video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+      kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, 1.5);
+  auto resumed = fake_encoder_.GetAndResetLastRateControlSettings();
+  ASSERT_TRUE(resumed);
+  EXPECT_DOUBLE_EQ(resumed->is_overused_for_encoder, 1.5);
+  video_stream_encoder_->Stop();
+}
+
+TEST_F(VideoStreamEncoderTest, MaeSurvivesReconfigureAndPeriodicRefresh) {
+  video_stream_encoder_->OnBitrateUpdatedAndWaitForManagedResources(
+      kTargetBitrate, kTargetBitrate, kTargetBitrate, 0, 0, 0, 1.5);
+  video_source_.IncomingCapturedFrame(CreateFrame(1, codec_width_, codec_height_));
+  WaitForEncodedFrame(1);
+  auto initial = fake_encoder_.GetAndResetLastRateControlSettings();
+  ASSERT_TRUE(initial);
+  EXPECT_DOUBLE_EQ(initial->is_overused_for_encoder, 1.5);
+  video_encoder_config_.max_bitrate_bps += 1000;
+  video_stream_encoder_->ConfigureEncoder(video_encoder_config_.Copy(),
+                                          kMaxPayloadLength);
+  video_source_.IncomingCapturedFrame(CreateFrame(34, codec_width_, codec_height_));
+  WaitForEncodedFrame(34);
+  auto reconfigured = fake_encoder_.GetAndResetLastRateControlSettings();
+  ASSERT_TRUE(reconfigured);
+  EXPECT_DOUBLE_EQ(reconfigured->is_overused_for_encoder, 1.5);
+  // A cadence change across the periodic parameter refresh must retain MAE.
+  for (int64_t timestamp = 234; timestamp <= 1434; timestamp += 200) {
+    AdvanceTime(TimeDelta::Millis(200));
+    video_source_.IncomingCapturedFrame(CreateFrame(timestamp, codec_width_, codec_height_));
+    WaitForEncodedFrame(timestamp);
+  }
+  auto refreshed = fake_encoder_.GetAndResetLastRateControlSettings();
+  ASSERT_TRUE(refreshed);
+  EXPECT_DOUBLE_EQ(refreshed->is_overused_for_encoder, 1.5);
   video_stream_encoder_->Stop();
 }
 

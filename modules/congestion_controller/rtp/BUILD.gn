@@ -66,10 +66,12 @@ if (rtc_include_tests) {
     testonly = true
 
     sources = [
+      "control_handler_unittest.cc",
       "transport_feedback_adapter_unittest.cc",
       "transport_feedback_demuxer_unittest.cc",
     ]
     deps = [
+      ":control_handler",
       ":transport_feedback",
       "../:congestion_controller",
       "../../../api:array_view",

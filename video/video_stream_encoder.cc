@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -1813,12 +1814,7 @@ void VideoStreamEncoder::SetEncoderRates(
     return;
 
   if (rate_control_changed) {
-    // [MAE] Attach the congestion signal to the parameters the codec receives.
-    // Done here rather than where rate_settings is built because this is the
-    // single point at which every path reaches the encoder.
-    VideoEncoder::RateControlParameters rc = rate_settings.rate_control;
-    rc.is_overused_for_encoder = last_is_overused_for_encoder_;
-    encoder_->SetRates(rc);
+    encoder_->SetRates(rate_settings.rate_control);
 
     encoder_stats_observer_->OnBitrateAllocationUpdated(
         send_codec_, rate_settings.rate_control.bitrate);
@@ -2412,9 +2408,6 @@ void VideoStreamEncoder::OnBitrateUpdated(DataRate target_bitrate,
     return;
   }
   RTC_DCHECK_RUN_ON(encoder_queue_.get());
-  // [MAE] Remember it for the next SetRates() to the codec — that is where the
-  // VBV buffer is (re)configured, and the encoder is the only consumer.
-  last_is_overused_for_encoder_ = is_overused_for_encoder;
 
   const bool video_is_suspended = target_bitrate == DataRate::Zero();
   const bool video_suspension_changed = video_is_suspended != EncoderPaused();
@@ -2446,6 +2439,10 @@ void VideoStreamEncoder::OnBitrateUpdated(DataRate target_bitrate,
   EncoderRateSettings new_rate_settings{
       VideoBitrateAllocation(), static_cast<double>(framerate_fps),
       link_allocation, target_bitrate, stable_target_bitrate};
+  // Part of the cached object before comparison/allocation. Reconfigure and
+  // periodic refresh copy this same value instead of reverting it to 1.0.
+  new_rate_settings.rate_control.is_overused_for_encoder =
+      std::isfinite(is_overused_for_encoder) ? is_overused_for_encoder : 1.0;
   SetEncoderRates(UpdateBitrateAllocation(new_rate_settings));
 
   if (target_bitrate.bps() != 0)
