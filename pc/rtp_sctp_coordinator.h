@@ -192,6 +192,7 @@ struct UnifiedMetrics {
 // RTP-SCTP Coordinator: Controls SCTP pacing based on BUR
 // V14: OWD-based RTP BUR from accumulated_delay + SCTP RTT queue
 class RtpSctpCoordinator {
+  friend class PudicaFeedbackTest;
  public:
   explicit RtpSctpCoordinator(
       rtc::Thread* network_thread,
@@ -231,11 +232,21 @@ class RtpSctpCoordinator {
                                       int64_t max_data_rate_bps = -1);
 
   // ===== Pudica: per-packet OWD feedback (called from DelayBasedBwe) =====
+  // `rtp_timestamp` is the on-wire timestamp of the frame this packet belongs
+  // to; it delimits the BUR accumulator. `is_frame_last` is the transport
+  // send-time group boundary, used only when rtp_timestamp is unavailable.
   static void OnPudicaPacketFeedback(int64_t transport_seq,
                                       int64_t send_time_us,
                                       int64_t recv_time_us,
                                       bool is_probe,
-                                      bool is_frame_last);
+                                      bool is_frame_last,
+                                      uint32_t rtp_timestamp = 0,
+                                      int64_t size_bytes = 0,
+                                      int64_t inflight_bytes = 0,
+                                      int64_t intended_span_us = 0,
+                                      int64_t probe_interval_us = 0,
+                                      uint64_t pudica_send_id = 0,
+                                      int64_t pudica_send_time_us = 0);
 
   // Pudica: adaptive pacing multiplier (read by PacingController)
   static double GetPudicaPacingMultiplier();
@@ -247,6 +258,9 @@ class RtpSctpCoordinator {
   // recomputed per frame from the frame BUR + measured receiving_rate.
   static bool IsPudicaMode();
   static int64_t GetPudicaRtpOverride();
+  // [A28e] Timer-path variant: returns >0 only when the next-delay fallback
+  // actually cut the target, so the periodic path stays inert otherwise.
+  static int64_t GetPudicaTimerFallback();
 
   // ===== Called by DcSctpTransport =====
 
@@ -327,6 +341,13 @@ class RtpSctpCoordinator {
   static std::atomic<bool> fse_v2_mode_active_;        // FSEv2 mode flag (lightweight override)
   static std::atomic<int64_t> pudica_rtp_target_bps_;  // Apollo: Pudica RTP target override
   static std::atomic<bool> pudica_mode_active_;        // Apollo: Pudica mode flag for GCC
+  // Next delay retains the newest ACK's original sender time for diagnostics;
+  // its exact sender-local ID retires frames without timestamp quantization.
+  static std::atomic<int64_t> pudica_acked_send_us_;
+  static std::atomic<uint64_t> pudica_acked_send_id_;
+  // [A28e] True while GetPudicaRtpOverride() is running on the periodic path,
+  // so next_delay.csv can say which call site produced each row ("-t" suffix).
+  static std::atomic<bool> pudica_in_timer_path_;
 
   CoordinatorConfig config_;
   CoordinatorFeatures features_;
@@ -479,11 +500,35 @@ class RtpSctpCoordinator {
     int64_t last_send_us = -1;    // last packet send time (μs) — for SACK H_i clamping
     int64_t last_recv_us = -1;    // last packet receive time (μs)
     int frame_packets = 0;
+    int64_t frame_bytes = 0;      // [A41] acked bytes: the frame's realised B_k
+    int64_t intended_span_us = 0;  // Eq.2 arm captured at this frame's send time
   };
   PudicaFrameInfo pudica_frame_;
 
+  // [DRAIN-INFLIGHT] Outstanding bytes reported with the most recent video
+  // media feedback. One OWD stale by construction — it is the queue the acked
+  // packet actually saw, which is the same instant the frame's BUR describes.
+  int64_t pudica_inflight_meas_bytes_ = 0;
+
   // D_min: minimum packet OWD over 10-second window (μs)
   double pudica_d_min_us_ = -1.0;
+  // [A28] §4.3 next delay instrumentation, logged in pudica_ctrl.csv. Written
+  // from the feedback thread inside GetPudicaRtpOverride(), read when the row
+  // is emitted, so they are atomic. nd_steps is 0 whenever the fallback is not
+  // engaged; nd_out_bps holds the last value it published.
+  std::atomic<double> pudica_next_delay_ms_{-1.0};
+  std::atomic<int> pudica_nd_steps_{0};
+  std::atomic<int64_t> pudica_nd_out_bps_{0};
+  // Emission span of the last frame (last_send - first_send), subtracted from
+  // D before Eq.1. Logged as span_ms in pudica_ctrl.csv: when it approaches or
+  // exceeds L the sender, not the network, is what D was measuring.
+  double pudica_frame_span_us_ = 0.0;
+  // On-wire RTP timestamp of the frame currently accumulating in
+  // pudica_frame_. Sentinel: pudica_frame_rtp_ts_valid_ == false means the
+  // accumulator has no frame identity and the transport group boundary is
+  // being used instead.
+  uint32_t pudica_frame_rtp_ts_ = 0;
+  bool pudica_frame_rtp_ts_valid_ = false;
   std::deque<std::pair<int64_t, double>> pudica_owd_window_;  // (time_us, owd_us)
   static constexpr int64_t kPudicaDminWindowUs = 10'000'000;  // 10 seconds in μs
 
@@ -496,6 +541,7 @@ class RtpSctpCoordinator {
   struct PudicaProbeResult {
     double owd_us;    // probe one-way delay (μs)
     double h_us;      // time since last frame packet arrival (μs)
+    double interval_us;  // T_packet that scheduled this probe, sender metadata
   };
   std::deque<PudicaProbeResult> pudica_probe_results_;
   int64_t pudica_last_frame_recv_us_ = 0;  // last frame's last packet arrival (μs)
@@ -521,6 +567,21 @@ class RtpSctpCoordinator {
   std::ofstream pudica_ctrl_csv_;
   bool pudica_ctrl_csv_initialized_ = false;
   int64_t pudica_ctrl_csv_start_us_ = 0;
+  // [A28d] next_delay.csv -- one row per GetPudicaRtpOverride() call, i.e. per
+  // TWCC feedback. pudica_ctrl.csv cannot answer whether next delay fired: its
+  // rows are written on FRAME COMPLETION, which is exactly what stops during a
+  // blackout (5 of 7 zero-capacity seconds in run 1789021240 produced zero
+  // ctrl rows). This log runs on the path that keeps ticking, and it records
+  // the no-fire cases too -- including the empty-ledger early return, which is
+  // the leading hypothesis for the missing fallback.
+  std::ofstream pudica_nd_csv_;
+  bool pudica_nd_csv_initialized_ = false;
+  int64_t pudica_nd_csv_start_us_ = 0;
+  std::mutex pudica_nd_csv_mu_;
+  void PudicaLogNextDelay(int64_t now_us, double next_delay_ms, double d_min_ms,
+                          int steps, int64_t target_bps, int64_t out_bps,
+                          const char* reason, int64_t oldest_us, int64_t acked_us,
+                          uint64_t oldest_id, uint64_t acked_id);
 
   // Pudica methods
   double PudicaComputeFrameBur(int64_t now_us);

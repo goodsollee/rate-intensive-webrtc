@@ -101,7 +101,12 @@ bool PacedPacketInfo::operator==(const PacedPacketInfo& rhs) const {
   return send_bitrate == rhs.send_bitrate &&
          probe_cluster_id == rhs.probe_cluster_id &&
          probe_cluster_min_probes == rhs.probe_cluster_min_probes &&
-         probe_cluster_min_bytes == rhs.probe_cluster_min_bytes;
+         probe_cluster_min_bytes == rhs.probe_cluster_min_bytes &&
+         pudica_intended_span_us == rhs.pudica_intended_span_us &&
+         pudica_probe_interval_us == rhs.pudica_probe_interval_us &&
+         pudica_probe_frame_timestamp == rhs.pudica_probe_frame_timestamp &&
+         pudica_send_id == rhs.pudica_send_id &&
+         pudica_send_time_us == rhs.pudica_send_time_us;
 }
 
 }  // namespace webrtc

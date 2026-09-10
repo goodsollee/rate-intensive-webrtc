@@ -63,6 +63,7 @@
 #include "video/corruption_detection/frame_instrumentation_generator.h"
 #include "video/frame_cadence_adapter.h"
 #include "video/frame_dumping_encoder.h"
+#include "pc/coordinator/gecko_controller.h"  // [Gecko S7] flush -> keyframe now
 
 namespace webrtc {
 
@@ -749,6 +750,9 @@ VideoStreamEncoder::VideoStreamEncoder(
   RTC_DCHECK_GE(number_of_cores, 1);
 
   frame_cadence_adapter_->Initialize(&cadence_callback_);
+  // [Gecko S7] a FLUSH decision asks this encoder for a keyframe immediately;
+  // SendKeyFrame() posts to encoder_queue_ when called from another thread.
+  gecko::GeckoController::Get().SetKeyFrameRequester([this] { SendKeyFrame(); });
   stream_resource_manager_.Initialize(encoder_queue_.get());
 
   encoder_queue_->PostTask([this] {
@@ -776,6 +780,7 @@ VideoStreamEncoder::VideoStreamEncoder(
 
 VideoStreamEncoder::~VideoStreamEncoder() {
   RTC_DCHECK_RUN_ON(worker_queue_);
+  gecko::GeckoController::Get().ClearKeyFrameRequester();  // [Gecko S7]
   RTC_DCHECK(!video_source_sink_controller_.HasSource())
       << "Must call ::Stop() before destruction.";
 

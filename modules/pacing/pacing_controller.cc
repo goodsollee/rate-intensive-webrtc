@@ -14,8 +14,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -36,6 +38,7 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/numerics/safe_conversions.h"
+#include "rtc_base/synchronization/mutex.h"
 #include "system_wrappers/include/clock.h"
 
 namespace webrtc {
@@ -95,7 +98,6 @@ void PacingController::SetPudicaProbing(bool enabled,
     MutexLock lock(&PudicaConfigMutex());
     PudicaProbeConfig& config = MutablePudicaProbeConfig();
     config.enabled = false;
-    config.frame_interval_us = 0;
     ++config.revision;
     RTC_LOG(LS_ERROR) << "[PUDICA] Probe injection disabled: invalid N/L, N="
                       << num_probes << " L_us="
@@ -107,7 +109,7 @@ void PacingController::SetPudicaProbing(bool enabled,
     PudicaProbeConfig& config = MutablePudicaProbeConfig();
     config.enabled = enabled;
     config.num_probes = num_probes;
-    config.frame_interval_us = enabled ? frame_interval.us() : 0;
+    if (enabled) config.frame_interval_us = frame_interval.us();
     ++config.revision;
   }
   if (enabled) {
@@ -117,7 +119,7 @@ void PacingController::SetPudicaProbing(bool enabled,
 }
 
 void PacingController::SetPudicaRho(double rho) {
-  const bool valid = std::isfinite(rho) && rho > 1.0;
+  const bool valid = std::isfinite(rho) && (rho == 0.0 || rho > 1.0);
   const double resolved_rho = valid ? rho : 2.0;
   MutexLock lock(&PudicaConfigMutex());
   MutablePudicaProbeConfig().rho = resolved_rho;
@@ -141,8 +143,167 @@ void PacingController::RefreshPudicaProbeConfig() {
     pudica_probe_interval_ = TimeDelta::Zero();
     pudica_gap_end_time_ = Timestamp::MinusInfinity();
     pudica_frame_send_start_ = Timestamp::MinusInfinity();
+    pudica_frame_rate_ = DataRate::Zero();
+    pudica_intended_span_us_ = 0;
+    adjusted_media_rate_ = pacing_rate_;
   }
   pudica_config_snapshot_ = next;
+}
+
+void PacingController::SetPudicaIntraFramePacing(bool enabled,
+                                                TimeDelta frame_interval) {
+  const bool valid = frame_interval.IsFinite() &&
+      frame_interval >= TimeDelta::Millis(1) &&
+      frame_interval <= TimeDelta::Seconds(1);
+  MutexLock lock(&PudicaConfigMutex());
+  auto& config = MutablePudicaProbeConfig();
+  config.intra_frame_pacing = enabled && valid;
+  if (valid) config.frame_interval_us = frame_interval.us();
+  ++config.revision;
+}
+
+bool PacingController::PudicaIntraFramePacing() {
+  return ReadPudicaProbeConfig().intra_frame_pacing;
+}
+
+std::atomic<double> PacingController::pudica_bur_{1.0};
+std::atomic<bool> PacingController::pudica_mode_{false};
+std::atomic<uint64_t> PacingController::pudica_next_send_id_{0};
+
+namespace {
+// [A28] §4.3 next delay: send-time ledger of outstanding frames.
+//
+// A frame every 33 ms, so this is ~17 s of outstanding frames. The list only
+// grows while feedback is absent, and the fallback bottoms out (MAX_STEPS)
+// long before then; the bound exists so a permanently dead return path cannot
+// leak memory.
+constexpr size_t kPudicaMaxSentFrames = 512;
+
+struct PudicaSentFrames {
+  Mutex lock;
+  struct Frame {
+    int64_t send_us;
+    uint64_t send_id;
+  };
+  std::deque<Frame> frames RTC_GUARDED_BY(lock);
+};
+// Function-local and intentionally never destroyed: a namespace-scope object
+// with a destructor trips -Wexit-time-destructors, and the pacer thread may
+// still be running at teardown.
+PudicaSentFrames& SentFrames() {
+  static PudicaSentFrames* const s = new PudicaSentFrames();
+  return *s;
+}
+}  // namespace
+
+void PacingController::SetPudicaMode(bool enabled) {
+  pudica_mode_.store(enabled, std::memory_order_relaxed);
+  PudicaSentFrames& s = SentFrames();
+  MutexLock lock(&s.lock);
+  s.frames.clear();
+}
+
+void PacingController::PudicaRecordFrameSent(int64_t send_us, uint64_t send_id) {
+  PudicaSentFrames& s = SentFrames();
+  MutexLock lock(&s.lock);
+  s.frames.push_back({send_us, send_id});
+  if (s.frames.size() > kPudicaMaxSentFrames) {
+    s.frames.pop_front();
+  }
+}
+
+int64_t PacingController::PudicaOldestUnackedSendUs(uint64_t acked_through_id,
+                                                 uint64_t* oldest_id) {
+  PudicaSentFrames& s = SentFrames();
+  MutexLock lock(&s.lock);
+  while (!s.frames.empty() && s.frames.front().send_id <= acked_through_id) {
+    s.frames.pop_front();
+  }
+  if (oldest_id) *oldest_id = s.frames.empty() ? 0 : s.frames.front().send_id;
+  return s.frames.empty() ? 0 : s.frames.front().send_us;
+}
+
+// [A27] PUDICA_RHO pins ρ, disabling Eq.2's adaptation. Read here, once, at
+// the single site that computes ρ.
+//
+// It used to arrive through SetPudicaRho(), called per frame from the
+// coordinator. A26 removed that call (it was the duplicate Eq.2 implementation)
+// and left `pudica_rho_override_` with no writer, so the pin silently stopped
+// working: run 1788956971 was launched with PUDICA_RHO=2 and logged ρ of 1.25,
+// 4.58, 5.16, 8.25, 20.62 — every value except 2. A knob that is read from a
+// variable nobody writes fails exactly this way, so the env read now lives
+// next to its only reader.
+double PacingController::PudicaRhoOverride() {
+  static const double kRho = []() {
+    const char* e = std::getenv("PUDICA_RHO");
+    // An empty string is "explicitly unset" (the runner passes PUDICA_RHO= to
+    // mean that), and atof("") is 0, which is already <= 1.0 and so not a pin.
+    return e ? std::atof(e) : 0.0;
+  }();
+  return kRho;
+}
+
+void PacingController::SetPudicaBur(double bur) {
+  // Guard the value at the boundary so PudicaRho() never has to. NaN compares
+  // false against everything, so the >= form rejects it.
+  pudica_bur_.store(bur >= 0.0 ? bur : 0.0, std::memory_order_relaxed);
+}
+
+// [A25] Pudica NSDI'24 Eq.2:  ρ = γ_ρ / min(R, 1),  γ_ρ = 1.25.
+//
+// R is the BUR: (D − D_min)/L, the bottleneck queuing delay expressed in frame
+// intervals. The frame's send span is L/ρ, so
+//
+//     L/ρ = L · min(R,1) / γ_ρ
+//
+// and the two clauses of the paper fall out directly:
+//
+//   R < 1 : span = (D − D_min)/γ_ρ — "slightly shorter than the queuing
+//           delay", which is the point. The frame occupies the wire for less
+//           time than the queue takes to drain, so the queue never grows by a
+//           whole frame, but the sender is still busy long enough that the
+//           NEXT frame's D is a measurement of the link rather than of its own
+//           serialization. That is the "sensible period" being extended.
+//   R ≥ 1 : the denominator is capped at 1, so span = L/γ_ρ = 0.8 L. "By
+//           bounding the denominator up to one, all packets of each frame are
+//           sent within the frame interval, to avoid superfluous waiting time
+//           at the sender." Without the cap a queued link (R = 8, seen on
+//           every dip in this testbed) would give ρ = 0.156, i.e. a span of
+//           6.4 L — the sender would sit on a frame for six frame intervals
+//           while the encoder produced six more.
+//
+// The other bound is ours, not the paper's. R → 0 sends ρ → ∞ and the span to
+// zero, which is *correct* (an empty queue needs no pacing) but degenerates
+// into an unbounded rate. The floor is applied to the SPAN rather than to ρ,
+// because a span is the thing with a physical meaning here: below one packet
+// serialization there is nothing left to spread. kPudicaMinSpanUs = 1 ms is
+// ~3% of L, i.e. still a burst for practical purposes, and it exists only so
+// `frame_size / span` cannot produce an infinity.
+//
+// R is the RAW per-frame BUR, published from the feedback path (the single
+// SetPudicaBur() call site). delay_based_bwe.cc notes that 29% of raw samples
+// come from 1-packet frames reading a constant 0.030, which arms the minimum
+// span; PUDICA_RHO_SMOOTH_BUR=1 switches to the smoothed BUR for an A/B.
+double PacingController::PudicaRho() {
+  static const double kGammaRho = []() {
+    const char* e = std::getenv("PUDICA_GAMMA_RHO");
+    return e ? std::atof(e) : 1.25;
+  }();
+  // The manual pin wins and disables adaptation, for A/B runs against Eq.2.
+  const auto config = ReadPudicaProbeConfig();
+  const double pin = config.rho > 1.0 ? config.rho : PudicaRhoOverride();
+  double r = pudica_bur_.load(std::memory_order_relaxed);
+  if (!(r > 0.0)) r = 1e-9;  // empty queue: use the finite minimum span
+  double denom = std::min(r, 1.0);
+  double rho = std::isfinite(pin) && pin > 1.0 ? pin : kGammaRho / denom;
+  // Span floor, expressed as a ρ ceiling so every consumer sees one number.
+  constexpr double kPudicaMinSpanUs = 1000.0;
+  const double rho_max = std::max(1.0, config.frame_interval_us /
+                                         kPudicaMinSpanUs);
+  if (!std::isfinite(rho)) rho = 1.25;
+  if (rho > rho_max) rho = rho_max;
+  if (rho < 1.0) rho = 1.0;
+  return rho;
 }
 
 PacingController::PacingController(Clock* clock,
@@ -468,8 +629,16 @@ Timestamp PacingController::NextSendTime() const {
     TimeDelta drain_time = media_debt_ / adjusted_media_rate_;
     // Ensure that a burst of sent packet is not larger than kMaxBurstSize in
     // order to not risk overfilling socket buffers at high bitrate.
+    //
+    // [A25] Eq.2: no burst allowance while spreading a frame. The default
+    // min(send_burst_interval_, 63KB/rate) lets a whole median frame go out
+    // back-to-back, which bypasses pudica_frame_rate_ entirely and leaves the
+    // send span at ~0 — i.e. Eq.2 would compute a span and then never apply it.
     TimeDelta send_burst_interval =
-        std::min(send_burst_interval_, kMaxBurstSize / adjusted_media_rate_);
+        (pudica_frame_rate_ > DataRate::Zero())
+            ? TimeDelta::Zero()
+            : std::min(send_burst_interval_,
+                       kMaxBurstSize / adjusted_media_rate_);
     next_send_time =
         last_process_time_ +
         ((send_burst_interval > drain_time) ? TimeDelta::Zero() : drain_time);
@@ -500,13 +669,25 @@ Timestamp PacingController::NextSendTime() const {
 
   // Pudica: wake up for deferred probe sending or gap end
   const PudicaProbeConfig pudica_config = ReadPudicaProbeConfig();
-  if (pudica_config.revision == pudica_config_snapshot_.revision &&
-      pudica_config.enabled) {
+  if (pudica_config.revision == pudica_config_snapshot_.revision) {
     if (pudica_probes_remaining_ > 0 && pudica_next_probe_time_.IsFinite()) {
       next_send_time = std::min(next_send_time, pudica_next_probe_time_);
     }
     if (now < pudica_gap_end_time_ && pudica_gap_end_time_.IsFinite()) {
       next_send_time = std::min(next_send_time, pudica_gap_end_time_);
+    }
+    // [A25] Wake up for the Eq.2 deadline guard at the top of ProcessPackets().
+    // Without this the guard's wake-up is scheduled from
+    // media_debt_ / adjusted_media_rate_ — i.e. from the very rate it exists to
+    // correct, so the lower the bogus rate the later the correction, and an
+    // emptied queue falls through to the kPausedProcessInterval (500 ms) branch
+    // above. The deadline must not be scheduled by the thing it bounds.
+    if (pudica_config.intra_frame_pacing && pudica_frame_send_start_.IsFinite()) {
+      next_send_time =
+          std::min(next_send_time,
+                   pudica_frame_send_start_ +
+                       TimeDelta::Micros(
+                           pudica_config.frame_interval_us));
     }
   }
 
@@ -520,6 +701,47 @@ void PacingController::ProcessPackets() {
   const Timestamp now = CurrentTime();
   RefreshPudicaProbeConfig();
   Timestamp target_send_time = now;
+
+  // [A25] Eq.2 deadline guard. pudica_frame_rate_ is computed once, from
+  // `packet_size + QueueSizeData()` at the instant the frame's FIRST packet is
+  // dequeued, on the assumption that a frame is enqueued as one batch. That
+  // assumption breaks when the encoder is still delivering the frame — most
+  // reliably on a resolution step-up, where the keyframe is large and slow to
+  // packetize. The queue then holds a fraction of the frame, the rate is set
+  // from that fraction, and nothing corrects it: the rate is only recomputed at
+  // the next frame start, and pudica_frame_send_start_ is only cleared by the
+  // marker bit, which is the frame's LAST packet. So the frame cannot finish
+  // until it drains at the wrong rate, and the rate cannot be fixed until the
+  // frame finishes.
+  //
+  // Eq.2's premise is that a frame leaves within L/ρ, and ρ ≥ 1 by
+  // construction, so L/ρ ≤ L. Taking longer than L therefore means the size
+  // estimate was wrong. Drop it and let the next video packet re-arm from the
+  // queue as it stands by then — which holds the rest of the frame, so the
+  // recomputed rate is right. This bounds the damage to one frame interval
+  // instead of the whole frame.
+  //
+  // This guard is why Eq.2 cannot reproduce the unbounded pacer holds measured
+  // without it (1.3-1.9 s on runs 1788944778 / 1788946628, against a p90 of
+  // 49-74 ms on the sibling branch that has it).
+  if (pudica_config_snapshot_.intra_frame_pacing &&
+      pudica_frame_send_start_.IsFinite() &&
+      now - pudica_frame_send_start_ >=
+          TimeDelta::Micros(pudica_config_snapshot_.frame_interval_us)) {
+    ++pudica_frame_deadline_hits_;
+    if (pudica_frame_deadline_hits_ % 100 == 1) {
+      fprintf(stderr,
+              "[PUDICA-PACE-DEADLINE] frame overran L: held=%.0fms "
+              "rate=%.1fMbps queue=%.0fKB rho=%.2f hits=%d\n",
+              (now - pudica_frame_send_start_).ms<double>(),
+              pudica_frame_rate_.bps() / 1e6,
+              QueueSizeData().bytes<double>() / 1024.0, PudicaRho(),
+              pudica_frame_deadline_hits_);
+    }
+    pudica_frame_rate_ = DataRate::Zero();
+    adjusted_media_rate_ = pacing_rate_;
+    pudica_frame_send_start_ = Timestamp::MinusInfinity();
+  }
 
   if (ShouldSendKeepalive(now)) {
     DataSize keepalive_data_sent = DataSize::Zero();
@@ -628,33 +850,80 @@ void PacingController::ProcessPackets() {
       }
 
       // Pudica: track frame send start (first video pkt after gap)
-      if (pudica_config_snapshot_.enabled &&
+      if ((pudica_config_snapshot_.enabled ||
+           pudica_config_snapshot_.intra_frame_pacing) &&
           packet_type == RtpPacketMediaType::kVideo &&
           pudica_frame_send_start_.IsMinusInfinity()) {
         pudica_frame_send_start_ = now;
+        // [A25] Eq.2: spread this frame's packets over L/ρ so the last one
+        // leaves at L/ρ, instead of bursting the frame at pacing_rate_ and
+        // idling for the rest of L. All packets of a frame are enqueued as one
+        // batch, so the queue at frame start plus this packet is the frame
+        // size.
+        //
+        // Deliberately NOT clamped to any multiple of the committed rate. An
+        // upper bound of B·ρ was tried on the sibling branch and reverted: B is
+        // what the BUR controls, so the bound closes a positive feedback loop
+        // (B down → bound down → frame takes longer → Eq.1's D counts that →
+        // BUR up → B down). The L deadline guard above is the bound instead,
+        // and a deadline is independent of B so it cannot do that.
+        if (pudica_config_snapshot_.intra_frame_pacing) {
+          const double rho = PudicaRho();
+          DataSize frame_size = packet_size + QueueSizeData();
+          TimeDelta span = TimeDelta::Micros(
+              static_cast<int64_t>(pudica_config_snapshot_.frame_interval_us / rho));
+          pudica_intended_span_us_ = span.us();
+          if (span > TimeDelta::Zero() && frame_size > DataSize::Zero()) {
+            pudica_frame_rate_ = frame_size / span;
+            // MaybeUpdateMediaRateDueToLongQueue() only runs at the END of
+            // ProcessPackets(), so apply it here too — otherwise the rest of
+            // this send batch still goes out at the old (bursty) rate.
+            adjusted_media_rate_ = pudica_frame_rate_;
+          }
+        }
       }
 
-      // Pudica: detect video frame end (marker bit) before packet is moved
-      bool pudica_frame_ended = false;
-      if (pudica_config_snapshot_.enabled &&
-          packet_type == RtpPacketMediaType::kVideo &&
-          rtp_packet->Marker()) {
-        pudica_frame_ended = true;
+      // Pudica: detect video frame end (marker bit) before packet is moved.
+      // [A28] No longer gated on pudica_probing_enabled_: §4.3 next delay has
+      // to time outstanding frames whether or not probes are being injected,
+      // and folding the two together made next delay silently dead in any
+      // PUDICA_PROBING=0 run. The probe SCHEDULING below keeps the gate.
+      const bool pudica_frame_ended =
+          packet_type == RtpPacketMediaType::kVideo && rtp_packet->Marker();
+      if (pudica_frame_ended && pudica_config_snapshot_.enabled) {
+        pudica_probe_frame_timestamp_ = rtp_packet->Timestamp();
       }
-
-      packet_sender_->SendPacket(std::move(rtp_packet), pacing_info);
+      PacedPacketInfo packet_pacing_info = pacing_info;
+      if (packet_type == RtpPacketMediaType::kVideo) {
+        packet_pacing_info.pudica_intended_span_us = pudica_intended_span_us_;
+        if (pudica_mode_.load(std::memory_order_relaxed)) {
+          packet_pacing_info.pudica_send_id =
+              pudica_next_send_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+          packet_pacing_info.pudica_send_time_us = CurrentTime().us();
+        }
+      }
+      packet_sender_->SendPacket(std::move(rtp_packet), packet_pacing_info);
       for (auto& packet : packet_sender_->FetchFec()) {
         EnqueuePacket(std::move(packet));
       }
       data_sent += packet_size;
       ++packets_sent;
 
+      // [A28] §4.3 next delay: this frame is now fully sent and outstanding.
+      // Independent of probing (see above), but still Pudica-only: nothing
+      // drains this ledger unless GetPudicaRtpOverride() runs, and that is
+      // gated on IsPudicaMode(). Recording in a GCC-arm run would keep a dead
+      // 512-entry deque at its bound forever.
+      if (pudica_frame_ended && packet_pacing_info.pudica_send_id > 0) {
+        PudicaRecordFrameSent(packet_pacing_info.pudica_send_time_us,
+                               packet_pacing_info.pudica_send_id);
+      }
+
       // Pudica: schedule deferred probe packets after frame ends
-      if (pudica_frame_ended) {
+      if (pudica_frame_ended && pudica_config_snapshot_.enabled) {
         ++pudica_marker_count_;
         // Compute T_packet = (1-1/ρ) × L / (N+1)
-        const double rho_configured = pudica_config_snapshot_.rho;
-        const double rho = rho_configured > 1.0 ? rho_configured : 2.0;
+        const double rho = PudicaRho();
         const int num_probes = pudica_config_snapshot_.num_probes;
         const double kL_us = static_cast<double>(
             pudica_config_snapshot_.frame_interval_us);
@@ -673,7 +942,22 @@ void PacingController::ProcessPackets() {
             ? static_cast<double>((now - pudica_frame_send_start_).us())
             : 0.0;
         double remaining_us = std::max(0.0, kL_us - frame_send_us);
-        double gap_us = std::min(desired_gap_us, remaining_us);
+        // [A40] No agnostic period while the next frame is already queued.
+        // Eq.2/Eq.5 assume the pacer is empty at frame end -- the next frame
+        // arrives one L later, so L - L/ρ is idle time. With video still
+        // waiting behind this marker the pacer is behind the encoder, and the
+        // gap only idles a link that has work: service drops to one frame per
+        // ~L whatever the frame size, and with input at exactly 1/L a backlog
+        // never drains. Measured pre-dip on a 200 Mbps link (runs
+        // 1789041793/1789041990/1789042110): backlogged frames left every
+        // 25-32 ms at 0-100 KB and 300-450 KB alike, pacer wait p50 up to
+        // 430 ms while the network delay stayed 5-19 ms.
+        const bool video_waiting =
+            packet_queue_.SizeInPacketsPerRtpPacketMediaType()[static_cast<size_t>(
+                RtpPacketMediaType::kVideo)] > 0;
+        if (video_waiting) ++pudica_gaps_skipped_;
+        double gap_us =
+            video_waiting ? 0.0 : std::min(desired_gap_us, remaining_us);
         pudica_gap_end_time_ = now + TimeDelta::Micros(
             static_cast<int64_t>(gap_us));
         pudica_probes_remaining_ = std::min(
@@ -683,6 +967,9 @@ void PacingController::ProcessPackets() {
             ? now + pudica_probe_interval_
             : Timestamp::MinusInfinity();
         pudica_frame_send_start_ = Timestamp::MinusInfinity();  // reset for next frame
+        // [A25] The frame is done; revert to pacing_rate_ for the gap. The next
+        // frame's first packet re-arms Eq.2 from the queue as it stands then.
+        pudica_frame_rate_ = DataRate::Zero();
 
         if (pudica_marker_count_ % 100 == 0) {
           fprintf(stderr, "[PUDICA-MARKER] markers=%d L=%.3fms T_pkt=%.3fms gap=%.3f/%.3fms probes=%d rho=%.3f send=%.3fms\n",
@@ -691,6 +978,14 @@ void PacingController::ProcessPackets() {
                   desired_gap_us / 1000.0, pudica_probes_remaining_, rho,
                   frame_send_us / 1000.0);
         }
+      }
+
+      if (pudica_frame_ended && (pudica_config_snapshot_.enabled ||
+                                pudica_config_snapshot_.intra_frame_pacing)) {
+        pudica_frame_send_start_ = Timestamp::MinusInfinity();
+        pudica_frame_rate_ = DataRate::Zero();
+        pudica_intended_span_us_ = 0;
+        adjusted_media_rate_ = pacing_rate_;
       }
 
       // Send done, update send time.
@@ -742,6 +1037,13 @@ void PacingController::ProcessPackets() {
       }
       PacedPacketInfo pudica_info;
       pudica_info.probe_cluster_id = kPudicaProbeClusterId;
+      pudica_info.pudica_probe_interval_us = pudica_probe_interval_.us();
+      pudica_info.pudica_probe_frame_timestamp = pudica_probe_frame_timestamp_;
+      if (pudica_mode_.load(std::memory_order_relaxed)) {
+        pudica_info.pudica_send_id =
+            pudica_next_send_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+        pudica_info.pudica_send_time_us = CurrentTime().us();
+      }
       packet_sender_->SendPacket(std::move(p), pudica_info);
       OnPacketSent(RtpPacketMediaType::kPadding, packet_size, now);
       probe_data += packet_size;
@@ -890,7 +1192,9 @@ std::unique_ptr<RtpPacketToSend> PacingController::GetPendingPacket(
       return nullptr;
     }
 
-    if (now <= target_send_time && send_burst_interval_.IsZero()) {
+    if (now <= target_send_time &&
+        (send_burst_interval_.IsZero() ||
+         pudica_frame_rate_ > DataRate::Zero())) {
       // We allow sending slightly early if we think that we would actually
       // had been able to, had we been right on time - i.e. the current debt
       // is not more than would be reduced to zero at the target sent time.
@@ -942,6 +1246,12 @@ void PacingController::SetQueueTimeLimit(TimeDelta limit) {
 }
 
 void PacingController::MaybeUpdateMediaRateDueToLongQueue(Timestamp now) {
+  if (pudica_frame_rate_ > DataRate::Zero()) {
+    // Keep the frame's Eq.2 rate across ProcessPackets batches. The deadline
+    // guard, not queue draining or the committed target, bounds this override.
+    adjusted_media_rate_ = pudica_frame_rate_;
+    return;
+  }
   adjusted_media_rate_ = pacing_rate_;
   if (!drain_large_queues_) {
     return;

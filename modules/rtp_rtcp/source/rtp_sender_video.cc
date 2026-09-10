@@ -68,6 +68,7 @@
 #include "rtc_base/race_checker.h"
 #include "rtc_base/synchronization/mutex.h"
 #include "system_wrappers/include/ntp_time.h"
+#include "pc/coordinator/gecko_controller.h"  // [Gecko S5] FlagForFrame
 
 
 namespace webrtc {
@@ -527,6 +528,12 @@ void RTPSenderVideo::AddRtpHeaderExtensions(const RTPVideoHeader& video_header,
   if (packet->IsRegistered<PduSetInfoExtension>()) {
     packet->SetExtension<PduSetInfoExtension>(PduSetInfo());
   }
+  // [Gecko S5] Reserve the one-octet GeckoFlag likewise (0 = none), rewritten
+  // in place in SendVideo() once the frame's answer is known.
+  if (gecko::GeckoController::Get().Enabled() &&
+      packet->IsRegistered<GeckoFlagExtension>()) {
+    packet->SetExtension<GeckoFlagExtension>(static_cast<uint8_t>(0));
+  }
 }
 
 bool RTPSenderVideo::SendVideo(int payload_type,
@@ -846,6 +853,23 @@ bool RTPSenderVideo::SendVideo(int payload_type,
     }
     // PSSN is 16 bits and wraps naturally on the uint16_t.
     ++pdu_set_sequence_number_;
+  }
+
+  // [Gecko S5] The sender's answer to a router alert rides on this frame's
+  // packets: a flush on the keyframe the decision requested ("clear what is
+  // queued ahead of me"), a no-flush on the next frame. Asked once per frame
+  // even when the extension is not negotiated, so the controller keeps its
+  // doomed-frame count; stamped only when it is.
+  if (gecko::GeckoController::Get().Enabled()) {
+    const uint8_t gecko_flag = gecko::GeckoController::Get().FlagForFrame(
+        video_header.frame_type == VideoFrameType::kVideoFrameKey, rtp_timestamp,
+        clock_->TimeInMicroseconds());
+    if (gecko_flag != gecko::kFlagNone && !rtp_packets.empty() &&
+        rtp_packets.front()->HasExtension<GeckoFlagExtension>()) {
+      for (auto& rtp_packet : rtp_packets) {
+        rtp_packet->SetExtension<GeckoFlagExtension>(gecko_flag);
+      }
+    }
   }
 
   LogAndSendToNetwork(std::move(rtp_packets), encoder_output_size);

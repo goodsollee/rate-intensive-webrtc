@@ -2871,6 +2871,8 @@ rtc_library("compute_emulation") {
     "coordinator/compute_metrics_logger.h",
     "coordinator/emulated_compute_backend.h",
     "coordinator/query_tracker.h",
+    "coordinator/gecko_decider.h",
+    "coordinator/gecko_controller.h",
   ]
   deps = [
     "../rtc_base:logging",
@@ -2939,4 +2941,31 @@ rtc_library("rtp_sctp_coordinator") {
     "../rtc_base:macromagic",
     "../rtc_base:threading",
   ]
+}
+
+if (rtc_include_tests) {
+  rtc_test("pudica_validation_tests") {
+    testonly = true
+    sources = [
+      "coordinator/gecko_opt_in_unittest.cc",
+      "coordinator/pudica_feedback_unittest.cc",
+    ]
+    deps = [
+      ":rtp_sctp_coordinator",
+      "../media:rtc_data_dcsctp_transport",
+      "../media:rtc_audio_video",
+      "../api/environment:environment_factory",
+      "../api/transport:network_control",
+      "../api/units:data_rate",
+      "../api/units:data_size",
+      "../api/units:timestamp",
+      "../modules/congestion_controller/goog_cc:delay_based_bwe",
+      "../modules/pacing:pacing",
+      "../modules/pacing:pacing_unittests",
+      "../rtc_base:timeutils",
+      "../test:explicit_key_value_config",
+      "../test:test_main",
+      "../test:test_support",
+    ]
+  }
 }

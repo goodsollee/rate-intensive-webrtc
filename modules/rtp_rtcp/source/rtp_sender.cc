@@ -9,6 +9,7 @@
  */
 
 #include "modules/rtp_rtcp/source/rtp_sender.h"
+#include "pc/coordinator/gecko_controller.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -95,7 +96,10 @@ constexpr RtpExtensionSize kVideoExtensionSizes[] = {
     CreateExtensionSize<PduSetInfoExtension>(),
     {RtpGenericFrameDescriptorExtension00::kId,
      RtpGenericFrameDescriptorExtension00::kMaxSizeBytes},
+    CreateExtensionSize<GeckoFlagExtension>(),  // Optional final entry.
 };
+static_assert(kVideoExtensionSizes[arraysize(kVideoExtensionSizes) - 1].type ==
+              GeckoFlagExtension::kId);
 
 // Size info for header extensions that might be used in audio packets.
 constexpr RtpExtensionSize kAudioExtensionSizes[] = {
@@ -126,6 +130,7 @@ bool IsNonVolatile(RTPExtensionType type) {
     case kRtpExtensionGenericFrameDescriptor:
     case kRtpExtensionDependencyDescriptor:
     case kRtpExtensionPduSetInfo:
+    case kRtpExtensionGeckoFlag:  // [Gecko S1] reserved on every video packet
       return true;
     case kRtpExtensionInbandComfortNoise:
     case kRtpExtensionAbsoluteCaptureTime:
@@ -207,8 +212,12 @@ rtc::ArrayView<const RtpExtensionSize> RTPSender::FecExtensionSizes() {
 }
 
 rtc::ArrayView<const RtpExtensionSize> RTPSender::VideoExtensionSizes() {
+  // Gecko is the final optional entry; excluding it while OFF also preserves
+  // packetization sizes when a caller manually registers the extension.
+  const size_t count = arraysize(kVideoExtensionSizes) -
+      (gecko::GeckoController::Get().Enabled() ? 0 : 1);
   return rtc::MakeArrayView(kVideoExtensionSizes,
-                            arraysize(kVideoExtensionSizes));
+                            count);
 }
 
 rtc::ArrayView<const RtpExtensionSize> RTPSender::AudioExtensionSizes() {

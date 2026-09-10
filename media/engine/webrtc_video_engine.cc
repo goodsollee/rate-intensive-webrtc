@@ -58,6 +58,7 @@
 #include "media/base/rid_description.h"
 #include "media/base/rtp_utils.h"
 #include "media/engine/webrtc_media_engine.h"
+#include "pc/coordinator/gecko_controller.h"
 #include "modules/rtp_rtcp/include/receive_statistics.h"
 #include "modules/rtp_rtcp/include/report_block_data.h"
 #include "modules/rtp_rtcp/include/rtcp_statistics.h"
@@ -887,9 +888,18 @@ WebRtcVideoEngine::GetRtpHeaderExtensions() const {
         // is offered with extension ID 7; on-path network elements
         // (emulator/BPF) identify it by that fixed numeric ID on the wire.
         webrtc::RtpExtension::kPduSetInfoUri,
+        // [Gecko S1] position 8 -> extension ID 8, likewise read by numeric
+        // id on the wire (emulator GECKO_EXT_ID). Shifts the ids below by one.
+        webrtc::RtpExtension::kGeckoFlagUri,
         webrtc::RtpExtension::kVideoTimingUri,
         webrtc::RtpExtension::kColorSpaceUri, webrtc::RtpExtension::kMidUri,
         webrtc::RtpExtension::kRidUri, webrtc::RtpExtension::kRepairedRidUri}) {
+    // Gecko is an opt-in baseline. OFF must preserve both the capability list
+    // and the numeric IDs of every subsequent extension.
+    if (uri == webrtc::RtpExtension::kGeckoFlagUri &&
+        !webrtc::gecko::GeckoController::Get().Enabled()) {
+      continue;
+    }
     result.emplace_back(uri, id++, webrtc::RtpTransceiverDirection::kSendRecv);
   }
   result.emplace_back(webrtc::RtpExtension::kCorruptionDetectionUri, id++,

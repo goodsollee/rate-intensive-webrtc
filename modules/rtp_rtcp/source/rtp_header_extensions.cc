@@ -893,4 +893,21 @@ bool PduSetInfoExtension::Write(rtc::ArrayView<uint8_t> data,
   return true;
 }
 
+// [Gecko S1]
+bool GeckoFlagExtension::Parse(rtc::ArrayView<const uint8_t> data,
+                               uint8_t* flag) {
+  RTC_DCHECK(flag);
+  if (data.size() != kValueSizeBytes) {
+    return false;
+  }
+  *flag = data[0] & 0x03;
+  return true;
+}
+
+bool GeckoFlagExtension::Write(rtc::ArrayView<uint8_t> data, uint8_t flag) {
+  RTC_DCHECK_EQ(data.size(), kValueSizeBytes);
+  data[0] = flag & 0x03;
+  return true;
+}
+
 }  // namespace webrtc

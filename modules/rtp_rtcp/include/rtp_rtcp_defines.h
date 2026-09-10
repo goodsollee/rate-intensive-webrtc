@@ -90,6 +90,7 @@ enum RTPExtensionType : int {
   kRtpExtensionVideoFrameTrackingId,
   kRtpExtensionCorruptionDetection,
   kRtpExtensionPduSetInfo,
+  kRtpExtensionGeckoFlag,  // [Gecko S1] sender's flush/no-flush answer, 1 byte
   kRtpExtensionNumberOfExtensions  // Must be the last entity in the enum.
 };
 

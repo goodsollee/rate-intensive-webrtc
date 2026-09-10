@@ -209,6 +209,7 @@ void RtpPacket::ZeroMutableExtensions() {
       case RTPExtensionType::kRtpExtensionVideoRotation:
       case RTPExtensionType::kRtpExtensionInbandComfortNoise:
       case RTPExtensionType::kRtpExtensionVideoFrameTrackingId:
+      case RTPExtensionType::kRtpExtensionGeckoFlag:  // [Gecko S1]
       case RTPExtensionType::kRtpExtensionPduSetInfo: {
         // Non-mutable extension. Don't change it.
         break;

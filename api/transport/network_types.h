@@ -105,6 +105,15 @@ struct RTC_EXPORT PacedPacketInfo {
   int probe_cluster_min_probes = -1;
   int probe_cluster_min_bytes = -1;
   int probe_cluster_bytes_sent = 0;
+  // Sender-only Pudica measurement metadata, copied with transport feedback.
+  // Zero means Eq.2 was disabled, or this packet is not a Pudica probe.
+  int64_t pudica_intended_span_us = 0;
+  int64_t pudica_probe_interval_us = 0;
+  uint32_t pudica_probe_frame_timestamp = 0;
+  // Exact sender-local identity and monotonic time for next-delay feedback.
+  // IDs distinguish packets even when their send timestamps are identical.
+  uint64_t pudica_send_id = 0;
+  int64_t pudica_send_time_us = 0;
 };
 
 struct RTC_EXPORT SentPacket {
@@ -124,6 +133,15 @@ struct RTC_EXPORT SentPacket {
   int64_t sequence_number;
   // Tracked data in flight when the packet was sent, excluding unacked data.
   DataSize data_in_flight = DataSize::Zero();
+  // Frame identity, for rate controllers that measure per video frame rather
+  // than per transport send-time group (Pudica BUR). `rtp_timestamp` is the
+  // on-wire, post-StartTimestamp value, so all packets of one encoded frame
+  // share it; `video_media` is true only for an ORIGINAL video media packet
+  // (false for audio, padding, RTX and FEC). Both stay at their defaults on
+  // any path that does not populate them, and a reader must treat
+  // video_media == false as "no frame identity available".
+  uint32_t rtp_timestamp = 0;
+  bool video_media = false;
 };
 
 struct RTC_EXPORT ReceivedPacket {

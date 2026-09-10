@@ -8,6 +8,7 @@
  *  be found in the AUTHORS file in the root of the source tree.
  */
 
+#include "modules/pacing/pacing_controller.h"
 #include "modules/congestion_controller/goog_cc/goog_cc_network_control.h"
 
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -41,6 +43,7 @@
 #include "modules/congestion_controller/goog_cc/probe_controller.h"
 #include "modules/congestion_controller/goog_cc/send_side_bandwidth_estimation.h"
 #include "modules/remote_bitrate_estimator/include/bwe_defines.h"
+#include "pc/rtp_sctp_coordinator.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/experiments/field_trial_parser.h"
 #include "rtc_base/experiments/rate_control_settings.h"
@@ -64,6 +67,30 @@ constexpr float kDefaultPaceMultiplier = 2.5f;
 // However, if we actually are overusing, we want to drop to something slightly
 // below the current throughput estimate to drain the network queues.
 constexpr double kProbeDropThroughputFraction = 0.85;
+
+// [A31] Remove congestion-window pushback entirely. Unset => byte-identical to
+// upstream, which has it ON by default: WebRTC-CongestionWindow is unset in
+// this testbed, so rate_control_settings.cc falls back to the built-in
+// "QueueSize:350,MinBitrate:30000,DropFrame:true".
+//
+// This is a SEPARATE knob from KFT_NO_FRAME_DROP on purpose. That flag gates
+// five sites (video_stream_encoder.cc 1679/1941/2352/2464 and
+// libvpx_vp8_encoder.cc 994); four of them drop frames, but 2352 does
+// something else entirely -- it zeroes cwnd_reduce_ratio, i.e. it removes a
+// HALVING OF THE ENCODER TARGET, not a frame drop. Measuring the pushback's
+// effect through KFT_NO_FRAME_DROP therefore changes five things at once.
+//
+// Gating construction rather than one consumer disables the mechanism whole:
+// with the controller null, UpdatePacingQueue / SetDataWindow /
+// UpdateOutstandingData are all skipped, pushback_target_rate stays equal to
+// loss_based_target_rate, and cwnd_reduce_ratio stays 0.
+bool KftNoCwndPushback() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_NO_CWND_PUSHBACK");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
 
 BandwidthLimitedCause GetBandwidthLimitedCause(LossBasedState loss_based_state,
                                                bool is_rtt_above_limit,
@@ -114,7 +141,8 @@ GoogCcNetworkController::GoogCcNetworkController(NetworkControllerConfig config,
       probe_controller_(
           new ProbeController(&env_.field_trials(), &env_.event_log())),
       congestion_window_pushback_controller_(
-          rate_control_settings_.UseCongestionWindowPushback()
+          (rate_control_settings_.UseCongestionWindowPushback() &&
+           !KftNoCwndPushback())
               ? std::make_unique<CongestionWindowPushbackController>(
                     env_.field_trials())
               : nullptr),
@@ -250,8 +278,14 @@ NetworkControlUpdate GoogCcNetworkController::OnProcessInterval(
   update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
                                       probes.begin(), probes.end());
 
+  // [A31] KftNoCwndPushback() suppresses the WINDOW too, not just the pushback
+  // controller. Leaving it computed would be worse than upstream: with the
+  // controller null the branch below routes current_data_window_ into
+  // update.congestion_window instead, i.e. a hard transport-side cap on
+  // outstanding data replaces a soft encoder-side rate reduction. The knob is
+  // meant to remove the mechanism, not relocate it.
   if (rate_control_settings_.UseCongestionWindow() &&
-      !feedback_max_rtts_.empty()) {
+      !feedback_max_rtts_.empty() && !KftNoCwndPushback()) {
     UpdateCongestionWindowSize();
   }
   if (congestion_window_pushback_controller_ && current_data_window_) {
@@ -259,6 +293,33 @@ NetworkControlUpdate GoogCcNetworkController::OnProcessInterval(
         *current_data_window_);
   } else {
     update.congestion_window = current_data_window_;
+  }
+  // [A28e] Timer-driven evaluation of Pudica's §4.3 next-delay fallback.
+  //
+  // The rule is measured entirely on the SENDER's clock precisely so it does
+  // not need the failed link to carry anything -- but until now its only call
+  // site was inside DelayBasedBwe::MaybeUpdateEstimate(), reachable only from
+  // OnTransportPacketsFeedback(). In a full blackout no packet reaches the UE,
+  // so no TWCC comes back, so the fallback never runs and the target stays
+  // frozen at its pre-dip value. That is the exact opposite of what the signal
+  // exists for.
+  //
+  // Measured on run 1789022666 (q1s_attcampus_5g_122s): next_delay.csv has NO
+  // ROWS at all for every one of the 7 zero-capacity seconds -- the function
+  // was never called. Feedback stopped for 1.2-2.2 s at t=17.9/23.9/32.9/
+  // 52.9/56.9/59.9 s while the target sat at 48.94 and 49.35 Mbps into a link
+  // delivering nothing.
+  //
+  // OnProcessInterval is the periodic path (25 ms) and keeps running with no
+  // feedback, so evaluating here makes the fallback reachable. Applied the
+  // same way the feedback path applies it, via UpdateDelayBasedEstimate()
+  // followed by the MaybeTriggerOnNetworkChanged() already below.
+  if (RtpSctpCoordinator::IsPudicaMode()) {
+    int64_t pud_fallback = RtpSctpCoordinator::GetPudicaTimerFallback();
+    if (pud_fallback > 0) {
+      bandwidth_estimation_->UpdateDelayBasedEstimate(
+          msg.at_time, DataRate::BitsPerSec(pud_fallback));
+    }
   }
   MaybeTriggerOnNetworkChanged(&update, msg.at_time);
   return update;
@@ -527,8 +588,25 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
   bandwidth_estimation_->SetAcknowledgedRate(acknowledged_bitrate,
                                              report.feedback_time);
   for (const auto& feedback : report.SortedByReceiveTime()) {
+    // [A22] Pudica's Eq.5 probes carry kPudicaProbeClusterId (-100) purely as a
+    // TAG so delay_based_bwe.cc can route them to the coordinator; they are NOT
+    // GoogCC bandwidth probes. pacing_controller.h claimed "GCC ProbeController
+    // only processes probe_cluster_id >= 0, so -100 is ignored" -- but the test
+    // here is != kNotAProbe (-1), so -100 fell straight through into
+    // ProbeBitrateEstimator, which immediately fails
+    //   RTC_CHECK(pacing_info.probe_cluster_min_probes > 0)   (-1 vs 0)
+    // because pudica_info sets only the cluster id. PUDICA_PROBING=1 therefore
+    // aborted the sender ~2.7 s in, on every build, which is why probe_count
+    // was 0 in every run of this series.
+    //
+    // Excluded rather than given a min_probes value on purpose: these are
+    // 50-byte padding bursts placed in the inter-frame gap to measure LINK
+    // OCCUPANCY, and letting ProbeBitrateEstimator read them as a probe cluster
+    // would feed GoogCC a bandwidth estimate derived from 200 bytes.
     if (feedback.sent_packet.pacing_info.probe_cluster_id !=
-        PacedPacketInfo::kNotAProbe) {
+            PacedPacketInfo::kNotAProbe &&
+        feedback.sent_packet.pacing_info.probe_cluster_id !=
+            PacingController::kPudicaProbeClusterId) {
       probe_bitrate_estimator_->HandleProbeAndEstimateBitrate(feedback);
     }
   }
@@ -602,7 +680,7 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
   // No valid RTT could be because send-side BWE isn't used, in which case
   // we don't try to limit the outstanding packets.
   if (rate_control_settings_.UseCongestionWindow() &&
-      max_feedback_rtt.IsFinite()) {
+      max_feedback_rtt.IsFinite() && !KftNoCwndPushback()) {   // [A31]
     UpdateCongestionWindowSize();
   }
   if (congestion_window_pushback_controller_ && current_data_window_) {

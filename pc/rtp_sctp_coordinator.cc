@@ -17,6 +17,7 @@
 #include "modules/pacing/pacing_controller.h"
 #include "media/sctp/dcsctp_transport.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -37,6 +38,9 @@ std::atomic<bool> RtpSctpCoordinator::fse_v2_mode_active_{false};
 std::atomic<double> RtpSctpCoordinator::pudica_rho_{2.0};
 std::atomic<int64_t> RtpSctpCoordinator::pudica_rtp_target_bps_{0};
 std::atomic<bool> RtpSctpCoordinator::pudica_mode_active_{false};
+std::atomic<int64_t> RtpSctpCoordinator::pudica_acked_send_us_{0};
+std::atomic<uint64_t> RtpSctpCoordinator::pudica_acked_send_id_{0};
+std::atomic<bool> RtpSctpCoordinator::pudica_in_timer_path_{false};
 
 namespace {
 
@@ -366,6 +370,9 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
     // Start at 0 so GCC warm-starts until the first frame BUR arrives.
     pudica_mode_active_.store(true, std::memory_order_relaxed);
     pudica_rtp_target_bps_.store(0, std::memory_order_relaxed);
+    // [A28] next delay starts with an empty ledger and no acked frontier.
+    pudica_acked_send_us_.store(0, std::memory_order_relaxed);
+    pudica_acked_send_id_.store(0, std::memory_order_relaxed);
     pudica_rtp_ctrl_.cfg = PudicaRtpRateCtrl::Config::FromEnv();
     pudica_rtp_ctrl_.cfg.min_rate_bps = config_.min_rate_bps;
     // Published B ceiling is PUDICA_MAX_RATE_KBPS / kPudicaAppCapBps (100 Mbps).
@@ -377,6 +384,12 @@ RtpSctpCoordinator::RtpSctpCoordinator(rtc::Thread* network_thread,
       const char* e = std::getenv("PUDICA_LEGACY");
       pudica_legacy_ = (e && std::atoi(e) != 0);
     }
+    // [A28] Enable the next-delay ledger in the pacer. Independent of probing
+    // and of Eq.2 intra-frame pacing, both of which are separately switchable.
+    PacingController::SetPudicaMode(true);
+    PacingController::SetPudicaIntraFramePacing(
+        ReadEnvBool("PUDICA_INTRA_FRAME_PACING", true),
+        TimeDelta::Micros(static_cast<int64_t>(features_.L_ms * 1000.0)));
     // Activate probe injection in PacingController
     if (features_.pudica_probing) {
       PacingController::SetPudicaProbing(
@@ -438,6 +451,13 @@ RtpSctpCoordinator::~RtpSctpCoordinator() {
     active_instance_ = nullptr;
     rtp_fse_override_bps_.store(0, std::memory_order_relaxed);
     fse_mode_active_.store(false, std::memory_order_relaxed);
+    if (config_.mode == CoordinatorMode::kPudica) {
+      pudica_mode_active_.store(false, std::memory_order_relaxed);
+      pudica_rtp_target_bps_.store(0, std::memory_order_relaxed);
+      PacingController::SetPudicaMode(false);
+      PacingController::SetPudicaProbing(false, 4, TimeDelta::Zero());
+      PacingController::SetPudicaIntraFramePacing(false, TimeDelta::Zero());
+    }
   }
   if (csv_file_.is_open()) csv_file_.close();
   RTC_LOG(LS_INFO) << "[BUR-COORD] Destroyed.";
@@ -776,6 +796,13 @@ int64_t RtpSctpCoordinator::GetAckRateBps() const {
                       ack_samples_.front().timestamp_ms;
     if (span_ms >= 10) {
       window = std::min(span_ms, ack_window);
+      // [A21] The span runs from the FRONT sample's stamp, so it covers only
+      // the gaps BETWEEN samples. The front sample's bytes were acked over an
+      // interval that ends at that stamp -- entirely outside the span. Keeping
+      // them in the numerator divides n samples' bytes by n-1 gaps, i.e. reads
+      // n/(n-1) too high. See GetRtpRecvRateBps for the measurement.
+      total -= ack_samples_.front().bytes;
+      if (total <= 0) return 0;
     }
   }
   return (total * 8 * 1000) / window;
@@ -788,7 +815,16 @@ int64_t RtpSctpCoordinator::GetRtpRecvRateBps() const {
   if (span_ms < 10) return 0;
   int64_t window_ms = std::min(span_ms, kAckWindowMs);
   if (window_ms <= 0) return 0;
-  return rtp_samples_total_bytes_ * 8 * 1000 / window_ms;
+  // [A21] Exclude the front sample's bytes -- see GetAckRateBps. Measured on
+  // run 1788929764 (40 Mbps link, n_ack_samples p50 = 4, i.e. +33%): 306 of
+  // 435 samples in the 40 Mbps stretch reported a rate the link physically
+  // cannot carry, peaking at 52.1 Mbps payload (57 Mbps on wire). With the
+  // front sample removed the maximum is 39.9 Mbps on wire and nothing exceeds
+  // the link. The consequence was that alpha = 0.85 was applied to a base
+  // 33% too high, so Pudica's real target was 1.13 x the link.
+  int64_t bytes = rtp_samples_total_bytes_ - rtp_ack_samples_.front().bytes;
+  if (bytes <= 0) return 0;
+  return bytes * 8 * 1000 / window_ms;
 }
 
 int64_t RtpSctpCoordinator::GetDirectSctpRecvRateBps() const {
@@ -796,8 +832,12 @@ int64_t RtpSctpCoordinator::GetDirectSctpRecvRateBps() const {
   int64_t window_ms = sctp_recv_samples_.back().timestamp_ms -
                       sctp_recv_samples_.front().timestamp_ms;
   if (window_ms <= 0) return 0;
+  // [A21] Same front-sample exclusion as GetAckRateBps: window_ms starts at
+  // sctp_recv_samples_.front()'s stamp, so that sample's bytes precede it.
   int64_t total_bytes = 0;
   for (const auto& s : sctp_recv_samples_) total_bytes += s.bytes;
+  total_bytes -= sctp_recv_samples_.front().bytes;
+  if (total_bytes <= 0) return 0;
   return total_bytes * 8 * 1000 / window_ms;
 }
 
@@ -2235,9 +2275,13 @@ void RtpSctpCoordinator::MaybeUpdateMafsPriorities(int64_t now_ms) {
 
 void RtpSctpCoordinator::OnPudicaPacketFeedback(
     int64_t transport_seq, int64_t send_time_us, int64_t recv_time_us,
-    bool is_probe, bool is_frame_last) {
+    bool is_probe, bool is_frame_last, uint32_t rtp_timestamp,
+    int64_t size_bytes, int64_t inflight_bytes,
+    int64_t intended_span_us, int64_t probe_interval_us,
+    uint64_t pudica_send_id, int64_t pudica_send_time_us) {
   if (!active_instance_) return;
   auto* self = active_instance_;
+  if (inflight_bytes > 0) self->pudica_inflight_meas_bytes_ = inflight_bytes;
   // Frame OWD BUR: works for Pudica and ALL agentrtc modes.
   // Always compute per-frame OWD so it's available as fallback during idle gaps.
   if (self->config_.mode != CoordinatorMode::kPudica &&
@@ -2246,6 +2290,20 @@ void RtpSctpCoordinator::OnPudicaPacketFeedback(
   }
 
   double owd_us = static_cast<double>(recv_time_us - send_time_us);
+
+  // The sender-local identity is preserved in transport history. Transport's
+  // send_time_us is rounded to milliseconds and cannot distinguish markers in
+  // one timestamp bucket, nor retire a microsecond-resolution ledger exactly.
+  if (pudica_send_id > 0 && pudica_send_time_us > 0) {
+    uint64_t prev = pudica_acked_send_id_.load(std::memory_order_relaxed);
+    while (pudica_send_id > prev &&
+           !pudica_acked_send_id_.compare_exchange_weak(
+               prev, pudica_send_id, std::memory_order_relaxed)) {
+    }
+    if (pudica_send_id > prev) {
+      pudica_acked_send_us_.store(pudica_send_time_us, std::memory_order_relaxed);
+    }
+  }
 
   // Debug: periodic report
   static int64_t pudica_pkt_count = 0;
@@ -2263,7 +2321,7 @@ void RtpSctpCoordinator::OnPudicaPacketFeedback(
   }
 
   // Update D_min (minimum packet OWD over 10-second window, in μs)
-  if (owd_us > 0) {
+  if (!is_probe && owd_us > 0) {
     self->pudica_owd_window_.push_back({recv_time_us, owd_us});
     while (!self->pudica_owd_window_.empty() &&
            (recv_time_us - self->pudica_owd_window_.front().first) >
@@ -2277,16 +2335,58 @@ void RtpSctpCoordinator::OnPudicaPacketFeedback(
   }
 
   if (is_probe) {
-    double h_us = (self->pudica_last_frame_recv_us_ > 0)
-                      ? static_cast<double>(recv_time_us -
-                                            self->pudica_last_frame_recv_us_)
-                      : owd_us;
-    self->pudica_probe_results_.push_back({owd_us, h_us});
+    // A probe follows the currently accumulating frame. Use that frame's
+    // latest arrival, not the preceding frame's already-finalized marker.
+    const int64_t frame_recv_us = self->pudica_frame_.last_recv_us;
+    if (frame_recv_us > 0 && self->pudica_d_min_us_ > 0 &&
+        self->pudica_frame_rtp_ts_valid_ &&
+        rtp_timestamp == self->pudica_frame_rtp_ts_ &&
+        probe_interval_us > 0 && self->pudica_probe_results_.size() < 64) {
+      const double h_us = std::max<int64_t>(0, recv_time_us - frame_recv_us);
+      self->pudica_probe_results_.push_back(
+          {owd_us, h_us, static_cast<double>(probe_interval_us)});
+    }
   } else {
-    // Media packet: track per-frame OWD
-    // IMPORTANT: is_frame_last means THIS packet is the first of a NEW frame.
-    // Compute BUR for the previous frame BEFORE adding this packet.
-    if (is_frame_last && self->pudica_frame_.frame_packets > 0) {
+    // A delayed ACK from an older frame cannot join the current frame or
+    // rewind its RTP timestamp. Keep ACK frontier progress but skip its BUR.
+    if (self->pudica_frame_rtp_ts_valid_ &&
+        static_cast<int32_t>(rtp_timestamp - self->pudica_frame_rtp_ts_) < 0) {
+      return;
+    }
+    // Media packet: track per-frame OWD.
+    //
+    // FRAME BOUNDARY. BUR is a per-FRAME quantity: (D - D_min) is the link
+    // time one encoded frame occupied and L is the interval it was given, so
+    // R > 1 means the frame did not fit. The accumulator therefore has to hold
+    // exactly one frame. `is_frame_last` (an InterArrivalDelta send-time group
+    // boundary) does not do that: under congestion arrivals bunch below
+    // kBurstDeltaThreshold, BelongsToBurst() merges frames, and one sample
+    // then spans N frames while L stays at one interval — measured at 961
+    // packets covering seven frames, reading bur = 8.576 where the honest
+    // figure was ~1.2 (run 1788856257, t = 49.573 s).
+    //
+    // Rescaling L cannot repair that: D is itself span + owd, so dividing by
+    // the span cancels the span and drives BUR to 1 + queue/span, i.e. the
+    // queue signal is suppressed hardest exactly when the link is worst. That
+    // was tried and reverted (run 1788857998; stall 10.9 s -> 16.8 s).
+    //
+    // So delimit on the frame itself. rtp_timestamp is constant across one
+    // encoded frame and steps once per frame. The comparison is wrapped
+    // (int32 difference) so a reordered packet from an OLDER frame joins the
+    // current accumulator instead of splitting it — slight contamination is
+    // cheaper than a phantom one-packet frame, which is what A6 removed.
+    //
+    // is_frame_last remains the fallback for any path that does not populate
+    // SentPacket::rtp_timestamp, so a plumbing regression degrades to the old
+    // behaviour rather than starving the controller of samples entirely.
+    bool boundary;
+    if (self->pudica_frame_rtp_ts_valid_) {
+      boundary = static_cast<int32_t>(rtp_timestamp -
+                                      self->pudica_frame_rtp_ts_) > 0;
+    } else {
+      boundary = is_frame_last;
+    }
+    if (boundary && self->pudica_frame_.frame_packets > 0) {
       double bur = self->PudicaComputeFrameBur(recv_time_us);
       if (bur >= 0.0) {
         // Apollo: drive the RTP-video target from this frame's BUR (Pudica
@@ -2518,12 +2618,25 @@ void RtpSctpCoordinator::OnPudicaPacketFeedback(
         }
       }
 
-      // Update adaptive pacing: ρ = γ_ρ / min(R, 1) (use base frame BUR, not corrected)
-      double r_clamped = std::max(0.01, std::min(bur, 1.0));
-      double rho = self->features_.pudica_gamma_rho / r_clamped;
-      rho = std::max(1.0, std::min(rho, 10.0));
-      pudica_rho_.store(rho, std::memory_order_relaxed);
-      PacingController::SetPudicaRho(rho);
+      // [A25] Eq.2's ρ is computed in ONE place, PacingController::PudicaRho(),
+      // and mirrored here only so pudica_debug.csv and the Eq.5 probe spacing
+      // read the same number the pacer used.
+      //
+      // This block used to compute ρ itself and push it through
+      // SetPudicaRho(). That was the whole of Eq.2 on this branch, and it was
+      // half-wired: nothing consumed ρ as a SEND SPAN, so it only ever set the
+      // post-frame gap and the probe interval, and `PUDICA_RHO` (the manual
+      // override this fed) then read as "ρ was pinned" to the pacer. Keeping
+      // both would have raced -- SetPudicaRho() writes the very field
+      // PudicaRho() treats as the manual pin, so an adaptive value written here
+      // would have permanently disabled the adaptive path there.
+      //
+      // R here is the base frame BUR, uncorrected by Eq.5, and that is
+      // deliberate: the probe correction is computed FROM T_packet, which is
+      // derived from ρ, so feeding the corrected R back into ρ closes a loop.
+      PacingController::SetPudicaBur(bur);
+      pudica_rho_.store(PacingController::PudicaRho(),
+                        std::memory_order_relaxed);
 
       // Set RTT_ref synthetically from frame measurement.
       // RTT_ref = RTT_min + (D_frame - D_min)
@@ -2567,15 +2680,26 @@ void RtpSctpCoordinator::OnPudicaPacketFeedback(
     }
 
     // Now add current packet to the (new) frame
+    // Guarded on non-zero: if the frame identity never arrives (a plumbing
+    // regression, or a caller using the 5-argument overload), the sentinel
+    // stays false and the fallback keeps producing samples. Marking it valid
+    // unconditionally would leave the wrapped comparison at 0 - 0, no boundary
+    // would ever fire, and the controller would receive no BUR at all.
+    if (rtp_timestamp != 0) {
+      self->pudica_frame_rtp_ts_ = rtp_timestamp;
+      self->pudica_frame_rtp_ts_valid_ = true;
+    }
     if (self->pudica_frame_.first_send_us < 0 ||
         send_time_us < self->pudica_frame_.first_send_us) {
       self->pudica_frame_.first_send_us = send_time_us;
+      self->pudica_frame_.intended_span_us = intended_span_us;
     }
     if (send_time_us > self->pudica_frame_.last_send_us) {
       self->pudica_frame_.last_send_us = send_time_us;
     }
     self->pudica_frame_.last_recv_us = recv_time_us;
     self->pudica_frame_.frame_packets++;
+    self->pudica_frame_.frame_bytes += size_bytes;
   }
 }
 
@@ -2592,24 +2716,57 @@ double RtpSctpCoordinator::PudicaComputeFrameBur(int64_t now_us) {
   double D_us = static_cast<double>(pudica_frame_.last_recv_us -
                                      pudica_frame_.first_send_us);
 
-  // R = (D - D_min) / L (Pudica Eq.1) — all in μs, result dimensionless
-  double base_R = std::max(0.0, (D_us - pudica_d_min_us_) / L_us);
+  // SUBTRACT the frame's own emission span. Do not divide by it.
+  //
+  // Eq.1's D = last_recv - first_send is the frame's OWD, and it is that only
+  // while the frame leaves as a burst, which is the regime the paper assumes
+  // (cloud gaming, target >> frame size / L). Here the pacer emits at the
+  // committed rate, so once the controller throttles, D is dominated by how
+  // long the SENDER took to push the frame out, and BUR then measures this
+  // controller's own brake and calls it congestion. It self-latches:
+  //
+  //   DRAIN -> commit = min_rate (1 Mbps) -> a 15-packet frame takes 90-180 ms
+  //   to emit -> excess = 90-180 ms -> BUR = 2.7-5.4 > 1 -> consec stays >= 3
+  //   -> DRAIN stays -> commit stays at 1 Mbps.
+  //
+  // Measured against the RAN's own queue on run 1788860317, trace 25-31 s
+  // (link back at 40 Mbps, DU backlog 0.0-0.7 ms for eight seconds straight):
+  //
+  //   t=26.85  bur=5.424  span=179 ms  excess=179 ms  DU queue 0.3 ms
+  //   t=29.52  bur=3.970  span=131 ms  excess=131 ms  DU queue 0.1 ms
+  //   t=47.53  bur=21.424 span=706 ms  excess=707 ms  DU queue 2.1 ms
+  //
+  // excess == span to within a millisecond in every one of them, and the
+  // implied emission rate (1.09-1.20 Mbps) is the committed rate. Run-wide,
+  // 140 of 201 DRAIN samples (70%) had span > L. Subtracting the span leaves
+  // 0.000-0.061, which is what the RAN measured.
+  //
+  // last_recv - last_send is the last packet's own transit, so what remains
+  // after D_min is the queue the frame actually met. It under-reads while a
+  // queue is draining mid-frame (t=23.59: 6 ms against the RAN's 22 ms), but
+  // both sides of that case are far below L and the decision is unchanged.
+  //
+  // Dividing by the span was tried instead and reverted (A7/A8, run
+  // 1788857998): D already contains the span, so (D - D_min)/span collapses to
+  // 1 + queue/span and suppresses the signal hardest when the link is worst.
+  double span_us = static_cast<double>(pudica_frame_.last_send_us -
+                                       pudica_frame_.first_send_us);
+  if (span_us < 0.0) span_us = 0.0;
+  pudica_frame_span_us_ = span_us;      // logged as span_ms in pudica_ctrl.csv
+
+  // R = (D - D_min) / L (Pudica Eq.1), D taken net of the emission span.
+  double base_R = std::max(0.0, (D_us - span_us - pudica_d_min_us_) / L_us);
   double R = base_R;
 
   // Probe correction: R_corrected = R + Σ T_i / L (Pudica Eq.5)
   int probe_count = static_cast<int>(pudica_probe_results_.size());
   double probe_correction_us = 0.0;
   if (!pudica_probe_results_.empty()) {
-    double rho = pudica_rho_.load(std::memory_order_relaxed);
-    double T_packet_us = (1.0 - 1.0 / rho) * L_us /
-                         (features_.pudica_num_probes + 1);
-    if (T_packet_us < 100.0) T_packet_us = 100.0;  // min 0.1ms
-
     for (const auto& probe : pudica_probe_results_) {
       double probe_excess = probe.owd_us - pudica_d_min_us_;
       if (probe_excess < 0.0) probe_excess = 0.0;
       // T_i = min(D_i - D_min, H_i, T_packet) (Pudica Eq.4)
-      double T_i = std::min({probe_excess, probe.h_us, T_packet_us});
+      double T_i = std::min({probe_excess, probe.h_us, probe.interval_us});
       if (T_i < 0.0) T_i = 0.0;
       probe_correction_us += T_i;
     }
@@ -2622,7 +2779,31 @@ double RtpSctpCoordinator::PudicaComputeFrameBur(int64_t now_us) {
   if (rate_bps <= 0) {
     rate_bps = pacing_rate_bps_.load(std::memory_order_relaxed);
   }
-  pudica_bur_history_.push_back({now_us, R, static_cast<double>(rate_bps)});
+  // [A41] What Eq.6 averages. R above stays the short-term signal (FALLBACK,
+  // DRAIN, drain exit, rho, the DRAIN queue estimate): those want the queue
+  // behind the frame, and A10 measures exactly that. The smoothed BUR decides
+  // MI vs AI-MD, which is a question about UTILISATION, so it gets the paper's
+  // Eq.1 (PudicaUtilBur) and, as B_k, the bitrate the frame was actually
+  // encoded at. Eq.6's B/B_k is there to "rectify any deviation" between the
+  // frame's bitrate and the current one; with B_k = target, a frame the
+  // encoder undershot by 10x reads as a link 10x emptier than B would find it.
+  // That is the post-DRAIN jump: output 2-8 Mbps against B = 34, R~ 0.1-0.3,
+  // MI straight to the ceiling (run 1789041793, 16 jumps >25% in 40-75 s).
+  static const bool kEq6Util = []() {
+    const char* e = std::getenv("PUDICA_EQ6_UTIL");
+    return !(e && std::atoi(e) == 0);  // default ON
+  }();
+  const double intended_span_us = pudica_frame_.intended_span_us;
+  const double util_R =
+      PudicaUtilBur(D_us, pudica_d_min_us_, span_us, intended_span_us, L_us) +
+      probe_correction_us / L_us;
+  const double frame_bps =
+      static_cast<double>(pudica_frame_.frame_bytes) * 8.0 * 1e6 / L_us;
+  if (kEq6Util && frame_bps > 0.0) {
+    pudica_bur_history_.push_back({now_us, util_R, frame_bps});
+  } else {
+    pudica_bur_history_.push_back({now_us, R, static_cast<double>(rate_bps)});
+  }
   while (!pudica_bur_history_.empty() &&
          (now_us - pudica_bur_history_.front().time_us) > kPudicaBurWindowUs) {
     pudica_bur_history_.pop_front();
@@ -2639,7 +2820,9 @@ double RtpSctpCoordinator::PudicaComputeFrameBur(int64_t now_us) {
         chmod(path.c_str(), 0666);
         pudica_csv_file_ << "time_ms,frame_owd_ms,d_min_ms,base_bur,"
                             "probe_count,probe_correction_ms,corrected_bur,"
-                            "rho,frame_packets\n";
+                            "rho,frame_packets,util_bur,frame_mbps,"
+                            "span_ms,intended_span_ms,first_send_us,last_send_us,"
+                            "last_recv_us,rtp_timestamp,acked_frame_bytes,monotonic_us\n";
       }
       pudica_csv_start_us_ = now_us;
       pudica_csv_initialized_ = true;
@@ -2653,7 +2836,16 @@ double RtpSctpCoordinator::PudicaComputeFrameBur(int64_t now_us) {
                      << std::setprecision(3) << (probe_correction_us / 1000.0) << ","
                      << std::setprecision(6) << R << ","
                      << std::setprecision(2) << rho_val << ","
-                     << pudica_frame_.frame_packets << "\n";
+                     << pudica_frame_.frame_packets << ","
+                     << std::setprecision(6) << util_R << ","
+                     << std::setprecision(3) << (frame_bps / 1e6) << ","
+                     << span_us / 1000.0 << "," << intended_span_us / 1000.0 << ","
+                     << pudica_frame_.first_send_us << ","
+                     << pudica_frame_.last_send_us << ","
+                     << pudica_frame_.last_recv_us << ","
+                     << pudica_frame_rtp_ts_ << "," << pudica_frame_.frame_bytes
+                     << "," << rtc::TimeMicros() << "\n";
+    pudica_csv_file_.flush();
   }
 
   return R;
@@ -2684,8 +2876,218 @@ bool RtpSctpCoordinator::IsPudicaMode() {
   return pudica_mode_active_.load(std::memory_order_relaxed);
 }
 
+// [A28d] One row per GetPudicaRtpOverride() call. Called from the TWCC
+// feedback path (DelayBasedBwe), which is a different thread from the frame
+// path that writes pudica_ctrl.csv, hence its own mutex and stream.
+//
+// `reason` says which exit was taken:
+//   fire   next delay exceeded the threshold; out < target by zeta^steps
+//   below  in-flight frame exists but is not late enough yet
+//   empty  NOTHING outstanding -- the ambiguous case (see the call site)
+//   no_L   L_ms misconfigured (should never appear)
+void RtpSctpCoordinator::PudicaLogNextDelay(int64_t now_us,
+                                            double next_delay_ms,
+                                            double d_min_ms,
+                                            int steps,
+                                            int64_t target_bps,
+                                            int64_t out_bps,
+                                            const char* reason,
+                                            int64_t oldest_us,
+                                            int64_t acked_us,
+                                            uint64_t oldest_id,
+                                            uint64_t acked_id) {
+  std::lock_guard<std::mutex> lock(pudica_nd_csv_mu_);
+  if (!pudica_nd_csv_initialized_) {
+    const char* dir = std::getenv("UNIFIED_CSV_DIR");
+    if (dir && std::strlen(dir) > 0) {
+      std::string path = std::string(dir) + "/next_delay.csv";
+      pudica_nd_csv_.open(path, std::ios::out | std::ios::trunc);
+      if (pudica_nd_csv_.is_open()) {
+        chmod(path.c_str(), 0666);
+        pudica_nd_csv_ << "t_ms,reason,next_delay_ms,d_min_ms,steps,"
+                          "target_mbps,out_mbps,recv_mbps,now_us,oldest_us,acked_us,monotonic_us,oldest_id,acked_id\n";
+      }
+      pudica_nd_csv_start_us_ = now_us;
+      pudica_nd_csv_initialized_ = true;
+    } else {
+      pudica_nd_csv_initialized_ = true;  // no dir: log once, stay quiet
+    }
+  }
+  if (!pudica_nd_csv_.is_open()) return;
+  pudica_nd_csv_ << std::fixed << std::setprecision(3)
+                 << ((now_us - pudica_nd_csv_start_us_) / 1000.0) << ","
+                 << reason
+                 << (pudica_in_timer_path_.load(std::memory_order_relaxed)
+                         ? "-t"
+                         : "")
+                 << "," << next_delay_ms << "," << d_min_ms << ","
+                 << steps << "," << (target_bps / 1e6) << ","
+                 << (out_bps / 1e6) << ","
+                 << (GetRtpRecvRateBps() / 1e6) << "," << now_us << ","
+                 << oldest_us << "," << acked_us << "," << now_us << ","
+                 << oldest_id << "," << acked_id << "\n";
+  pudica_nd_csv_.flush();
+}
+
+// [A28e] Timer-path entry point. Evaluates next delay and returns a value ONLY
+// when the fallback actually fired, i.e. only when it cut the target.
+//
+// The distinction matters for the control arm. GetPudicaRtpOverride() returns
+// the unchanged target when next delay is disabled or below threshold, and
+// pushing that through UpdateDelayBasedEstimate() every 25 ms would publish the
+// Pudica target on a path that never carried it before -- changing the rate
+// trajectory of PUDICA_NEXT_DELAY_MS=0 runs, which are exactly the runs the
+// firing arms get compared against. Returning 0 unless the value was reduced
+// keeps the OFF arm byte-identical.
+int64_t RtpSctpCoordinator::GetPudicaTimerFallback() {
+  const int64_t before = pudica_rtp_target_bps_.load(std::memory_order_relaxed);
+  pudica_in_timer_path_.store(true, std::memory_order_relaxed);
+  const int64_t out = GetPudicaRtpOverride();
+  pudica_in_timer_path_.store(false, std::memory_order_relaxed);
+  return (out > 0 && out < before) ? out : 0;
+}
+
+// [A28] Pudica NSDI'24 §4.3 "next delay".
+//
+// WHY THIS LIVES HERE AND NOT IN PudicaUpdateRtpTarget(). The controller in
+// pudica_rtp_rate.h runs once per frame whose completion is observed in TWCC
+// feedback. A dip deep enough to stall frame completions therefore stops
+// producing decisions altogether -- neither the zeta fallback nor DRAIN can
+// fire, because the frame they would fire ON never arrives. Measured on
+// mae-nodrop: pudica_ctrl.csv tick gaps reach 288 ms (run 1789003559),
+// 587 ms (1788958392) and 1226 ms (1788953652), with 2.2-4.9 s per run spent
+// in gaps over 200 ms. Run 1789003559 has six ~270 ms gaps clustered in
+// t=30-35 s -- exactly the stall interval.
+//
+// This function, by contrast, is called from DelayBasedBwe on every TWCC
+// feedback, so it keeps running when the controller does not. It is the
+// paper's own answer to "the sender may experience delays in receiving
+// feedback regarding network degradation, which can lead to delayed bitrate
+// fallback": next delay is measured entirely on the SENDER's clock and so
+// needs the failed link to carry nothing at all.
 int64_t RtpSctpCoordinator::GetPudicaRtpOverride() {
-  return pudica_rtp_target_bps_.load(std::memory_order_relaxed);
+  int64_t target = pudica_rtp_target_bps_.load(std::memory_order_relaxed);
+  if (target <= 0) return 0;
+
+  // Threshold = D_min + margin. The paper says only "when the next delay is
+  // significant". It is NOT a multiple of L: next delay has an irreducible
+  // floor of one one-way delay plus one TWCC batching interval (kMinInterval
+  // clamps to 50 ms above ~1 Mbps), and neither term is related to L. An
+  // L-multiple threshold false-fires on one trace and never fires on another.
+  //
+  // Anchoring on D_min removes that trace dependence: D_min IS the floor, it
+  // is already tracked, and the margin is then a real margin.
+  //
+  // Default 150 ms, not the 200 ms that was tuned on a shallower link. Our
+  // D_min is 73-111 ms (vs 64-96 ms there), so a 200 ms margin puts the
+  // threshold at 273 ms on run 1789003559 -- just ABOVE that run's 260-288 ms
+  // gap cluster, which fires 1 of 19 gaps and covers 0.02 s. At 150 ms the
+  // threshold is 223 ms: all 19 gaps fire, and it still sits 1.65x above that
+  // run's frame_owd p90 (135 ms) so ordinary jitter cannot reach it.
+  static const double kNextDelayMarginUs = []() {
+    const char* e = std::getenv("PUDICA_NEXT_DELAY_MS");
+    return (e ? std::atof(e) : 150.0) * 1000.0;
+  }();
+  static const double kZeta = []() {
+    const char* e = std::getenv("PUDICA_FALLBACK_ZETA");
+    return e ? std::atof(e) : 0.15;
+  }();
+  // Each further frame interval with no acknowledgement earns one more zeta
+  // cut. Compounding rather than a single 15% step is ours, not the paper's:
+  // the paper's fallback re-fires per frame off the BUR, and here there are no
+  // frames to re-fire on.
+  //
+  // The cap is 2 and it is load-bearing. next_delay grows at 1 ms/ms once the
+  // queue builds, so steps grows by one every L -- 30 steps per second. A cap
+  // of 12 spends the whole budget in 400 ms; combined with the recv_rate
+  // anchor below that double-counts the collapse (the anchor already fell) and
+  // lands on the 1 Mbps floor while the link is still delivering several Mbps.
+  // At 2, published >= 0.72 x anchor by construction: the cap IS the floor
+  // against the delivered rate. Sending at 1 Mbps does not drain a queue any
+  // faster than the link does.
+  static const int kMaxSteps = []() {
+    const char* e = std::getenv("PUDICA_NEXT_DELAY_MAX_STEPS");
+    return e ? std::atoi(e) : 2;
+  }();
+
+  if (kNextDelayMarginUs <= 0.0 || active_instance_ == nullptr) return target;
+
+  const double L_us = active_instance_->features_.L_ms * 1000.0;
+  const int64_t acked_us = pudica_acked_send_us_.load(std::memory_order_relaxed);
+  const uint64_t acked_id = pudica_acked_send_id_.load(std::memory_order_relaxed);
+  uint64_t oldest_id = 0;
+  const int64_t oldest_us =
+      PacingController::PudicaOldestUnackedSendUs(acked_id, &oldest_id);
+  // D_min is -1 until the first packet OWD lands; until then the margin alone
+  // is the threshold, which is conservative (too high, never too low).
+  const double d_min_us = std::max(0.0, active_instance_->pudica_d_min_us_);
+
+  // Same monotonic API as RealTimeClock::CurrentTime() in the pacer.
+  const int64_t now_us = rtc::TimeMicros();
+
+  // [A28d] EMPTY LEDGER. Nothing is outstanding, so there is no "next
+  // to-be-received frame" to time. This is NOT the same as a healthy link: it
+  // is also what a total blackout looks like once everything already sent has
+  // been acked and the pacer cannot enqueue anything new. The paper's signal
+  // cannot distinguish "nothing owed" from "nothing coming back", and this
+  // early return is where that ambiguity is resolved -- silently, in favour of
+  // doing nothing. Logged as reason=empty so the run can say how often it hit.
+  if (oldest_us <= 0 || L_us <= 0.0) {
+    active_instance_->PudicaLogNextDelay(now_us, -1.0, d_min_us / 1000.0, 0,
+                                         target, target,
+                                         oldest_us <= 0 ? "empty" : "no_L",
+                                         oldest_us, acked_us, oldest_id, acked_id);
+    return target;
+  }
+
+  const double next_delay_us = static_cast<double>(now_us - oldest_us);
+  const double thresh_us = d_min_us + kNextDelayMarginUs;
+
+  active_instance_->pudica_next_delay_ms_.store(next_delay_us / 1000.0,
+                                                std::memory_order_relaxed);
+  if (next_delay_us <= thresh_us) {
+    active_instance_->pudica_nd_steps_.store(0, std::memory_order_relaxed);
+    active_instance_->PudicaLogNextDelay(now_us, next_delay_us / 1000.0,
+                                         d_min_us / 1000.0, 0, target, target,
+                                         "below", oldest_us, acked_us,
+                                         oldest_id, acked_id);
+    return target;
+  }
+
+  int steps = 1 + static_cast<int>((next_delay_us - thresh_us) / L_us);
+  if (steps > kMaxSteps) steps = kMaxSteps;
+
+  // Cut from the DELIVERED rate, not from the published target. The target is
+  // pinned at the controller ceiling whenever MI has run away, and a zeta cut
+  // off a runaway target is not a response to anything: measured on
+  // mae-nodrop, 56-84% of PUD-FALLBACK rows published a rate still ABOVE the
+  // rate actually arriving, because committed_bps sat at the 100 Mbps app cap
+  // on an 8 Mbps link. Every other branch of PudicaUpdateRtpTarget anchors on
+  // recv_rate for this reason; this one must too.
+  const int64_t recv_rate = active_instance_->GetRtpRecvRateBps();
+  const int64_t anchor = (recv_rate > 0) ? std::min(target, recv_rate) : target;
+  double faded = static_cast<double>(anchor) * std::pow(1.0 - kZeta, steps);
+  int64_t out = static_cast<int64_t>(faded);
+  const int64_t floor_bps = active_instance_->config_.min_rate_bps;
+  if (out < floor_bps) out = floor_bps;
+
+  active_instance_->pudica_nd_steps_.store(steps, std::memory_order_relaxed);
+  active_instance_->pudica_nd_out_bps_.store(out, std::memory_order_relaxed);
+  active_instance_->PudicaLogNextDelay(now_us, next_delay_us / 1000.0,
+                                       d_min_us / 1000.0, steps, target, out,
+                                       "fire", oldest_us, acked_us,
+                                       oldest_id, acked_id);
+
+  static std::atomic<int> last_steps{0};
+  int prev = last_steps.exchange(steps, std::memory_order_relaxed);
+  if (prev != steps) {
+    fprintf(stderr,
+            "[PUDICA-RTP] NEXT-DELAY fallback nd=%.0fms thr=%.0fms "
+            "(dmin=%.0f) steps=%d target=%.2f recv=%.2f -> %.2fMbps\n",
+            next_delay_us / 1000.0, thresh_us / 1000.0, d_min_us / 1000.0,
+            steps, target / 1e6, recv_rate / 1e6, out / 1e6);
+  }
+  return out;
 }
 
 // Per-frame Pudica RTP-video target (NSDI'24 §4.2–§4.3). Default is the
@@ -2693,6 +3095,11 @@ int64_t RtpSctpCoordinator::GetPudicaRtpOverride() {
 // recv-anchored 3-way branch + rotary slew (not in the paper; J-251).
 void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us) {
   if (config_.mode != CoordinatorMode::kPudica) return;
+  // now_us is the reconstructed receiver-arrival clock used by BUR history.
+  // The paper's feedback barrier instead asks whether a frame was SENT after
+  // this actual sender decision. A delayed TWCC batch cannot acknowledge a
+  // rate decision that only happens while that batch is being processed.
+  const int64_t decision_time_us = rtc::TimeMicros();
 
   int64_t recv_rate = GetRtpRecvRateBps();
   if (recv_rate <= 0) recv_rate = GetTotalRecvRateBps();
@@ -2702,8 +3109,36 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
   const char* mode = "PUD-HOLD";
   double smoothed = PudicaSmoothedBur(now_us);
   int consec = 0;
+
+  // [A25] Optionally re-publish R for Eq.2 using the SMOOTHED BUR. The default
+  // source is the raw per-frame BUR, published at the single site in
+  // OnPudicaPacketFeedback() where ρ is derived; this is the opt-in A/B.
+  //
+  // Why smoothing is worth an A/B at all: Eq.2 sizes a send span, and a span
+  // that changes 30x between consecutive frames is worse than no pacing.
+  // delay_based_bwe.cc's own note records that 29% of raw samples come from
+  // 1-packet frames reading a constant 0.030, which arms the minimum span
+  // regardless of the true queue. Measured on run 1788952574 the raw path was
+  // still the better one end to end, so it stays the default.
+  //
+  // This runs AFTER the raw publish (feedback path) rather than instead of it,
+  // so with the knob off there is exactly one writer.
+  {
+    static const bool kUseSmoothed = []() {
+      const char* e = std::getenv("PUDICA_RHO_SMOOTH_BUR");
+      return e && std::atoi(e) != 0;
+    }();
+    if (kUseSmoothed) {
+      PacingController::SetPudicaBur(smoothed);
+      pudica_rho_.store(PacingController::PudicaRho(),
+                        std::memory_order_relaxed);
+    }
+  }
   int64_t committed_out = old_target;
   int64_t drain_recv_out = 0;
+  double ack_ceil_out = -1.0;  // [A32] delivered-rate ceiling, -1 = disabled
+  double drain_rate_out = -1.0;   // [DRAIN] diagnostic
+  double drain_q_out = -1.0;
 
   if (pudica_legacy_) {
     if (recv_rate <= 0) return;
@@ -2776,36 +3211,64 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
     if (old_target > 0 && pudica_rtp_ctrl_.committed_bps <= 0) {
       pudica_rtp_ctrl_.committed_bps = old_target;
     }
-    double owd_s = 0.0;
-    if (pudica_frame_.first_send_us >= 0 && pudica_frame_.last_recv_us >= 0) {
-      owd_s = (pudica_frame_.last_recv_us - pudica_frame_.first_send_us) /
-              1e6;
-    }
-    if (owd_s <= 0.0) {
-      owd_s = std::max(0.0, frame_bur) * features_.L_ms / 1000.0;
-    }
-    int64_t rate_for_q = pudica_rtp_ctrl_.committed_bps > 0
-                             ? pudica_rtp_ctrl_.committed_bps
-                             : (recv_rate > 0 ? recv_rate : old_target);
+    // Bytes of SELF-INDUCED QUEUE at the bottleneck. The paper defines
+    // draining_rate as "the additional throughput rates needed to clear the
+    // self-induced queuing at the bottleneck within the next 200 ms", so this
+    // count must be the self-induced queue and nothing else. Two factors were
+    // wrong and they multiplied:
+    //
+    //   1. The delay used was D, the FULL one-way delay. D_min on run
+    //      1788861518 was 120.8 ms against a 200 ms horizon, so the
+    //      propagation baseline alone made drain_rate ~= 0.6 x rate even with
+    //      an entirely empty queue. Only D - D_min is self-induced.
+    //   2. The rate used was the COMMITTED target. Bytes sitting in the
+    //      bottleneck queue are queue_delay x BOTTLENECK rate, and the
+    //      bottleneck rate is what actually arrives, not what we aim for.
+    //
+    // Together drain_rate came out ~= 0.84 x committed — self-referential, and
+    // unrelated to the queue: a larger target demanded a larger drain. On the
+    // 40 Mbps stretch (t 40-70 s) the 24 slams reconstructed as drain_rate
+    // 71.3 Mbps median against a true 14.7 (5.2x), which drove
+    // alpha*recv - drain_rate to -32 and clamped B to min_rate (1 Mbps). With
+    // both factors corrected, 96% of those come out positive, median 20.3
+    // Mbps — a drain, not a stall.
+    //
+    // frame_bur * L is used for the queue delay rather than recomputing
+    // D - span - D_min, so this stays consistent with whatever
+    // PudicaComputeFrameBur() measures by construction (post-A10 it is already
+    // net of the frame's own emission span; reusing D here would put that span
+    // back and re-arm the self-latch through this path instead).
+    double q_s = std::max(0.0, frame_bur) * features_.L_ms / 1000.0;
+    // Unknown receiving rate cannot turn an encoder target into queue bytes.
+    const int64_t rate_for_q = std::max<int64_t>(0, recv_rate);
     int64_t inflight_bytes =
-        (rate_for_q > 0 && owd_s > 0.0)
-            ? static_cast<int64_t>(static_cast<double>(rate_for_q) * owd_s /
-                                   8.0)
+        (rate_for_q > 0 && q_s > 0.0)
+            ? static_cast<int64_t>(static_cast<double>(rate_for_q) * q_s / 8.0)
             : 0;
     PudicaRtpRateCtrl::Input in;
     in.frame_bur = frame_bur;
     in.smoothed_bur = smoothed;
     in.recv_rate_bps =
         recv_rate > 0 ? recv_rate : pudica_rtp_ctrl_.committed_bps;
+    in.ack_recv_bps = recv_rate > 0 ? recv_rate : 0;  // [A39] measured only
     in.inflight_bytes = inflight_bytes;
-    in.now_us = now_us;
+    in.now_us = decision_time_us;
     in.frame_send_us = pudica_frame_.first_send_us;
+    // [DRAIN-INFLIGHT] Measured outstanding bytes + the D_min the BDP term
+    // needs. Both raw; the controller decides whether to use them.
+    in.inflight_meas_bytes = pudica_inflight_meas_bytes_;
+    in.d_min_us = pudica_d_min_us_ > 0.0
+                      ? static_cast<int64_t>(pudica_d_min_us_)
+                      : 0;
     PudicaRtpRateCtrl::Output o = pudica_rtp_ctrl_.Update(in);
     new_target = o.target_bps;
     mode = o.mode;
     consec = o.consecutive_high;
     committed_out = o.committed_bps;
     drain_recv_out = o.drain_recv_bps;
+    ack_ceil_out = o.ack_ceil_bps;
+    drain_rate_out = o.drain_rate_bps;
+    drain_q_out = o.drain_queue_bytes;
   }
 
   int64_t ceiling = pudica_rtp_ctrl_.cfg.max_rate_bps;
@@ -2834,8 +3297,10 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
         pudica_ctrl_csv_
             << "t_ms,mode,bur,rtp_recv_mbps,total_recv_mbps,n_ack_samples,"
                "ack_span_ms,ack_bytes,old_target_mbps,new_target_mbps,"
-               "d_min_ms,frame_owd_ms,frame_pkts,smoothed_bur,consec,"
-               "committed_mbps,drain_recv_mbps\n";
+               "d_min_ms,frame_owd_ms,frame_pkts,span_ms,smoothed_bur,consec,"
+               "committed_mbps,drain_recv_mbps,ack_ceil_mbps,"
+               "drain_rate_mbps,drain_queue_kb,"
+               "next_delay_ms,nd_steps,nd_out_mbps,monotonic_us\n";
       }
       pudica_ctrl_csv_start_us_ = now_us;
       pudica_ctrl_csv_initialized_ = true;
@@ -2862,10 +3327,24 @@ void RtpSctpCoordinator::PudicaUpdateRtpTarget(double frame_bur, int64_t now_us)
                      << (old_target / 1e6) << "," << (new_target / 1e6) << ","
                      << (pudica_d_min_us_ / 1000.0) << "," << frame_owd_ms
                      << "," << pudica_frame_.frame_packets << ","
+                     << (pudica_frame_span_us_ / 1000.0) << ","
                      << std::setprecision(6) << smoothed << ","
                      << consec << ","
                      << std::setprecision(3) << (committed_out / 1e6) << ","
-                     << (drain_recv_out / 1e6) << "\n";
+                     << (drain_recv_out / 1e6) << ","
+                     << (ack_ceil_out < 0 ? -1.0 : ack_ceil_out / 1e6) << ","
+                     << (drain_rate_out < 0 ? -1.0 : drain_rate_out / 1e6) << ","
+                     << (drain_q_out < 0 ? -1.0 : drain_q_out / 1024.0) << ","
+                     // [A28] next delay is sampled by the TWCC-driven override
+                     // path, not by this per-frame one, so these describe the
+                     // most recent feedback -- which is the point: when this
+                     // row is late, next_delay_ms is what fired in the gap.
+                     << pudica_next_delay_ms_.load(std::memory_order_relaxed)
+                     << ","
+                     << pudica_nd_steps_.load(std::memory_order_relaxed) << ","
+                     << (pudica_nd_out_bps_.load(std::memory_order_relaxed) / 1e6)
+                     << "," << rtc::TimeMicros() << "\n";
+    pudica_ctrl_csv_.flush();
   }
 
   static int64_t pud_log = 0;
