@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -111,11 +113,34 @@ void TaskQueuePacedSender::SetPacingRates(DataRate pacing_rate,
 
 void TaskQueuePacedSender::EnqueuePackets(
     std::vector<std::unique_ptr<RtpPacketToSend>> packets) {
-  task_queue_->PostTask(
-      SafeTask(safety_.flag(), [this, packets = std::move(packets)]() mutable {
+  // [DIAG] PUDICA_DIAG=1: per call carrying video, when the packetizer posted
+  // it and when this task queue ran it. The gap between the two is time a
+  // frame spends outside packet_queue_, where A40's queue check cannot see it.
+  static const bool kDiag = []() {
+    const char* e = std::getenv("PUDICA_DIAG");
+    return e && std::atoi(e) == 1;
+  }();
+  const Timestamp diag_posted = clock_->CurrentTime();
+  task_queue_->PostTask(SafeTask(
+      safety_.flag(),
+      [this, diag_posted, packets = std::move(packets)]() mutable {
         RTC_DCHECK_RUN_ON(task_queue_);
         TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("webrtc"),
                      "TaskQueuePacedSender::EnqueuePackets");
+        if (kDiag) {
+          for (const auto& packet : packets) {
+            if (packet->packet_type() == RtpPacketMediaType::kVideo) {
+              const Timestamp run = clock_->CurrentTime();
+              fprintf(stderr,
+                      "[PUDICA-DIAG-ENQ] rtp_ts=%u posted_ms=%.3f run_ms=%.3f "
+                      "wait_ms=%.3f npkts=%zu\n",
+                      packet->Timestamp(), diag_posted.us() / 1000.0,
+                      run.us() / 1000.0, (run - diag_posted).us() / 1000.0,
+                      packets.size());
+              break;
+            }
+          }
+        }
         for (auto& packet : packets) {
           TRACE_EVENT2(TRACE_DISABLED_BY_DEFAULT("webrtc"),
                        "TaskQueuePacedSender::EnqueuePackets::Loop",

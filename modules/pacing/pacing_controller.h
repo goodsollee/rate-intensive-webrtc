@@ -228,6 +228,10 @@ class PacingController {
                     DataSize packet_size,
                     Timestamp send_time);
   void MaybeUpdateMediaRateDueToLongQueue(Timestamp now);
+  // [A42] NextSendTime() without Pudica's probe / gap / deadline wake-ups:
+  // when media is next allowed out. The wake-ups schedule ProcessPackets();
+  // they do not make media due.
+  Timestamp NextSendTime(bool include_pudica_wakeups) const;
 
   Timestamp CurrentTime() const;
 

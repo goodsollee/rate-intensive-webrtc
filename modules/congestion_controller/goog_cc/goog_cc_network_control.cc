@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -182,6 +184,27 @@ GoogCcNetworkController::GoogCcNetworkController(NetworkControllerConfig config,
   // WebRTC-L4S-CeReaction is enabled; otherwise MaybeReactToCe returns early.
   ParseFieldTrial({&l4s_ce_g_},
                   env_.field_trials().Lookup("WebRTC-L4S-CeReaction"));
+  // [L4Span L7] Sender-side CE-brake log. The runner sets KFT_L4S_LOG for the
+  // sender process only (the receiver's goog_cc would otherwise write a
+  // second l4s_sender.csv into the same UNIFIED_CSV_DIR).
+  if (l4s_ce_reaction_enabled_) {
+    const char* e = std::getenv("KFT_L4S_LOG");
+    l4s_log_enabled_ = e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+    if (l4s_log_enabled_) {
+      const char* dir = std::getenv("UNIFIED_CSV_DIR");
+      if (dir && *dir) {
+        const std::string path = std::string(dir) + "/l4s_sender.csv";
+        l4s_csv_ = std::fopen(path.c_str(), "w");
+        if (l4s_csv_) {
+          std::fprintf(l4s_csv_,
+                       "t_ms,n_ce,n_ect,alpha,rtt_ms,target_mbps,cap_mbps,active\n");
+          std::fflush(l4s_csv_);
+        }
+      }
+      std::fprintf(stderr, "[L4S] ON g=%.4f csv=%s\n", l4s_ce_g_.Get(),
+                   l4s_csv_ ? "yes" : "no");
+    }
+  }
   if (delay_based_bwe_)
     delay_based_bwe_->SetMinBitrate(kCongestionControllerMinBitrate);
 
@@ -192,7 +215,10 @@ GoogCcNetworkController::GoogCcNetworkController(NetworkControllerConfig config,
   RTC_LOG(LS_INFO) << "GoogCcNetworkController: Logging to " << logging_folder_.value_or("not set");
 }
 
-GoogCcNetworkController::~GoogCcNetworkController() {}
+GoogCcNetworkController::~GoogCcNetworkController() {
+  if (l4s_csv_)
+    std::fclose(l4s_csv_);
+}
 
 NetworkControlUpdate GoogCcNetworkController::OnNetworkAvailability(
     NetworkAvailability msg) {
@@ -843,9 +869,26 @@ void GoogCcNetworkController::MaybeReactToCe(
   }
 
   ce_window_ce_count_ += n_ce;
+  ce_window_ect_count_ += n_ect;
+  l4s_tot_ect_ += n_ect;
+  l4s_tot_ce_ += n_ce;
   if (!ce_window_start_.IsFinite()) {
     ce_window_start_ = at_time;
+    l4s_log_t0_ = at_time;
+    l4s_stat_at_ = at_time;
     return;
+  }
+  // [L4Span L7] 1 s heartbeat: proves the ECN echo path (n_ect > 0 iff the
+  // receiver reads ECN and CCFB carries it) even while nothing is marked.
+  if (l4s_log_enabled_ && at_time - l4s_stat_at_ >= TimeDelta::Seconds(1)) {
+    l4s_stat_at_ = at_time;
+    std::fprintf(stderr,
+                 "[L4S] stat t=%.0f ect_total=%lld ce_total=%lld alpha=%.4f "
+                 "rtt_ms=%.1f active=%d\n",
+                 (at_time - l4s_log_t0_).ms<double>(),
+                 static_cast<long long>(l4s_tot_ect_),
+                 static_cast<long long>(l4s_tot_ce_), ce_alpha_,
+                 ce_rtt_ewma_ms_, ce_cap_active_ ? 1 : 0);
   }
   if (ce_rtt_ewma_ms_ <= 0.0)
     return;  // No usable RTT yet; wait for a finite feedback RTT.
@@ -853,10 +896,12 @@ void GoogCcNetworkController::MaybeReactToCe(
     return;  // Still inside the current RTT window: at most one reaction/RTT.
 
   // Window boundary crossed.
+  const DataRate target = bandwidth_estimation_->target_rate();
+  DataRate cap = DataRate::PlusInfinity();
+  const bool was_active = ce_cap_active_;
   if (ce_window_ce_count_ > 0) {
     // Multiplicative decrease once per RTT that saw CE (paper §2).
-    DataRate target = bandwidth_estimation_->target_rate();
-    DataRate cap = target * (1.0 - ce_alpha_ / 2.0);
+    cap = target * (1.0 - ce_alpha_ / 2.0);
     bandwidth_estimation_->SetCeLimit(cap, at_time);
     ce_cap_active_ = true;
   } else if (ce_cap_active_) {
@@ -864,8 +909,28 @@ void GoogCcNetworkController::MaybeReactToCe(
     bandwidth_estimation_->SetCeLimit(DataRate::PlusInfinity(), at_time);
     ce_cap_active_ = false;
   }
+  // [L4Span L7] One row per window that saw CE, applied a cap, or released
+  // one -- quiet (no row) while the link is uncongested.
+  if (l4s_log_enabled_ && (ce_window_ce_count_ > 0 || was_active)) {
+    const double t_ms = (at_time - l4s_log_t0_).ms<double>();
+    const double cap_mbps = cap.IsFinite() ? cap.bps<double>() / 1e6 : -1.0;
+    std::fprintf(stderr,
+                 "[L4S] t=%.0f n_ce=%d n_ect=%d alpha=%.4f rtt_ms=%.1f "
+                 "target_mbps=%.3f cap_mbps=%.3f active=%d\n",
+                 t_ms, ce_window_ce_count_, ce_window_ect_count_, ce_alpha_,
+                 ce_rtt_ewma_ms_, target.bps<double>() / 1e6, cap_mbps,
+                 ce_cap_active_ ? 1 : 0);
+    if (l4s_csv_) {
+      std::fprintf(l4s_csv_, "%.0f,%d,%d,%.5f,%.2f,%.4f,%.4f,%d\n", t_ms,
+                   ce_window_ce_count_, ce_window_ect_count_, ce_alpha_,
+                   ce_rtt_ewma_ms_, target.bps<double>() / 1e6, cap_mbps,
+                   ce_cap_active_ ? 1 : 0);
+      std::fflush(l4s_csv_);
+    }
+  }
   ce_window_start_ = at_time;
   ce_window_ce_count_ = 0;
+  ce_window_ect_count_ = 0;
 }
 
 PacerConfig GoogCcNetworkController::GetPacingRates(Timestamp at_time) const {

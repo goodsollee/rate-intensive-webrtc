@@ -2224,17 +2224,28 @@ void RtpSctpCoordinator::OnPudicaPacketFeedback(
   }
 
   // Update D_min (minimum packet OWD over 10-second window, in μs)
+  //
+  // [A45] O(1) amortized instead of a scan of the whole window per packet.
+  // The scan was O(window) = O(rate^2): ~9k packets/s x ~90k samples at
+  // ~90 Mbps, 60-85% of pc_worker_thread -- the pacer's own task queue -- so
+  // encoded frames waited up to 968 ms before even reaching the pacer queue
+  // (runs 1789101011 / 1789102102, perf + [PUDICA-DIAG-ENQ]). Same result as
+  // the scan, including its arrival-order expiry under reordered recv times:
+  // a sample no smaller than a later one can never be the minimum again, since
+  // the later one leaves the window no earlier.
   if (owd_us > 0) {
-    self->pudica_owd_window_.push_back({recv_time_us, owd_us});
-    while (!self->pudica_owd_window_.empty() &&
-           (recv_time_us - self->pudica_owd_window_.front().first) >
-               kPudicaDminWindowUs) {
-      self->pudica_owd_window_.pop_front();
+    auto& times = self->pudica_owd_times_;
+    auto& minq = self->pudica_owd_minq_;
+    const int64_t idx = self->pudica_owd_pushed_++;
+    times.push_back(recv_time_us);
+    while (!minq.empty() && minq.back().second >= owd_us) minq.pop_back();
+    minq.push_back({idx, owd_us});
+    while ((recv_time_us - times.front()) > kPudicaDminWindowUs) {
+      times.pop_front();
+      ++self->pudica_owd_expired_;
     }
-    self->pudica_d_min_us_ = owd_us;
-    for (const auto& [t, d] : self->pudica_owd_window_) {
-      if (d < self->pudica_d_min_us_) self->pudica_d_min_us_ = d;
-    }
+    while (minq.front().first < self->pudica_owd_expired_) minq.pop_front();
+    self->pudica_d_min_us_ = minq.front().second;
   }
 
   if (is_probe) {
@@ -2882,11 +2893,10 @@ int64_t RtpSctpCoordinator::GetPudicaRtpOverride() {
   // The cap is 2 and it is load-bearing. next_delay grows at 1 ms/ms once the
   // queue builds, so steps grows by one every L -- 30 steps per second. A cap
   // of 12 spends the whole budget in 400 ms; combined with the recv_rate
-  // anchor below that double-counts the collapse (the anchor already fell) and
-  // lands on the 1 Mbps floor while the link is still delivering several Mbps.
-  // At 2, published >= 0.72 x anchor by construction: the cap IS the floor
-  // against the delivered rate. Sending at 1 Mbps does not drain a queue any
-  // faster than the link does.
+  // anchor A28 used (removed in A49) that double-counted the collapse (the
+  // anchor already fell) and landed on the 1 Mbps floor while the link was
+  // still delivering several Mbps. At 2, published >= 0.72 x target by
+  // construction.
   static const int kMaxSteps = []() {
     const char* e = std::getenv("PUDICA_NEXT_DELAY_MAX_STEPS");
     return e ? std::atoi(e) : 2;
@@ -2936,16 +2946,18 @@ int64_t RtpSctpCoordinator::GetPudicaRtpOverride() {
   int steps = 1 + static_cast<int>((next_delay_us - thresh_us) / L_us);
   if (steps > kMaxSteps) steps = kMaxSteps;
 
-  // Cut from the DELIVERED rate, not from the published target. The target is
-  // pinned at the controller ceiling whenever MI has run away, and a zeta cut
-  // off a runaway target is not a response to anything: measured on
-  // mae-nodrop, 56-84% of PUD-FALLBACK rows published a rate still ABOVE the
-  // rate actually arriving, because committed_bps sat at the 100 Mbps app cap
-  // on an 8 Mbps link. Every other branch of PudicaUpdateRtpTarget anchors on
-  // recv_rate for this reason; this one must too.
+  // [A49] Cut from the published target, as the paper's fallback does
+  // (committed x (1-zeta)). A28 anchored on min(target, recv_rate) because a
+  // zeta cut off a target pinned at the 100 Mbps app cap publishes a rate still
+  // above what arrives (56-84% of PUD-FALLBACK rows on mae-nodrop). That anchor
+  // made the cut far stronger than the paper's: run 1789107225 at the 20.0 s
+  // fastdrop dip published 2.05 x 0.85^2 = 1.4 Mbps against a 100 Mbps target
+  // 50 ms after firing, so the sender stopped 0.3 s into the dip and the RAN
+  // backlog FINESSE acts on never formed. With a pinned target this branch is
+  // now close to inert -- that is the paper's behaviour, and DRAIN is what
+  // responds. recv_rate is still read for the log line.
   const int64_t recv_rate = active_instance_->GetRtpRecvRateBps();
-  const int64_t anchor = (recv_rate > 0) ? std::min(target, recv_rate) : target;
-  double faded = static_cast<double>(anchor) * std::pow(1.0 - kZeta, steps);
+  double faded = static_cast<double>(target) * std::pow(1.0 - kZeta, steps);
   int64_t out = static_cast<int64_t>(faded);
   const int64_t floor_bps = active_instance_->config_.min_rate_bps;
   if (out < floor_bps) out = floor_bps;

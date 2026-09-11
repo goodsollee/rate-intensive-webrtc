@@ -112,15 +112,25 @@ class GeckoController {
       if (s.hash != h || s.len != len) continue;
       ++s.copies;
       ++dups_dropped_;
-      const bool in_window = now_us - s.t_last_us <= cfg_.echo_window_us;
+      // A BURST is a run of copies spaced by no more than the echo window.
+      // The router re-sends whatever it last forwarded, so consecutive alerts
+      // often echo the SAME datagram (run 1789114024: 8 of 40 echoes were
+      // never seen as alerts because an entry alerted only once). Each new
+      // burst of two copies is therefore a new alert, as in the paper.
+      if (now_us - s.t_last_us > cfg_.echo_window_us) {
+        s.burst_copies = 1;
+        s.burst_alerted = false;
+      } else {
+        ++s.burst_copies;
+      }
       s.t_last_us = now_us;
-      if (in_window && !s.alerted) {
-        s.alerted = true;
+      if (s.burst_copies >= 2 && !s.burst_alerted) {
+        s.burst_alerted = true;
         OnAlertLocked(now_us);
       }
       return true;
     }
-    seen_.push_back(Seen{h, static_cast<uint32_t>(len), now_us, 0, false});
+    seen_.push_back(Seen{h, static_cast<uint32_t>(len), now_us, 0, 0, false});
     if (seen_.size() > kHistoryMax) seen_.pop_front();
     return false;
   }
@@ -138,6 +148,12 @@ class GeckoController {
     while (!dmin_.empty() && dmin_.back().second >= owd) dmin_.pop_back();
     dmin_.push_back({recv_us, owd});
     while (!dmin_.empty() && recv_us - dmin_.front().first > kDminWindowUs) dmin_.pop_front();
+    // Frames at or before this one are no longer in flight: delivered (this
+    // feedback) or gone for good (a flush). RTP timestamps increase per frame.
+    while (!sent_frames_.empty() &&
+           static_cast<int32_t>(rtp_ts - sent_frames_.front()) >= 0) {
+      sent_frames_.pop_front();
+    }
     if (!have_cur_ || rtp_ts != cur_ts_) {
       if (have_cur_) CloseFrameLocked();
       have_cur_ = true;
@@ -161,6 +177,14 @@ class GeckoController {
     std::lock_guard<std::mutex> lk(mu_);
     ++frames_sent_;
     if (is_keyframe) last_kf_sent_us_ = now_us;
+    // Paper §III-E: N_F_bad counts the frames the flush skips. The router
+    // flushes what is queued ahead of the flag packet, i.e. the frames this
+    // sender has put on the wire and not yet had fed back -- charged to the
+    // flush cycle when the flag goes out (run 1789114024 charged 0 for a
+    // 6007-packet flush and the A/B test never saw a cost for flushing).
+    const int inflight = static_cast<int>(sent_frames_.size());
+    sent_frames_.push_back(rtp_ts);
+    if (sent_frames_.size() > 4096) sent_frames_.pop_front();
     switch (pending_) {
       case Pending::kNone:
         return kFlagNone;
@@ -172,12 +196,14 @@ class GeckoController {
       case Pending::kFlushNext:
         pending_ = Pending::kNone;
         ++flags_flush_;
+        ChargeFlushLocked(inflight);
         LogEvent(now_us, "flag", "flush", now_us - pending_since_us_, rtp_ts);
         return kFlagFlush;
       case Pending::kFlushOnKeyframe:
         if (is_keyframe) {
           pending_ = Pending::kNone;
           ++flags_flush_;
+          ChargeFlushLocked(inflight);
           LogEvent(now_us, "flag", "flush_kf", now_us - pending_since_us_, rtp_ts);
           return kFlagFlush;
         }
@@ -219,8 +245,9 @@ class GeckoController {
     uint64_t hash;
     uint32_t len;
     int64_t t_last_us;
-    int copies;
-    bool alerted;
+    int copies;         // duplicates of this datagram, all time
+    int burst_copies;   // copies in the current burst (gap <= echo window)
+    bool burst_alerted; // this burst already raised its alert
   };
   enum class Pending : uint8_t { kNone, kNoFlushNext, kFlushNext, kFlushOnKeyframe };
 
@@ -260,6 +287,14 @@ class GeckoController {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+  }
+
+  // mu_ held. The frames in flight when a flush flag leaves are the ones the
+  // router destroys: charge them to this flush cycle as skipped frames.
+  void ChargeFlushLocked(int inflight) {
+    for (int i = 0; i < inflight; ++i) decider_.OnFrameSkipped();
+    doomed_ += inflight;
+    last_flush_inflight_ = inflight;
   }
 
   void CloseFrameLocked() {
@@ -321,8 +356,8 @@ class GeckoController {
   void LogEvent(int64_t now_us, const char* event, const char* detail, int64_t lat_us,
                 uint32_t rtp_ts) {
     if (std::strcmp(event, "flag") == 0 || std::strcmp(event, "stale") == 0) {
-      std::fprintf(stderr, "[GECKO] %s %s lat_ms=%.1f rtp_ts=%u\n", event, detail,
-                   lat_us / 1000.0, rtp_ts);
+      std::fprintf(stderr, "[GECKO] %s %s lat_ms=%.1f rtp_ts=%u inflight_charged=%d\n",
+                   event, detail, lat_us / 1000.0, rtp_ts, last_flush_inflight_);
     }
     if (!csv_) return;
     const AlertOutcome& o = last_outcome_;
@@ -346,6 +381,8 @@ class GeckoController {
   uint32_t cur_ts_ = 0;
   int64_t cur_first_send_us_ = 0, cur_last_recv_us_ = 0;
   int cur_pkts_ = 0;
+  std::deque<uint32_t> sent_frames_;   // rtp_ts of frames sent, not yet fed back
+  int last_flush_inflight_ = 0;
   Pending pending_ = Pending::kNone;
   int64_t pending_since_us_ = 0;
   int64_t last_kf_req_us_ = 0, last_kf_sent_us_ = 0;

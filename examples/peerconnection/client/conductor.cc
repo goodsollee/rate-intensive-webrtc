@@ -88,6 +88,7 @@ ABSL_DECLARE_FLAG(bool, rtp_only_mode);
 ABSL_DECLARE_FLAG(bool, with_audio);
 ABSL_DECLARE_FLAG(int, test_duration);
 ABSL_DECLARE_FLAG(int, vp8_kf_max_dist);
+ABSL_DECLARE_FLAG(std::string, video_codec);
 ABSL_DECLARE_FLAG(bool, demo_mode);
 ABSL_DECLARE_FLAG(std::string, context_path);
 ABSL_DECLARE_FLAG(std::string, kvcache_path);
@@ -380,6 +381,7 @@ bool Conductor::ReinitializePeerConnectionForLoopback() {
     for (const auto& sender : senders) {
       peer_connection_->AddTrack(sender->track(), sender->stream_ids());
     }
+    ApplyVideoCodecPreference();  // [A43]
     peer_connection_->CreateOffer(
         this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
   }
@@ -724,6 +726,7 @@ void Conductor::OnMessageFromPeer(int peer_id, const std::string& message) {
         fflush(stdout);
         AddTracks();
       }
+      ApplyVideoCodecPreference();  // [A43]
       peer_connection_->CreateAnswer(
           this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
     }
@@ -820,6 +823,7 @@ void Conductor::ConnectToPeer(int peer_id) {
       AddTracks();
     }
 
+    ApplyVideoCodecPreference();  // [A43]
     peer_connection_->CreateOffer(
         this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
   } else {
@@ -990,6 +994,72 @@ void Conductor::AddTracks() {
   main_wnd_->SwitchToStreamingUI();
 }
 
+void Conductor::ApplyVideoCodecPreference() {
+  const std::string want = absl::GetFlag(FLAGS_video_codec);
+  if (want.empty() || !peer_connection_ || !peer_connection_factory_) {
+    return;
+  }
+  auto same = [](const std::string& a, const std::string& b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+             return std::tolower(static_cast<unsigned char>(x)) ==
+                    std::tolower(static_cast<unsigned char>(y));
+           });
+  };
+  // Resiliency "codecs" ride along unchanged, so RTX / RED / FEC behave as they
+  // did under the default order.
+  auto is_resiliency = [&](const std::string& name) {
+    return same(name, "rtx") || same(name, "red") || same(name, "ulpfec") ||
+           same(name, "flexfec-03");
+  };
+  std::vector<webrtc::RtpCodecCapability> prefs;
+  int media = 0;
+  for (const webrtc::RtpCodecCapability& c :
+       peer_connection_factory_
+           ->GetRtpReceiverCapabilities(cricket::MEDIA_TYPE_VIDEO)
+           .codecs) {
+    if (is_resiliency(c.name)) {
+      prefs.push_back(c);
+      continue;
+    }
+    if (!same(c.name, want)) {
+      continue;
+    }
+    // Single-NAL mode (packetization-mode=0) cannot carry a NAL larger than
+    // the MTU, i.e. any 1080p frame.
+    if (same(want, "H264")) {
+      auto pm = c.parameters.find("packetization-mode");
+      if (pm == c.parameters.end() || pm->second != "1") {
+        continue;
+      }
+    }
+    prefs.insert(prefs.begin() + media++, c);  // media codecs first
+  }
+  if (media == 0) {
+    printf("[CODEC] FATAL: --video_codec=%s is not in this build's receiver "
+           "capabilities (H264 needs rtc_use_h264=true proprietary_codecs=true "
+           "ffmpeg_branding=\"Chrome\")\n",
+           want.c_str());
+    fflush(stdout);
+    exit(1);
+  }
+  for (const auto& t : peer_connection_->GetTransceivers()) {
+    if (t->media_type() != cricket::MEDIA_TYPE_VIDEO) {
+      continue;
+    }
+    webrtc::RTCError err = t->SetCodecPreferences(prefs);
+    if (!err.ok()) {
+      printf("[CODEC] FATAL: SetCodecPreferences(%s) failed: %s\n",
+             want.c_str(), err.message());
+      fflush(stdout);
+      exit(1);
+    }
+  }
+  printf("[CODEC] video restricted to %s (%d variant(s)) + RTX/RED/FEC\n",
+         want.c_str(), media);
+  fflush(stdout);
+}
+
 void Conductor::DisconnectFromCurrentPeer() {
   RTC_LOG(LS_INFO) << __FUNCTION__;
   if (peer_connection_) {
@@ -1087,6 +1157,29 @@ void Conductor::OnSuccess(webrtc::SessionDescriptionInterface* desc) {
 
   std::string sdp;
   desc->ToString(&sdp);
+
+  // [A43] Record the video payload types this side put in its SDP. The RAN
+  // side classifies media vs RTX by PT (QCON_PT_MEDIA / QCON_PT_RTX /
+  // FV3_PT_VIDEO), and nothing else in the run artifacts keeps the SDP.
+  {
+    std::string line, out;
+    bool in_video = false;
+    for (size_t pos = 0; pos < sdp.size();) {
+      size_t end = sdp.find('\n', pos);
+      if (end == std::string::npos) end = sdp.size();
+      line = sdp.substr(pos, end - pos);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      pos = end + 1;
+      if (line.rfind("m=", 0) == 0) in_video = line.rfind("m=video", 0) == 0;
+      if (in_video && (line.rfind("a=rtpmap:", 0) == 0 ||
+                       line.rfind("a=fmtp:", 0) == 0)) {
+        out += " | " + line.substr(2);
+      }
+    }
+    printf("[CODEC] local %s video%s\n",
+           webrtc::SdpTypeToString(desc->GetType()), out.c_str());
+    fflush(stdout);
+  }
 
   // For loopback test. To save some connecting delay.
   if (loopback_) {
@@ -2355,6 +2448,7 @@ void Conductor::OnWebSocketConnection(bool connected) {
           AddTracks();
         }
 
+        ApplyVideoCodecPreference();  // [A43]
         peer_connection_->CreateOffer(
             this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
       }

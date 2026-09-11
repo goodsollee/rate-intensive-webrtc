@@ -149,7 +149,16 @@ void TransportFeedbackAdapter::AddPacket(const RtpPacketToSend& packet_to_send,
   }
   // Note that it can happen that the same SSRC and sequence number is sent
   // again. e.g, audio retransmission.
-  rtp_to_transport_sequence_number_.emplace(
+  // [L4Span L7, 2026-09-11] insert_or_assign, not emplace: the key is the
+  // 16-bit RTP sequence number, which wraps every 65536 packets (~6 s at
+  // 150 Mbps). A packet that CCFB never reported (startup, a dropped report)
+  // kept its key, and emplace then left the NEXT packet with the same
+  // (ssrc, seq16) mapped to the OLD transport sequence number: goog_cc saw a
+  // "received" packet whose send_time was one wrap old, max_feedback_rtt
+  // jumped to ~6 s and the CE-brake RTT window (and the RTT-based pushback)
+  // followed (loopback 150 Mbps: rtt EWMA 1.1 s at 21 s, 16% of reports).
+  // The newest send owns the key; the stale history entry ages out.
+  rtp_to_transport_sequence_number_.insert_or_assign(
       SsrcAndRtpSequencenumber(
           {.ssrc = feedback.ssrc,
            .rtp_sequence_number = feedback.rtp_sequence_number}),

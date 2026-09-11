@@ -855,19 +855,21 @@ bool RTPSenderVideo::SendVideo(int payload_type,
   }
 
   // [Gecko S5] The sender's answer to a router alert rides on this frame's
-  // packets: a flush on the keyframe the decision requested ("clear what is
-  // queued ahead of me"), a no-flush on the next frame. Asked once per frame
-  // even when the extension is not negotiated, so the controller keeps its
-  // doomed-frame count; stamped only when it is.
+  // FIRST packet (the paper's "next outgoing RTP packet"): a flush on the
+  // keyframe the decision requested ("clear what is queued ahead of me"), a
+  // no-flush on the next frame. First packet ONLY: stamping every packet let
+  // the router take a stale flag from the tail of the previous answer as the
+  // reply to a NEW alert 0.1 ms later (run 1789114024, 6 of 38 flags). The
+  // sender-to-RAN hop loses nothing here, so one packet is enough. Asked once
+  // per frame even when the extension is not negotiated, so the controller
+  // keeps its in-flight/doomed ledger; stamped only when it is.
   {
     const uint8_t gecko_flag = gecko::GeckoController::Get().FlagForFrame(
         video_header.frame_type == VideoFrameType::kVideoFrameKey, rtp_timestamp,
         clock_->TimeInMicroseconds());
     if (gecko_flag != gecko::kFlagNone && !rtp_packets.empty() &&
         rtp_packets.front()->HasExtension<GeckoFlagExtension>()) {
-      for (auto& rtp_packet : rtp_packets) {
-        rtp_packet->SetExtension<GeckoFlagExtension>(gecko_flag);
-      }
+      rtp_packets.front()->SetExtension<GeckoFlagExtension>(gecko_flag);
     }
   }
 
