@@ -83,6 +83,18 @@ bool MaeEnabled() {
   return on;
 }
 
+// [A56] OpenH264 2.4 is built around MAX_THREADS_NUM = 4 (wels_const.h:69),
+// and that constant is internal to the library, so it is restated here:
+//   * the per-thread bitstream buffers are a MAX_THREADS_NUM array
+//     (encoder_context.h:237) and only min(pool, MAX_THREADS_NUM) of them are
+//     allocated (slice_multi_threading.cpp:339);
+//   * the dynamic slice assignment asserts iSliceNumInFrame <= MAX_THREADS_NUM
+//     (svc_enc_slice_segment.cpp:645), and this is a release build where that
+//     assert is compiled out.
+// Asking for more than four is therefore not more parallelism, it is an
+// out-of-range slice index writing past those buffers.
+constexpr int kMaxOpenH264Threads = 4;
+
 // Used by histograms. Values of entries should not be changed.
 enum H264EncoderImplEvent {
   kH264EncoderEventInit = 0,
@@ -342,6 +354,10 @@ int32_t H264EncoderImpl::InitEncode(const VideoCodec* inst,
                       << " temporal_layers=" << encoder_params.iTemporalLayerNum
                       << " qp=" << encoder_params.iMinQp << ".."
                       << encoder_params.iMaxQp
+                      << " threads=" << encoder_params.iMultipleThreadIdc
+                      << " slices="
+                      << encoder_params.sSpatialLayers[0]
+                             .sSliceArgument.uiSliceNum
                       << " codec=H264";
     mae_active_ = false;
 
@@ -719,9 +735,12 @@ SEncParamExt H264EncoderImpl::CreateEncoderParams(size_t i) const {
   //  0: auto (dynamic imp. internal encoder)
   //  1: single thread (default value)
   // >1: number of threads
-  encoder_params.iMultipleThreadIdc =
+  // [A56] Clamped: NumberOfThreads() returns up to 8 for 1080p on a host with
+  // more than 8 cores, which is above what this OpenH264 can carry.
+  encoder_params.iMultipleThreadIdc = std::min(
       NumberOfThreads(encoder_thread_limit_, encoder_params.iPicWidth,
-                      encoder_params.iPicHeight, number_of_cores_);
+                      encoder_params.iPicHeight, number_of_cores_),
+      kMaxOpenH264Threads);
   // The base spatial layer 0 is the only one we use.
   encoder_params.sSpatialLayers[0].iVideoWidth = encoder_params.iPicWidth;
   encoder_params.sSpatialLayers[0].iVideoHeight = encoder_params.iPicHeight;
@@ -756,9 +775,29 @@ SEncParamExt H264EncoderImpl::CreateEncoderParams(size_t i) const {
     case H264PacketizationMode::NonInterleaved:
       // When uiSliceMode = SM_FIXEDSLCNUM_SLICE, uiSliceNum = 0 means auto
       // design it with cpu core number.
-      // TODO(sprang): Set to 0 when we understand why the rate controller borks
-      //               when uiSliceNum > 1.
-      encoder_params.sSpatialLayers[0].sSliceArgument.uiSliceNum = 1;
+      //
+      // [A56] ONE SLICE PER THREAD, not a hardcoded 1. OpenH264 parallelises a
+      // frame across SLICES only, so a thread count without a matching slice
+      // count buys nothing: SliceArgumentValidationFixedSliceMode() rewrites
+      // uiSliceNum <= 1 back to SM_SINGLE_SLICE (encoder_ext.cpp:196) and the
+      // extra threads idle. That is why the encoder ran single-threaded on a
+      // 14-core host: 1080p at 90 Mbps cost 28 ms per frame, 85% of the 33 ms
+      // frame interval, sitting exactly on WebRTC's CPU-overuse threshold, so
+      // whether a run dropped to 720p mid-experiment was decided by where the
+      // detector's 5 s check grid landed rather than by the arm under test.
+      //
+      // iMultipleThreadIdc is clamped to kMaxOpenH264Threads above, so the
+      // slice count stays inside the MAX_THREADS_NUM structures. Without the
+      // WebRTC-VideoEncoderSettings/encoder_thread_limit trial it is 1 and
+      // this line writes the same 1 it wrote before, so the untrialled path is
+      // unchanged.
+      //
+      // The upstream TODO warned that the rate controller "borks" when
+      // uiSliceNum > 1. That is a claim to measure per build, not to inherit:
+      // check achieved bitrate against target across a slice sweep before
+      // trusting a new OpenH264 roll.
+      encoder_params.sSpatialLayers[0].sSliceArgument.uiSliceNum =
+          encoder_params.iMultipleThreadIdc;
       encoder_params.sSpatialLayers[0].sSliceArgument.uiSliceMode =
           SM_FIXEDSLCNUM_SLICE;
       break;
