@@ -114,7 +114,13 @@ int main(int argc, char* argv[]) {
   // emits almost nothing there, so the run is not perturbed by log volume.
   if (const char* e = getenv("KFT_WEBRTC_LOG")) {
     if (e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) {
-      rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
+      // "info"/"verbose" opens the level up for diagnosis only. Every measured
+      // run uses KFT_WEBRTC_LOG=1, which stays ERROR-only so the log volume
+      // cannot perturb it.
+      const std::string level(e);
+      rtc::LogMessage::LogToDebug(
+          (level == "info" || level == "verbose") ? rtc::LS_INFO
+                                                 : rtc::LS_ERROR);
       rtc::LogMessage::LogTimestamps();
     }
   }

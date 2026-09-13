@@ -62,7 +62,15 @@
 #include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
 #include "api/video_codecs/video_encoder_factory_template_libvpx_vp9_adapter.h"
 #include "api/video_codecs/video_encoder_factory_template_open_h264_adapter.h"
+#include "absl/strings/match.h"
+#include "api/media_types.h"
+#include "api/rtp_parameters.h"
 #include "examples/peerconnection/client/defaults.h"
+#if defined(WEBRTC_LINUX)
+#include "examples/peerconnection/client/nvenc/nvenc_env.h"
+#include "examples/peerconnection/client/nvenc/nvenc_video_encoder_factory.h"
+#include "media/base/media_constants.h"
+#endif
 #include "examples/peerconnection/client/main_wnd.h"
 #include "examples/peerconnection/client/peer_connection_client.h"
 #include "json/reader.h"
@@ -134,6 +142,86 @@ class DummySetSessionDescriptionObserver
                      << error.message();
   }
 };
+
+#if defined(WEBRTC_LINUX)
+void ApplyNvencSenderPrefs(webrtc::PeerConnectionInterface* pc,
+                            webrtc::PeerConnectionFactoryInterface* factory,
+                            int max_framerate) {
+  if (!webrtc::nvenc::NvencEnabled() || !pc || !factory)
+    return;
+  auto send_caps = factory->GetRtpSenderCapabilities(cricket::MEDIA_TYPE_VIDEO);
+  auto recv_caps =
+      factory->GetRtpReceiverCapabilities(cricket::MEDIA_TYPE_VIDEO);
+  // RTX has to stay in the preference list. SetCodecPreferences replaces the
+  // m-section's codec set outright, so an H264-only list also strips rtx --
+  // and then this arm runs with no retransmission at all while every other arm
+  // has it (measured: PT_HISTOGRAM had pt103/pt113 rtx on the VP8 arms and no
+  // rtx PT at all here). That is not a smaller difference than the codec: with
+  // no rtx there is no stale retransmit backlog, which is the phenomenon the
+  // RAN-side recovery arms act on, so the NVENC arm would answer a different
+  // question than the 1080p runs it is compared against.
+  std::vector<webrtc::RtpCodecCapability> prefs;
+  bool have_h264 = false;
+  for (const auto& c : send_caps.codecs) {
+    const bool is_h264 = absl::EqualsIgnoreCase(c.name, cricket::kH264CodecName);
+    const bool is_rtx = absl::EqualsIgnoreCase(c.name, cricket::kRtxCodecName);
+    if (!is_h264 && !is_rtx)
+      continue;
+    bool in_recv = false;
+    for (const auto& r : recv_caps.codecs) {
+      if (absl::EqualsIgnoreCase(r.name, c.name)) {
+        in_recv = true;
+        break;
+      }
+    }
+    if (!in_recv)
+      continue;
+    prefs.push_back(c);
+    have_h264 = have_h264 || is_h264;
+  }
+  if (!have_h264) {
+    RTC_LOG(LS_ERROR) << "KFT NVENC: no H264 in sender capabilities";
+    return;
+  }
+  {
+    std::string names;
+    for (const auto& c : prefs)
+      names += (names.empty() ? "" : ",") + c.name;
+    RTC_LOG(LS_ERROR) << "KFT NVENC codec prefs=" << names;
+  }
+  for (const auto& t : pc->GetTransceivers()) {
+    if (t->media_type() == cricket::MEDIA_TYPE_VIDEO) {
+      webrtc::RTCError err = t->SetCodecPreferences(prefs);
+      RTC_LOG(LS_ERROR) << "KFT NVENC SetCodecPreferences ok=" << err.ok()
+                        << " msg=" << err.message();
+    }
+  }
+  for (const auto& sender : pc->GetSenders()) {
+    if (!sender->track() ||
+        sender->track()->kind() !=
+            webrtc::MediaStreamTrackInterface::kVideoKind) {
+      continue;
+    }
+    webrtc::RtpParameters params = sender->GetParameters();
+    // MAINTAIN_FRAMERATE, not MAINTAIN_RESOLUTION: IsResolutionScalingEnabled
+    // (video/adaptation/video_stream_encoder_resource_manager.cc:49-52) accepts
+    // only MAINTAIN_FRAMERATE or BALANCED, and with MAINTAIN_RESOLUTION the
+    // framework answered overuse by cutting fps instead of resolution. Chosen
+    // over BALANCED because every metric this arm is scored on -- on-time FPS
+    // against a 60 fps clock, and J built from frames missing the deadline --
+    // is a framerate metric, and BALANCED would let the framework move that
+    // same variable. Code constant on purpose: switching it changes what the
+    // arm measures, so it belongs in a packet, not an env knob.
+    params.degradation_preference =
+        webrtc::DegradationPreference::MAINTAIN_FRAMERATE;
+    for (auto& encoding : params.encodings) {
+      encoding.max_framerate = max_framerate;
+      encoding.scale_resolution_down_by = 1.0;
+    }
+    sender->SetParameters(params);
+  }
+}
+#endif
 
 std::unique_ptr<TestVideoCapturer> CreateCapturer(
     webrtc::TaskQueueFactory& task_queue_factory) {
@@ -294,18 +382,30 @@ bool Conductor::InitializePeerConnection() {
 
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-  deps.video_encoder_factory =
-      std::make_unique<webrtc::VideoEncoderFactoryTemplate<
-          webrtc::LibvpxVp8EncoderTemplateAdapter,
-          webrtc::LibvpxVp9EncoderTemplateAdapter,
-          webrtc::OpenH264EncoderTemplateAdapter,
-          webrtc::LibaomAv1EncoderTemplateAdapter>>();
-  deps.video_decoder_factory =
-      std::make_unique<webrtc::VideoDecoderFactoryTemplate<
-          webrtc::LibvpxVp8DecoderTemplateAdapter,
-          webrtc::LibvpxVp9DecoderTemplateAdapter,
-          webrtc::OpenH264DecoderTemplateAdapter,
-          webrtc::Dav1dDecoderTemplateAdapter>>();
+#if defined(WEBRTC_LINUX)
+  if (webrtc::nvenc::NvencEnabled()) {
+    deps.video_encoder_factory =
+        std::make_unique<webrtc::NvencH264EncoderFactory>();
+    // CPU H.264 decode (ffmpeg), same High 5.2 fmtp as NVENC or the
+    // transceiver has no video codec.
+    deps.video_decoder_factory =
+        std::make_unique<webrtc::NvencH264DecoderFactory>();
+  } else
+#endif
+  {
+    deps.video_encoder_factory =
+        std::make_unique<webrtc::VideoEncoderFactoryTemplate<
+            webrtc::LibvpxVp8EncoderTemplateAdapter,
+            webrtc::LibvpxVp9EncoderTemplateAdapter,
+            webrtc::OpenH264EncoderTemplateAdapter,
+            webrtc::LibaomAv1EncoderTemplateAdapter>>();
+    deps.video_decoder_factory =
+        std::make_unique<webrtc::VideoDecoderFactoryTemplate<
+            webrtc::LibvpxVp8DecoderTemplateAdapter,
+            webrtc::LibvpxVp9DecoderTemplateAdapter,
+            webrtc::OpenH264DecoderTemplateAdapter,
+            webrtc::Dav1dDecoderTemplateAdapter>>();
+  }
 
   // Don't create ADM - this will work without audio devices
   // Same approach as Modified WebRTC
@@ -646,6 +746,19 @@ void Conductor::OnMessageFromPeer(int peer_id, const std::string& message) {
       return;
     }
     RTC_LOG(LS_INFO) << " Received session description :" << message;
+#if defined(WEBRTC_LINUX)
+    if (!log_dir_.empty() && webrtc::nvenc::NvencEnabled()) {
+      std::ofstream dump(log_dir_ + "/sdp_remote_" + type_str + ".txt");
+      dump << sanitized_sdp;
+    }
+    if (webrtc::nvenc::NvencEnabled()) {
+      const auto v = sanitized_sdp.find("m=video");
+      RTC_LOG(LS_ERROR) << "KFT SDP remote type=" << type_str << " "
+                       << (v == std::string::npos
+                               ? "no m=video"
+                               : sanitized_sdp.substr(v, 160));
+    }
+#endif
     peer_connection_->SetRemoteDescription(
         DummySetSessionDescriptionObserver::Create().get(),
         session_description.release());
@@ -958,6 +1071,11 @@ void Conductor::AddTracks() {
               }
             }
           }
+#if defined(WEBRTC_LINUX)
+          ApplyNvencSenderPrefs(peer_connection_.get(),
+                                peer_connection_factory_.get(),
+                                video_fps_ > 0 ? video_fps_ : 60);
+#endif
         } else {
           RTC_LOG(LS_ERROR) << "Failed to add Y4M video track: " << result_or_error.error().message();
         }
@@ -1087,6 +1205,17 @@ void Conductor::OnSuccess(webrtc::SessionDescriptionInterface* desc) {
 
   std::string sdp;
   desc->ToString(&sdp);
+#if defined(WEBRTC_LINUX)
+  if (!log_dir_.empty() && webrtc::nvenc::NvencEnabled()) {
+    std::string kind = webrtc::SdpTypeToString(desc->GetType());
+    std::ofstream dump(log_dir_ + "/sdp_local_" + kind + ".txt");
+    dump << sdp;
+    const auto v = sdp.find("m=video");
+    RTC_LOG(LS_ERROR) << "KFT SDP local type=" << kind << " "
+                     << (v == std::string::npos ? "no m=video"
+                                               : sdp.substr(v, 160));
+  }
+#endif
 
   // For loopback test. To save some connecting delay.
   if (loopback_) {

@@ -40,6 +40,7 @@ extern "C" {
 }  // extern "C"
 
 #include <memory>
+#include <mutex>
 
 #include "common_video/h264/h264_bitstream_parser.h"
 #include "common_video/include/video_frame_buffer_pool.h"
@@ -90,6 +91,10 @@ class H264DecoderImpl : public H264Decoder {
 
   // Used by ffmpeg via `AVGetBuffer2()` to allocate I420 images.
   VideoFrameBufferPool ffmpeg_buffer_pool_;
+  // Slice threads call `AVGetBuffer2` concurrently; the pool's RaceChecker
+  // is same-thread-only, so serialize pool access.
+  std::mutex buffer_pool_lock_;
+  int decode_threads_ = 1;
   std::unique_ptr<AVCodecContext, AVCodecContextDeleter> av_context_;
   std::unique_ptr<AVFrame, AVFrameDeleter> av_frame_;
 

@@ -96,6 +96,40 @@ constexpr int kHighVp8QpThreshold = 95;
 constexpr int kScreenshareMinQp = 15;
 
 constexpr int kTokenPartitions = VP8_ONE_TOKENPARTITION;
+
+// [KFT] VP8 parallelises across token partitions, so with the stock single
+// partition the extra encoder threads have nothing to do: measured 97% on one
+// EncoderQueue thread and ~3% on the rest, on a 128-core idle machine. Env
+// gates, so unset reproduces stock behaviour byte for byte.
+int TokenPartitionsOverride() {
+  static const int v = [] {
+    const char* e = getenv("KFT_VP8_TOKEN_PARTITIONS");
+    if (!e || !e[0]) return kTokenPartitions;
+    int n = atoi(e);
+    // vp8e_token_partitions is a log2 count: 0=>1, 1=>2, 2=>4, 3=>8.
+    switch (n) {
+      case 1: return static_cast<int>(VP8_ONE_TOKENPARTITION);
+      case 2: return static_cast<int>(VP8_TWO_TOKENPARTITION);
+      case 4: return static_cast<int>(VP8_FOUR_TOKENPARTITION);
+      case 8: return static_cast<int>(VP8_EIGHT_TOKENPARTITION);
+      default: return kTokenPartitions;
+    }
+  }();
+  return v;
+}
+
+// [KFT] libvpx cpu_used: more negative is slower and higher quality. Stock
+// desktop default is -6; mobile uses -12. Unset keeps the stock value.
+int CpuSpeedOverride(int stock) {
+  static const bool has = [] {
+    const char* e = getenv("KFT_VP8_CPU_SPEED");
+    return e != nullptr && e[0] != '\0';
+  }();
+  if (!has) return stock;
+  static const int v = atoi(getenv("KFT_VP8_CPU_SPEED"));
+  if (v < -16 || v > 16) return stock;
+  return v;
+}
 constexpr uint32_t kVp832ByteAlign = 32u;
 
 constexpr int kRtpTicksPerSecond = 90000;
@@ -719,6 +753,7 @@ int LibvpxVp8Encoder::InitEncode(const VideoCodec* inst,
       cpu_speed_[0] = -6;
       break;
   }
+  cpu_speed_[0] = CpuSpeedOverride(cpu_speed_[0]);
   cpu_speed_default_ = cpu_speed_[0];
   // Set encoding complexity (cpu_speed) based on resolution and/or platform.
   cpu_speed_[0] = GetCpuSpeed(inst->width, inst->height);
@@ -936,7 +971,7 @@ int LibvpxVp8Encoder::InitAndSetControlSettings() {
     libvpx_->codec_control(&(encoders_[i]), VP8E_SET_CPUUSED, cpu_speed_[i]);
     libvpx_->codec_control(
         &(encoders_[i]), VP8E_SET_TOKEN_PARTITIONS,
-        static_cast<vp8e_token_partitions>(kTokenPartitions));
+        static_cast<vp8e_token_partitions>(TokenPartitionsOverride()));
     libvpx_->codec_control(&(encoders_[i]), VP8E_SET_MAX_INTRA_BITRATE_PCT,
                            rc_max_intra_target_);
     // VP8E_SET_SCREEN_CONTENT_MODE 2 = screen content with more aggressive

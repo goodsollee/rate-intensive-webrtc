@@ -723,6 +723,47 @@ rtc_library("sctp_traffic") {
   }
 }
 
+  if (is_linux || is_chromeos) {
+    config("nvenc_cuda") {
+      # Absolute .so paths so we do not add -L/usr/lib (host crt vs sysroot).
+      libs = [
+        "/usr/lib/x86_64-linux-gnu/libcuda.so",
+        "/usr/lib/x86_64-linux-gnu/libnvidia-encode.so",
+      ]
+    }
+    rtc_library("peerconnection_nvenc") {
+    visibility = [ ":*" ]
+    testonly = true
+    sources = [
+      "peerconnection/client/nvenc/h264_nvenc_encoder.cc",
+      "peerconnection/client/nvenc/h264_nvenc_encoder.h",
+      "peerconnection/client/nvenc/nvenc_env.h",
+      "peerconnection/client/nvenc/nvenc_video_encoder_factory.cc",
+      "peerconnection/client/nvenc/nvenc_video_encoder_factory.h",
+      "peerconnection/client/nvenc/nvEncodeAPI.h",
+    ]
+    include_dirs = [ "/usr/local/cuda/include" ]
+    cflags = [ "-isystem/usr/local/cuda/include" ]
+    public_configs = [ ":nvenc_cuda" ]
+    deps = [
+      "../api:array_view",
+      "../api:libjingle_peerconnection_api",
+      "../api/environment:environment",
+      "../api/video:encoded_image",
+      "../api/video:video_frame",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../media:media_constants",
+      "../modules/video_coding:codec_globals_headers",
+      "../modules/video_coding:video_codec_interface",
+      "../modules/video_coding:webrtc_h264",
+      "../rtc_base:checks",
+      "../rtc_base:logging",
+      "//third_party/libyuv",
+    ]
+  }
+  }
+
   rtc_executable("peerconnection_client") {
     testonly = true
     # third_party/zstd exports no include path; needed for #include <zstd.h>.
@@ -832,6 +873,8 @@ rtc_library("sctp_traffic") {
       ]
       configs += [ ":gtk_config" ]
       configs += [ ":websocket_config"]
+      deps += [ ":peerconnection_nvenc" ]
+      deps += [ "../media:media_constants" ]
     }
 
     deps += [
@@ -978,6 +1021,8 @@ rtc_library("sctp_traffic") {
       ]
       configs += [ ":gtk_config" ]
       configs += [ ":websocket_config" ]
+      deps += [ ":peerconnection_nvenc" ]
+      deps += [ "../media:media_constants" ]
     }
 
     deps += [

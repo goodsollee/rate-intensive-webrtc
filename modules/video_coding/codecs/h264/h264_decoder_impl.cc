@@ -23,8 +23,10 @@ extern "C" {
 }  // extern "C"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 #include "api/video/color_space.h"
 #include "api/video/i010_buffer.h"
@@ -54,6 +56,16 @@ enum H264DecoderImplEvent {
   kH264DecoderEventError = 1,
   kH264DecoderEventMax = 16,
 };
+
+// Stock WebRTC pins FFmpeg to one thread. NVENC 4K60 at ~100 Mbps exceeds
+// that budget (~18-21 ms/frame vs 16.7 ms). Opt-in with the same KFT_NVENC
+// gate as the encoder; slice threading needs matching NVENC slice count.
+int H264DecodeThreadCount() {
+  const char* e = std::getenv("KFT_NVENC");
+  if (e == nullptr || e[0] == '\0' || (e[0] == '0' && e[1] == '\0'))
+    return 1;
+  return 8;
+}
 
 struct ScopedPtrAVFreePacket {
   void operator()(AVPacket* packet) { av_packet_free(&packet); }
@@ -127,6 +139,7 @@ int H264DecoderImpl::AVGetBuffer2(AVCodecContext* context,
   rtc::scoped_refptr<I210Buffer> i210_buffer;
   rtc::scoped_refptr<I410Buffer> i410_buffer;
   int bytes_per_pixel = 1;
+  std::lock_guard<std::mutex> pool_lock(decoder->buffer_pool_lock_);
   switch (context->pix_fmt) {
     case AV_PIX_FMT_YUV420P:
     case AV_PIX_FMT_YUVJ420P:
@@ -298,10 +311,13 @@ bool H264DecoderImpl::Configure(const Settings& settings) {
   av_context_->extradata = nullptr;
   av_context_->extradata_size = 0;
 
-  // If this is ever increased, look at `av_context_->thread_safe_callbacks` and
-  // make it possible to disable the thread checker in the frame buffer pool.
-  av_context_->thread_count = 1;
+  // Slice threading only (not FRAME): Decode() is one-in/one-out and
+  // frame-threading would return a previous picture. Pool access is
+  // mutexed in AVGetBuffer2 because FFmpeg slice workers are concurrent.
+  decode_threads_ = H264DecodeThreadCount();
+  av_context_->thread_count = decode_threads_;
   av_context_->thread_type = FF_THREAD_SLICE;
+  RTC_LOG(LS_ERROR) << "KFT H264 decode thread_count=" << decode_threads_;
 
   // Function used by FFmpeg to get buffers to store decoded frames in.
   av_context_->get_buffer2 = AVGetBuffer2;
@@ -329,6 +345,7 @@ bool H264DecoderImpl::Configure(const Settings& settings) {
   av_frame_.reset(av_frame_alloc());
 
   if (std::optional<int> buffer_pool_size = settings.buffer_pool_size()) {
+    std::lock_guard<std::mutex> pool_lock(buffer_pool_lock_);
     if (!ffmpeg_buffer_pool_.Resize(*buffer_pool_size)) {
       return false;
     }
@@ -627,7 +644,7 @@ int32_t H264DecoderImpl::Decode(const EncodedImage& input_image,
 }
 
 const char* H264DecoderImpl::ImplementationName() const {
-  return "FFmpeg";
+  return decode_threads_ > 1 ? "FFmpeg_slice" : "FFmpeg";
 }
 
 bool H264DecoderImpl::IsInitialized() const {

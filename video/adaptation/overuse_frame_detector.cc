@@ -14,6 +14,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <list>
 #include <map>
 #include <memory>
@@ -65,6 +66,15 @@ const float kMaxSampleDiffMarginFactor = 1.35f;
 // encode times from being accepted if the frame rate happens to be low.
 const int kMinFramerate = 7;
 const int kMaxFramerate = 30;
+
+int OveruseMaxFramerateCap() {
+  // NVENC 4K60 arm: the stock 30 fps cap treats 16 ms encode as overuse and
+  // AdaptDowns resolution. Only this env; default campaigns stay at 30.
+  const char* e = std::getenv("KFT_NVENC");
+  if (e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0'))
+    return 60;
+  return kMaxFramerate;
+}
 
 // Class for calculating the processing usage on the send-side (the average
 // processing time of a frame divided by the average time difference between
@@ -549,7 +559,7 @@ void OveruseFrameDetector::ResetAll(int num_pixels) {
 void OveruseFrameDetector::OnTargetFramerateUpdated(int framerate_fps) {
   RTC_DCHECK_RUN_ON(&task_checker_);
   RTC_DCHECK_GE(framerate_fps, 0);
-  max_framerate_ = std::min(kMaxFramerate, framerate_fps);
+  max_framerate_ = std::min(OveruseMaxFramerateCap(), framerate_fps);
   usage_->SetMaxSampleDiffMs((1000 / std::max(kMinFramerate, max_framerate_)) *
                              kMaxSampleDiffMarginFactor);
 }
