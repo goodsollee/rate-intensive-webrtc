@@ -2960,6 +2960,7 @@ if (rtc_include_tests) {
       "../api/units:data_size",
       "../api/units:timestamp",
       "../modules/congestion_controller/goog_cc:delay_based_bwe",
+      "../modules/congestion_controller/rtp:congestion_controller_unittests",
       "../modules/pacing:pacing",
       "../modules/pacing:pacing_unittests",
       "../rtc_base:timeutils",

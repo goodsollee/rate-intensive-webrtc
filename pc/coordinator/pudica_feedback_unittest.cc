@@ -4,8 +4,12 @@
  */
 #include "pc/rtp_sctp_coordinator.h"
 
+#include <algorithm>
+#include <deque>
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "api/transport/network_types.h"
 #include "modules/congestion_controller/goog_cc/delay_based_bwe.h"
@@ -80,6 +84,11 @@ class PudicaFeedbackTest : public ::testing::Test {
   void SetCommittedRate(int64_t bps) {
     coordinator_->pudica_rtp_ctrl_.committed_bps = bps;
   }
+  void SetMeasuredRecvRate8Mbps() {
+    coordinator_->rtp_ack_samples_ = {{0, 10'000}, {10, 10'000}, {20, 10'000}};
+    coordinator_->rtp_samples_total_bytes_ = 30'000;
+    ASSERT_EQ(coordinator_->GetRtpRecvRateBps(), 8'000'000);
+  }
 
   void CheckDelayedBatchBarrier(bool aimd) {
     rtc::ScopedBaseFakeClock clock;
@@ -146,6 +155,32 @@ TEST_F(PudicaFeedbackTest, ProbeAndNonvideoBeforeMediaCannotInitializeDmin) {
   EXPECT_EQ(FramePackets(), 0);
 }
 
+TEST_F(PudicaFeedbackTest, DminMatchesArrivalOrderedWindowAcrossReordering) {
+  std::deque<std::pair<int64_t, int64_t>> reference;
+  // Equal minima, reordered receive times, exact window boundary, and expiry
+  // of the old minimum. The production monotonic queue must match the prior
+  // arrival-ordered scan, including a late sample behind an unexpired front.
+  const std::vector<std::pair<int64_t, int64_t>> samples = {
+      {100'000, 20'000}, {90'000, 10'000}, {120'000, 10'000},
+      {10'100'000, 30'000}, {10'100'001, 40'000},
+      {10'120'001, 50'000}, {10'110'000, 15'000},
+      {20'120'002, 25'000}};
+  for (const auto& [recv_us, owd_us] : samples) {
+    reference.push_back({recv_us, owd_us});
+    while (recv_us - reference.front().first > 10'000'000)
+      reference.pop_front();
+    int64_t expected = owd_us;
+    for (const auto& sample : reference)
+      expected = std::min(expected, sample.second);
+    Feedback(recv_us - owd_us, recv_us, true, false);
+    EXPECT_DOUBLE_EQ(Dmin(), expected) << "receive time " << recv_us;
+    // Neither probes nor other RTP media may lower the video-only minimum.
+    Feedback(recv_us - 1000, recv_us, false, true);
+    Feedback(recv_us - 1000, recv_us, false, false);
+    EXPECT_DOUBLE_EQ(Dmin(), expected);
+  }
+}
+
 TEST_F(PudicaFeedbackTest, OldRtpTimestampCannotMergeOrRewindCurrentFrame) {
   Feedback(0, 20'000, true, false, 9000);
   Feedback(33'000, 53'000, true, false, 12000);
@@ -175,6 +210,18 @@ TEST_F(PudicaFeedbackTest, TimerCanReducePublishedTargetWithoutNewFeedback) {
   const int64_t out = RtpSctpCoordinator::GetPudicaTimerFallback();
   EXPECT_GT(out, 0);
   EXPECT_LT(out, 10'000'000);
+  EXPECT_EQ(CommittedRate(), committed);
+}
+
+TEST_F(PudicaFeedbackTest, NextDelayCutsPublishedTargetDespiteLowMeasuredRecv) {
+  SetPublishedRate(100'000'000);
+  SetMeasuredRecvRate8Mbps();
+  SetDmin(20'000);
+  const int64_t committed = CommittedRate();
+  PacingController::PudicaRecordFrameSent(rtc::TimeMicros() - 400'000, 1);
+  // A49 intentionally changes the anchor from min(target, recv) to target.
+  // 100 Mbps * 0.85^2, rather than 8 Mbps * 0.85^2.
+  EXPECT_NEAR(RtpSctpCoordinator::GetPudicaRtpOverride(), 72'250'000, 1);
   EXPECT_EQ(CommittedRate(), committed);
 }
 

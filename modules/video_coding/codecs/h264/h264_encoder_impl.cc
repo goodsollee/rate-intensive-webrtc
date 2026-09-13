@@ -17,6 +17,7 @@
 #include "modules/video_coding/codecs/h264/h264_encoder_impl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -50,6 +51,49 @@ const bool kOpenH264EncoderDetailedLogging = false;
 // QP scaling thresholds.
 static const int kLowH264QpThreshold = 24;
 static const int kHighH264QpThreshold = 37;
+
+// [A43] KFT_NO_FRAME_DROP, the codec half. video_stream_encoder.cc turns off
+// WebRTC's own droppers; OpenH264 has a third in its rate control
+// (bEnableFrameSkip), the counterpart of libvpx's rc_dropframe_thresh that
+// libvpx_vp8_encoder.cc zeroes under the same flag. Without this the flag
+// would mean less under H264 than under VP8.
+bool NoFrameDropEnabled() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_NO_FRAME_DROP");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
+// [A44] KFT_MAE, the H264 half. Same gate and same signal as
+// libvpx_vp8_encoder.cc: unset => byte-identical to stock; while the delay
+// trend is raised (is_overused_for_encoder > 1) the encoder must meet its
+// per-frame budget. libvpx expresses that as a one-frame VBV; OpenH264 has no
+// VBV knob, its rate control budgets over an 8-frame window (VGOP_SIZE), so
+// the patched encoder (openh264_kft_mae.patch, ENCODER_OPTION_KFT_MAE) holds
+// that window at ONE frame and keeps its own skipper off for the same span --
+// the counterpart of rc_dropframe_thresh = 0 on VP8. The option does not exist
+// on an unpatched OpenH264: this file then fails to compile, which is the
+// intended failure -- not a client that records KFT_MAE=1 and runs without it.
+bool MaeEnabled() {
+  static const bool on = [] {
+    const char* e = getenv("KFT_MAE");
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
+// [A56] OpenH264 2.4 is built around MAX_THREADS_NUM = 4 (wels_const.h:69),
+// and that constant is internal to the library, so it is restated here:
+//   * the per-thread bitstream buffers are a MAX_THREADS_NUM array
+//     (encoder_context.h:237) and only min(pool, MAX_THREADS_NUM) of them are
+//     allocated (slice_multi_threading.cpp:339);
+//   * the dynamic slice assignment asserts iSliceNumInFrame <= MAX_THREADS_NUM
+//     (svc_enc_slice_segment.cpp:645), and this is a release build where that
+//     assert is compiled out.
+// Asking for more than four is therefore not more parallelism, it is an
+// out-of-range slice index writing past those buffers.
+constexpr int kMaxOpenH264Threads = 4;
 
 // Used by histograms. Values of entries should not be changed.
 enum H264EncoderImplEvent {
@@ -302,6 +346,20 @@ int32_t H264EncoderImpl::InitEncode(const VideoCodec* inst,
     // TODO(pbos): Base init params on these values before submitting.
     int video_format = EVideoFormatType::videoFormatI420;
     openh264_encoder->SetOption(ENCODER_OPTION_DATAFORMAT, &video_format);
+    // [A44] The runtime proof of the encoder arm, as on VP8 ("KFTF init").
+    // A fresh encoder is stock; SetRates() re-arms MAE from the next signal.
+    RTC_LOG(LS_ERROR) << "KFTF init mae=" << MaeEnabled()
+                      << " nodrop=" << NoFrameDropEnabled()
+                      << " frame_skip=" << encoder_params.bEnableFrameSkip
+                      << " temporal_layers=" << encoder_params.iTemporalLayerNum
+                      << " qp=" << encoder_params.iMinQp << ".."
+                      << encoder_params.iMaxQp
+                      << " threads=" << encoder_params.iMultipleThreadIdc
+                      << " slices="
+                      << encoder_params.sSpatialLayers[0]
+                             .sSliceArgument.uiSliceNum
+                      << " codec=H264";
+    mae_active_ = false;
 
     // Initialize encoded image. Default buffer size: size of unencoded data.
 
@@ -402,6 +460,20 @@ void H264EncoderImpl::SetRates(const RateControlParameters& parameters) {
     } else {
       configurations_[i].SetStreamState(false);
     }
+  }
+
+  // [A44] MAE: one-frame budget window while the congestion signal is raised.
+  // Written only on a regime change, like the VP8 port; the option is a
+  // per-encoder flag, so every simulcast encoder gets it.
+  const bool mae_on = MaeEnabled() && parameters.is_overused_for_encoder > 1.0;
+  if (mae_on != mae_active_) {
+    bool value = mae_on;
+    for (ISVCEncoder* encoder : encoders_)
+      encoder->SetOption(ENCODER_OPTION_KFT_MAE, &value);
+    mae_active_ = mae_on;
+    RTC_LOG(LS_ERROR) << "KFTF MAE " << (mae_on ? "on" : "off")
+                      << " ratio=" << parameters.is_overused_for_encoder
+                      << " fps=" << parameters.framerate_fps;
   }
 }
 
@@ -628,10 +700,27 @@ SEncParamExt H264EncoderImpl::CreateEncoderParams(size_t i) const {
   // Rate Control mode
   encoder_params.iRCMode = RC_BITRATE_MODE;
   encoder_params.fMaxFrameRate = configurations_[i].max_frame_rate;
+  // [A46] Pass WebRTC's QP ceiling (codec_.qpMax, kDefaultVideoMaxQpH26x = 51)
+  // instead of leaving the range unset. Unset means iMinQp = 0, and OpenH264
+  // then replaces the WHOLE range with 12..42 (encoder_ext.cpp, "Change QP
+  // Range", MAX_LOW_BR_QP). At QP 42 a 1080p P-frame of the Forza source is
+  // 3-4x a 0.9 Mbps frame budget, so after a deep target cut no rate control
+  // (stock or MAE) can meet it -- runs 1789101011-1789102345 sat at QP 42 for
+  // seconds.
+  //
+  // [A48] Floor 12 -> 3. At 12 (OpenH264's GOM_MIN_QP_MODE) the Forza source's
+  // simple scenes cannot reach a 100 Mbps target: fixed-QP P-frames of the
+  // low / mid / high segments are 38.7 / 63.8 / 95.9 Mbps at QP 12 (matching
+  // runs 1789103558 etc., which sat at QP 12.0 there) and 95.8 / 141 / 193 at
+  // QP 3. Needs the openh264_kft_mae.patch change that stops OpenH264 clipping
+  // the floor back to 12 in rate-control mode.
+  encoder_params.iMinQp = 3;
+  encoder_params.iMaxQp = std::clamp(static_cast<int>(codec_.qpMax), 12, 51);
 
   // The following parameters are extension parameters (they're in SEncParamExt,
   // not in SEncParamBase).
-  encoder_params.bEnableFrameSkip = configurations_[i].frame_dropping_on;
+  encoder_params.bEnableFrameSkip =
+      configurations_[i].frame_dropping_on && !NoFrameDropEnabled();
   // `uiIntraPeriod`    - multiple of GOP size
   // `keyFrameInterval` - number of frames
   encoder_params.uiIntraPeriod = configurations_[i].key_frame_interval;
@@ -646,9 +735,12 @@ SEncParamExt H264EncoderImpl::CreateEncoderParams(size_t i) const {
   //  0: auto (dynamic imp. internal encoder)
   //  1: single thread (default value)
   // >1: number of threads
-  encoder_params.iMultipleThreadIdc =
+  // [A56] Clamped: NumberOfThreads() returns up to 8 for 1080p on a host with
+  // more than 8 cores, which is above what this OpenH264 can carry.
+  encoder_params.iMultipleThreadIdc = std::min(
       NumberOfThreads(encoder_thread_limit_, encoder_params.iPicWidth,
-                      encoder_params.iPicHeight, number_of_cores_);
+                      encoder_params.iPicHeight, number_of_cores_),
+      kMaxOpenH264Threads);
   // The base spatial layer 0 is the only one we use.
   encoder_params.sSpatialLayers[0].iVideoWidth = encoder_params.iPicWidth;
   encoder_params.sSpatialLayers[0].iVideoHeight = encoder_params.iPicHeight;
@@ -683,9 +775,29 @@ SEncParamExt H264EncoderImpl::CreateEncoderParams(size_t i) const {
     case H264PacketizationMode::NonInterleaved:
       // When uiSliceMode = SM_FIXEDSLCNUM_SLICE, uiSliceNum = 0 means auto
       // design it with cpu core number.
-      // TODO(sprang): Set to 0 when we understand why the rate controller borks
-      //               when uiSliceNum > 1.
-      encoder_params.sSpatialLayers[0].sSliceArgument.uiSliceNum = 1;
+      //
+      // [A56] ONE SLICE PER THREAD, not a hardcoded 1. OpenH264 parallelises a
+      // frame across SLICES only, so a thread count without a matching slice
+      // count buys nothing: SliceArgumentValidationFixedSliceMode() rewrites
+      // uiSliceNum <= 1 back to SM_SINGLE_SLICE (encoder_ext.cpp:196) and the
+      // extra threads idle. That is why the encoder ran single-threaded on a
+      // 14-core host: 1080p at 90 Mbps cost 28 ms per frame, 85% of the 33 ms
+      // frame interval, sitting exactly on WebRTC's CPU-overuse threshold, so
+      // whether a run dropped to 720p mid-experiment was decided by where the
+      // detector's 5 s check grid landed rather than by the arm under test.
+      //
+      // iMultipleThreadIdc is clamped to kMaxOpenH264Threads above, so the
+      // slice count stays inside the MAX_THREADS_NUM structures. Without the
+      // WebRTC-VideoEncoderSettings/encoder_thread_limit trial it is 1 and
+      // this line writes the same 1 it wrote before, so the untrialled path is
+      // unchanged.
+      //
+      // The upstream TODO warned that the rate controller "borks" when
+      // uiSliceNum > 1. That is a claim to measure per build, not to inherit:
+      // check achieved bitrate against target across a slice sweep before
+      // trusting a new OpenH264 roll.
+      encoder_params.sSpatialLayers[0].sSliceArgument.uiSliceNum =
+          encoder_params.iMultipleThreadIdc;
       encoder_params.sSpatialLayers[0].sSliceArgument.uiSliceMode =
           SM_FIXEDSLCNUM_SLICE;
       break;

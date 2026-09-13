@@ -116,6 +116,8 @@ class H264EncoderImpl : public VideoEncoder {
 
   bool has_reported_init_;
   bool has_reported_error_;
+  // [A44] ENCODER_OPTION_KFT_MAE currently set on the encoders.
+  bool mae_active_ = false;
 
   std::vector<uint8_t> tl0sync_limit_;
 };

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -2888,6 +2889,168 @@ TEST_F(PacingControllerTest, CanControlQueueSizeUsingTtl) {
               TimeDelta::Millis(500));
     clock_.AdvanceTime(pacer->NextSendTime() - clock_.CurrentTime());
     pacer->ProcessPackets();
+  }
+}
+
+// [A42] Records when each video frame (keyed by capture time) left the pacer.
+class PudicaFrameSendLog : public PacingController::PacketSender {
+ public:
+  explicit PudicaFrameSendLog(SimulatedClock& clock) : clock_(clock) {}
+  void SendPacket(std::unique_ptr<RtpPacketToSend> packet,
+                  const PacedPacketInfo& /* cluster_info */) override {
+    if (packet->packet_type() != RtpPacketMediaType::kVideo)
+      return;
+    Span& s = frames[packet->capture_time().ms()];
+    if (s.first_ms < 0)
+      s.first_ms = clock_.TimeInMilliseconds();
+    s.last_ms = clock_.TimeInMilliseconds();
+  }
+  std::vector<std::unique_ptr<RtpPacketToSend>> FetchFec() override {
+    return {};
+  }
+  // Pudica's probes are 50 B padding; a sender that cannot pad leaves
+  // pudica_next_probe_time_ in the past forever, which the real one does not.
+  std::vector<std::unique_ptr<RtpPacketToSend>> GeneratePadding(
+      DataSize target_size) override {
+    std::vector<std::unique_ptr<RtpPacketToSend>> packets;
+    packets.push_back(std::make_unique<RtpPacketToSend>(nullptr));
+    packets.back()->SetPadding(target_size.bytes());
+    packets.back()->set_packet_type(RtpPacketMediaType::kPadding);
+    return packets;
+  }
+  void OnAbortedRetransmissions(uint32_t,
+                                rtc::ArrayView<const uint16_t>) override {}
+  std::optional<uint32_t> GetRtxSsrcForMedia(uint32_t) const override {
+    return std::nullopt;
+  }
+  void OnBatchComplete() override {}
+
+  struct Span {
+    int64_t first_ms = -1;
+    int64_t last_ms = -1;
+  };
+  std::map<int64_t, Span> frames;
+
+ private:
+  SimulatedClock& clock_;
+};
+
+// [A42] Replays run 1789089163 at trace 62.72-63.95 s: a scene cut (413 KB
+// frame, then 130-195 KB frames) at target 30.5 Mbps, after which DRAIN cuts
+// the target to 6.3 and then 4.1 Mbps while 17-22 KB frames keep arriving.
+// Eq.2 sends a frame at frame_size/(L/rho); those bytes must not be charged
+// again at the pacing rate once the frame is over. In the run they were: the
+// pacer went silent for 516 ms and held the small frames for up to 512 ms.
+TEST_F(PacingControllerTest, PudicaFrameBytesAreNotRepaidAtThePacingRate) {
+  PacingController::SetPudicaIntraFramePacing(true, TimeDelta::Micros(33'333));
+  PacingController::SetPudicaProbing(true, 4, TimeDelta::Micros(33'333));
+  PacingController::SetPudicaBur(0.3);  // rho = 4.17, span = 8 ms
+  PudicaFrameSendLog log(clock_);
+  PacingController pacer(&clock_, &log, trials_);
+
+  struct Frame {
+    int t_ms;  // capture offset; enqueued 20 ms later (encode)
+    int bytes;
+  };
+  const std::vector<Frame> frames = {
+      {0, 107929},   {34, 111461},  {67, 106694},  {100, 413149},
+      {133, 177244}, {167, 195859}, {200, 164099}, {234, 157925},
+      {267, 157882}, {300, 127430}, {333, 128656}, {367, 137106},
+      {400, 145447}, {600, 17583},  {634, 19239},  {666, 17497},
+      {700, 19248},  {734, 18906},  {767, 20568},  {800, 18881},
+      {833, 20701},  {867, 20242},  {901, 22304},  {933, 19464},
+      {967, 22453}};
+  struct Rate {
+    int t_ms;
+    double target_mbps;  // paced at 1.1x, the video send stream's factor
+  };
+  const std::vector<Rate> rates = {
+      {0, 30.46}, {286, 26.19}, {387, 6.28}, {589, 4.12}, {994, 17.49}};
+  constexpr int kEncodeMs = 20;
+  constexpr size_t kPacketBytes = 1150;
+  constexpr int kEndMs = 1400;
+
+  // GoogCC re-posts the pacer config on every feedback, so SetPacingRates()
+  // runs every few tens of ms even when the rate does not change.
+  constexpr int kFeedbackMs = 25;
+
+  const Timestamp start = clock_.CurrentTime();
+  auto at = [&](int ms) { return start + TimeDelta::Millis(ms); };
+  uint16_t seq = 1;
+  size_t fi = 0;
+  size_t ri = 0;
+  DataRate rate = DataRate::Zero();
+  Timestamp next_feedback = start;
+  Timestamp next_wake = start;
+  // TaskQueuePacedSender::MaybeProcessPackets(): drain everything due, then
+  // sleep until NextSendTime() rounded up to whole ms. Enqueue and rate
+  // updates process immediately.
+  auto process = [&]() {
+    const Timestamp now = clock_.CurrentTime();
+    // The real loop spins on the wall clock while the agnostic gap holds
+    // video (NextSendTime() stays <= now); the simulated clock does not move,
+    // so stop at the first call that sends nothing.
+    while (pacer.NextSendTime() <= now) {
+      const size_t queued = pacer.QueueSizePackets();
+      pacer.ProcessPackets();
+      if (pacer.QueueSizePackets() == queued)
+        break;
+    }
+    const TimeDelta sleep = std::max(PacingController::kMinSleepTime,
+                                     pacer.NextSendTime() - now);
+    next_wake = now + sleep.RoundUpTo(TimeDelta::Millis(1));
+  };
+  while (clock_.CurrentTime() < at(kEndMs)) {
+    const Timestamp now = clock_.CurrentTime();
+    bool poke = false;
+    while (ri < rates.size() && now >= at(rates[ri].t_ms)) {
+      rate = DataRate::BitsPerSec(
+          static_cast<int64_t>(rates[ri].target_mbps * 1.1e6));
+      ++ri;
+      next_feedback = now;
+    }
+    if (now >= next_feedback) {
+      pacer.SetPacingRates(rate, DataRate::Zero());
+      next_feedback = now + TimeDelta::Millis(kFeedbackMs);
+      poke = true;
+    }
+    while (fi < frames.size() && now >= at(frames[fi].t_ms + kEncodeMs)) {
+      const int64_t id = at(frames[fi].t_ms).ms();
+      for (int left = frames[fi].bytes; left > 0;) {
+        const size_t n = std::min<size_t>(kPacketBytes, left);
+        left -= static_cast<int>(n);
+        auto p = BuildPacket(RtpPacketMediaType::kVideo, kVideoSsrc, seq++, id,
+                             n);
+        p->SetMarker(left == 0);
+        pacer.EnqueuePacket(std::move(p));
+      }
+      ++fi;
+      poke = true;
+    }
+    if (poke || now >= next_wake)
+      process();
+    Timestamp next = std::min({next_wake, next_feedback, at(kEndMs)});
+    if (fi < frames.size())
+      next = std::min(next, at(frames[fi].t_ms + kEncodeMs));
+    if (ri < rates.size())
+      next = std::min(next, at(rates[ri].t_ms));
+    AdvanceTimeUntil(std::max(next, now + TimeDelta::Micros(100)));
+  }
+  PacingController::SetPudicaProbing(false, 4, TimeDelta::Zero());
+  PacingController::SetPudicaBur(1.0);
+
+  // Every frame leaves within its own Eq.2 span (L/ρ = 8 ms) of arriving,
+  // whatever the pacing rate is doing: the scene cut needs the LINK's time,
+  // not the pacer's. Before [A42] the small frames waited 7-374 ms and the
+  // scene-cut frames up to 86 ms.
+  for (const Frame& f : frames) {
+    const int64_t id = at(f.t_ms).ms();
+    const PudicaFrameSendLog::Span& s = log.frames[id];
+    ASSERT_GE(s.first_ms, 0) << "frame at " << f.t_ms << " ms never sent";
+    EXPECT_LT(s.first_ms - (id + kEncodeMs), 10)
+        << "pacer wait, frame at " << f.t_ms << " ms (" << f.bytes << " B)";
+    EXPECT_LE(s.last_ms - s.first_ms, 10)
+        << "send span, frame at " << f.t_ms << " ms (" << f.bytes << " B)";
   }
 }
 

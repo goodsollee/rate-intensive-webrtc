@@ -114,6 +114,14 @@ ABSL_FLAG(int,
           vp8_kf_max_dist,
           3000,
           "VP8 keyframe interval (libvpx kf_max_dist).");
+// [A43] The one video codec both ends negotiate. Every other video media codec
+// is removed from the transceivers' preferences, so a build that lacks it
+// fails at startup instead of silently falling back to VP8.
+ABSL_FLAG(std::string,
+          video_codec,
+          "H264",
+          "Video codec to negotiate: H264 (packetization-mode=1), VP8, VP9 or "
+          "AV1. Empty keeps WebRTC's default order.");
 ABSL_FLAG(std::string, model_path, "", "LLM model path (demo mode).");
 ABSL_FLAG(std::string, context_path, "", "Raw-text context file (demo mode).");
 ABSL_FLAG(std::string, kvcache_path, "", "KV-cache file (demo mode).");

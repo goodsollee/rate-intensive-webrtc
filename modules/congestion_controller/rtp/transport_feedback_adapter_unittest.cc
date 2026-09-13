@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -526,6 +527,56 @@ TEST_P(TransportFeedbackAdapterTest, TransportPacketFeedbackHasDataInFlight) {
       CreateAndProcessFeedback(rtc::MakeArrayView(&packets[1], 1), adapter);
   EXPECT_EQ(adapted_feedback_1->data_in_flight, packets[1].packet_size);
   EXPECT_EQ(adapted_feedback_2->data_in_flight, DataSize::Zero());
+}
+
+TEST(TransportFeedbackAdapterCongestionFeedbackTest,
+     ReusedRtpKeyKeepsNewestPacketAfterOldHistoryRetires) {
+  // Reuse occurs on RTP sequence wrap or retransmission. CCFB identifies only
+  // the RTP key, whereas delayed TWCC can still identify the older send.
+  for (const char* retirement : {"none", "expiry", "twcc"}) {
+    SCOPED_TRACE(retirement);
+    TransportFeedbackAdapter adapter;
+    const PacketTemplate old_packet = {
+        .transport_sequence_number = 10,
+        .rtp_sequence_number = 100,
+        .send_timestamp = Timestamp::Millis(0),
+        .receive_timestamp = Timestamp::Millis(10)};
+    const PacketTemplate new_packet = {
+        .transport_sequence_number = 11,
+        .rtp_sequence_number = 100,
+        .send_timestamp = Timestamp::Millis(59'000),
+        .receive_timestamp = Timestamp::Millis(59'010)};
+    for (const auto& packet : {old_packet, new_packet}) {
+      adapter.AddPacket(CreatePacketToSend(packet), packet.pacing_info, 0,
+                        packet.send_timestamp);
+      adapter.ProcessSentPacket(rtc::SentPacket(
+          packet.transport_sequence_number, packet.send_timestamp.ms()));
+    }
+    if (std::string(retirement) == "expiry") {
+      // Expire only the old packet from the 60-second send history.
+      const PacketTemplate unrelated = {.transport_sequence_number = 12,
+                                         .rtp_sequence_number = 101};
+      adapter.AddPacket(CreatePacketToSend(unrelated), unrelated.pacing_info, 0,
+                        Timestamp::Millis(61'000));
+    } else if (std::string(retirement) == "twcc") {
+      auto old_feedback = BuildRtcpTransportFeedbackPacket(
+          rtc::MakeArrayView(&old_packet, 1));
+      auto result = adapter.ProcessTransportFeedback(
+          old_feedback, Timestamp::Millis(59'020));
+      ASSERT_TRUE(result.has_value());
+      ASSERT_THAT(result->packet_feedbacks, SizeIs(1));
+      EXPECT_EQ(result->packet_feedbacks[0].sent_packet.sequence_number, 10);
+    }
+    auto feedback = BuildRtcpCongestionControlFeedbackPacket(
+        rtc::MakeArrayView(&new_packet, 1));
+    auto result = adapter.ProcessCongestionControlFeedback(
+        feedback, Timestamp::Millis(61'010));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_THAT(result->packet_feedbacks, SizeIs(1));
+    EXPECT_EQ(result->packet_feedbacks[0].sent_packet.sequence_number, 11);
+    EXPECT_EQ(result->packet_feedbacks[0].sent_packet.send_time,
+              new_packet.send_timestamp);
+  }
 }
 
 TEST(TransportFeedbackAdapterCongestionFeedbackTest,

@@ -595,6 +595,10 @@ bool PacingController::ShouldSendKeepalive(Timestamp now) const {
 }
 
 Timestamp PacingController::NextSendTime() const {
+  return NextSendTime(/*include_pudica_wakeups=*/true);
+}
+
+Timestamp PacingController::NextSendTime(bool include_pudica_wakeups) const {
   const Timestamp now = CurrentTime();
   Timestamp next_send_time = Timestamp::PlusInfinity();
 
@@ -669,7 +673,8 @@ Timestamp PacingController::NextSendTime() const {
 
   // Pudica: wake up for deferred probe sending or gap end
   const PudicaProbeConfig pudica_config = ReadPudicaProbeConfig();
-  if (pudica_config.revision == pudica_config_snapshot_.revision) {
+  if (include_pudica_wakeups &&
+      pudica_config.revision == pudica_config_snapshot_.revision) {
     if (pudica_probes_remaining_ > 0 && pudica_next_probe_time_.IsFinite()) {
       next_send_time = std::min(next_send_time, pudica_next_probe_time_);
     }
@@ -803,7 +808,19 @@ void PacingController::ProcessPackets() {
   int iteration = 0;
   int packets_sent = 0;
   int padding_packets_generated = 0;
-  for (; iteration < circuit_breaker_threshold_; ++iteration) {
+  // [A42] A Pudica probe / gap / deadline wake-up gets us here, but it does
+  // not make media due. The send loop below must be bounded by the media send
+  // time alone: with the probe time in it, a probe that fell due (probes go
+  // out only AFTER this loop) pinned target_send_time in the past, the loop
+  // never broke, and UpdateTimeAndGetElapsed() drained nothing -- so the
+  // whole queue left at once and every byte of it became media debt. Run
+  // 1789089163, 63.09 s: ~890 KB out in ~50 ms, debt at the 500 ms cap,
+  // then repaid at the post-DRAIN 4.5 Mbps -- 516 ms of silence while 11
+  // frames waited in the pacer (pacing_ms 512).
+  const bool media_due =
+      NextSendTime(/*include_pudica_wakeups=*/false) <=
+      now + early_execute_margin;
+  for (; media_due && iteration < circuit_breaker_threshold_; ++iteration) {
     // Fetch packet, so long as queue is not empty or budget is not
     // exhausted.
     std::unique_ptr<RtpPacketToSend> rtp_packet =
@@ -890,6 +907,10 @@ void PacingController::ProcessPackets() {
       // PUDICA_PROBING=0 run. The probe SCHEDULING below keeps the gate.
       const bool pudica_frame_ended =
           packet_type == RtpPacketMediaType::kVideo && rtp_packet->Marker();
+      // Capture Eq.2 state before marker handling clears the frame rate.
+      const bool pudica_eq2_frame_ended =
+          pudica_frame_ended && pudica_frame_rate_ > DataRate::Zero();
+      const uint32_t diag_rtp_ts = rtp_packet->Timestamp();
       if (pudica_frame_ended && pudica_config_snapshot_.enabled) {
         pudica_probe_frame_timestamp_ = rtp_packet->Timestamp();
       }
@@ -966,6 +987,27 @@ void PacingController::ProcessPackets() {
         pudica_next_probe_time_ = pudica_probes_remaining_ > 0
             ? now + pudica_probe_interval_
             : Timestamp::MinusInfinity();
+        // [DIAG] PUDICA_DIAG=1: what A40 saw at this marker. Joined on rtp_ts
+        // with [PUDICA-DIAG-ENQ] (task_queue_paced_sender.cc) it tells whether
+        // the next frame was already in packet_queue_ or not yet enqueued.
+        static const bool kDiag = []() {
+          const char* e = std::getenv("PUDICA_DIAG");
+          return e && std::atoi(e) == 1;
+        }();
+        if (kDiag) {
+          const Timestamp oldest =
+              packet_queue_.LeadingPacketEnqueueTime(RtpPacketMediaType::kVideo);
+          fprintf(stderr,
+                  "[PUDICA-DIAG-MARK] rtp_ts=%u now_ms=%.3f video_pkts=%d "
+                  "queue_kb=%.1f oldest_video_age_ms=%.3f gap_ms=%.3f "
+                  "send_ms=%.3f rho=%.2f\n",
+                  diag_rtp_ts, now.us() / 1000.0,
+                  packet_queue_.SizeInPacketsPerRtpPacketMediaType()
+                      [static_cast<size_t>(RtpPacketMediaType::kVideo)],
+                  QueueSizeData().bytes<double>() / 1024.0,
+                  oldest.IsFinite() ? (now - oldest).us() / 1000.0 : -1.0,
+                  gap_us / 1000.0, frame_send_us / 1000.0, rho);
+        }
         pudica_frame_send_start_ = Timestamp::MinusInfinity();  // reset for next frame
         // [A25] The frame is done; revert to pacing_rate_ for the gap. The next
         // frame's first packet re-arms Eq.2 from the queue as it stands then.
@@ -990,6 +1032,13 @@ void PacingController::ProcessPackets() {
 
       // Send done, update send time.
       OnPacketSent(packet_type, packet_size, now);
+      // [A42] The frame's bytes were paced by Eq.2 at frame_size / (L/ρ); they
+      // are on the wire. Whatever debt is left must not be repaid again at
+      // pacing_rate_, which the rate reverts to from here -- after a DRAIN cut
+      // that is a few Mbps, and the next frame would wait behind it.
+      if (pudica_eq2_frame_ended) {
+        media_debt_ = DataSize::Zero();
+      }
 
       if (is_probing) {
         pacing_info.probe_cluster_bytes_sent += packet_size.bytes();
@@ -1001,8 +1050,8 @@ void PacingController::ProcessPackets() {
       }
 
       // Update target send time in case that are more packets that we are late
-      // in processing.
-      target_send_time = NextSendTime();
+      // in processing. [A42] Media time only -- see `media_due` above.
+      target_send_time = NextSendTime(/*include_pudica_wakeups=*/false);
       if (target_send_time > now) {
         // Exit loop if not probing.
         if (!is_probing) {

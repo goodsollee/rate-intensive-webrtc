@@ -1,0 +1,225 @@
+diff --git a/codec/api/wels/codec_app_def.h b/codec/api/wels/codec_app_def.h
+index 9b13c33c..42301469 100644
+--- a/codec/api/wels/codec_app_def.h
++++ b/codec/api/wels/codec_app_def.h
+@@ -142,7 +142,9 @@ typedef enum {
+ 
+   ENCODER_OPTION_IS_LOSSLESS_LINK,            ///< advanced algorithmetic settings
+ 
+-  ENCODER_OPTION_BITS_VARY_PERCENTAGE        ///< bit vary percentage
++  ENCODER_OPTION_BITS_VARY_PERCENTAGE,       ///< bit vary percentage
++
++  ENCODER_OPTION_KFT_MAE                     ///< [KFT MAE] bool. 1: the rate-control bit budget covers ONE GOP (one frame without temporal layers) instead of VGOP_SIZE frames, and the RC frame skipper is off. 0: stock.
+ } ENCODER_OPTION;
+ 
+ /**
+diff --git a/codec/encoder/core/inc/param_svc.h b/codec/encoder/core/inc/param_svc.h
+index 92686e7a..d4d5023e 100644
+--- a/codec/encoder/core/inc/param_svc.h
++++ b/codec/encoder/core/inc/param_svc.h
+@@ -119,6 +119,7 @@ typedef struct TagWelsSvcCodingParam: SEncParamExt {
+ 
+   bool      bDeblockingParallelFlag;        // deblocking filter parallelization control flag
+   int32_t   iBitsVaryPercentage;
++  bool      bKftMae;                        // [KFT MAE] ENCODER_OPTION_KFT_MAE: one-GOP bit budget window, RC skipper off
+ 
+   int8_t   iDecompStages;          // GOP size dependency
+   int32_t  iMaxNumRefFrame;
+@@ -228,6 +229,7 @@ typedef struct TagWelsSvcCodingParam: SEncParamExt {
+ 
+     iDecompStages               = 0;    // GOP size dependency, unknown here and be revised later
+     iBitsVaryPercentage = 10;
++    bKftMae = false;
+   }
+ 
+   int32_t ParamBaseTranscode (const SEncParamBase& pCodingParam) {
+diff --git a/codec/encoder/core/inc/rc.h b/codec/encoder/core/inc/rc.h
+index ad9c0384..b06b2479 100644
+--- a/codec/encoder/core/inc/rc.h
++++ b/codec/encoder/core/inc/rc.h
+@@ -203,6 +203,7 @@ int32_t   iFrameCodedInVGop;
+ int32_t   iSkipFrameInVGop;
+ int32_t   iGopNumberInVGop;
+ int32_t   iGopIndexInVGop;
++int32_t   iGopsInWindow;    // [KFT MAE] GOPs the CURRENT allocation covers: iGopNumberInVGop, or 1 under ENCODER_OPTION_KFT_MAE
+ 
+ int32_t   iSkipQpValue;
+ int32_t   iQpRangeUpperInFrame;
+diff --git a/codec/encoder/core/src/encoder_ext.cpp b/codec/encoder/core/src/encoder_ext.cpp
+index 7fdbc614..6513bc3a 100644
+--- a/codec/encoder/core/src/encoder_ext.cpp
++++ b/codec/encoder/core/src/encoder_ext.cpp
+@@ -386,7 +386,10 @@ int32_t ParamValidation (SLogContext* pLogCtx, SWelsSvcCodingParam* pCfg) {
+       }
+ 
+     }
+-    pCfg->iMinQp = WELS_CLIP3 (pCfg->iMinQp, GOM_MIN_QP_MODE, QP_MAX_VALUE);
++    // [A48] Floor at 1, not GOM_MIN_QP_MODE (12): at QP 12 the e2e source's
++    // simple scenes top out at ~39 Mbps under a 100 Mbps target. 0 still means
++    // "unset" and is remapped to 12..42 above.
++    pCfg->iMinQp = WELS_CLIP3 (pCfg->iMinQp, 1, QP_MAX_VALUE);
+     pCfg->iMaxQp = WELS_CLIP3 (pCfg->iMaxQp, pCfg->iMinQp, QP_MAX_VALUE);
+   }
+   // ref-frames validation
+diff --git a/codec/encoder/core/src/ratectl.cpp b/codec/encoder/core/src/ratectl.cpp
+index 40af74d9..a60128fc 100644
+--- a/codec/encoder/core/src/ratectl.cpp
++++ b/codec/encoder/core/src/ratectl.cpp
+@@ -49,6 +49,18 @@
+ 
+ namespace WelsEnc {
+ 
++// [KFT MAE] The RC frame skipper is OFF while ENCODER_OPTION_KFT_MAE holds
++// the budget window at one GOP. It is not independent of the window: the
++// skipper's second trigger (RcVBufferCalculationSkip, dIncPercent) prices the
++// rest of a VGOP_SIZE window against iRemainingBits, and against a one-GOP
++// allocation that reads as a ~30% overrun on EVERY frame -- MAE would
++// manufacture the very frame drops it exists to avoid. libvpx has the same
++// coupling (drop_mark = thresh * optimal_buffer_level) and the VP8 port zeroes
++// rc_dropframe_thresh for the same reason.
++static inline bool RcFrameSkipEnabled (const sWelsEncCtx* pEncCtx) {
++  return pEncCtx->pSvcParam->bEnableFrameSkip && !pEncCtx->pSvcParam->bKftMae;
++}
++
+ const int32_t g_kiQpToQstepTable[52] = {
+   63,   71,   79,   89,  100,  112,  126,  141,  159,  178,
+   200,  224,  252,  283,  317,  356,  400,  449,  504,  566,
+@@ -208,6 +220,7 @@ void RcInitTlWeight (sWelsEncCtx* pEncCtx) {
+   }
+   pWelsSvcRc->iPreviousGopSize = kiGopSize;
+   pWelsSvcRc->iGopNumberInVGop = VGOP_SIZE / kiGopSize;
++  pWelsSvcRc->iGopsInWindow = pWelsSvcRc->iGopNumberInVGop;
+ }
+ 
+ void RcUpdateBitrateFps (sWelsEncCtx* pEncCtx) {
+@@ -258,26 +271,39 @@ void RcInitVGop (sWelsEncCtx* pEncCtx) {
+   SRCTemporal* pTOverRc = pWelsSvcRc->pTemporalOverRc;
+   const int32_t kiHighestTid = pEncCtx->pSvcParam->sDependencyLayers[kiDid].iHighestTemporalId;
+   const bool fix_rc_overshoot = pEncCtx->pSvcParam->bFixRCOverShoot;
++  // [KFT MAE] The window this allocation covers. Stock: iGopNumberInVGop GOPs
++  // = VGOP_SIZE frames. Under ENCODER_OPTION_KFT_MAE: ONE GOP -- one frame
++  // without temporal layers -- so the frame just coded is settled before the
++  // next one is budgeted. An overshoot is then a deficit the NEXT frame repays
++  // (the bFixRCOverShoot carry below), not something seven later frames
++  // absorb. This is libvpx's rc_buf_optimal_sz = one frame, expressed in the
++  // window OpenH264 budgets over. iGopsInWindow remembers what the PREVIOUS
++  // allocation covered, so the mid-window settlement stays exact across a
++  // switch.
++  const int32_t kiGopSize = 1 << pEncCtx->pSvcParam->sDependencyLayers[kiDid].iDecompositionStages;
++  const int32_t kiGopsInWindow = pEncCtx->pSvcParam->bKftMae ? 1 : pWelsSvcRc->iGopNumberInVGop;
++  const int32_t kiWindowBits = kiGopsInWindow * kiGopSize * pWelsSvcRc->iBitsPerFrame;
+ 
+   if (fix_rc_overshoot) {
+     // subtract unused bits if interrupted in a mid of VGOP
+-    int32_t iLeftInVGop = pWelsSvcRc->iGopNumberInVGop - pWelsSvcRc->iGopIndexInVGop;
+-    pWelsSvcRc->iRemainingBits -= iLeftInVGop * (pWelsSvcRc->iLastAllocatedBits / pWelsSvcRc->iGopNumberInVGop);
++    int32_t iLeftInVGop = pWelsSvcRc->iGopsInWindow - pWelsSvcRc->iGopIndexInVGop;
++    pWelsSvcRc->iRemainingBits -= iLeftInVGop * (pWelsSvcRc->iLastAllocatedBits / pWelsSvcRc->iGopsInWindow);
+   }
+ 
+   if (fix_rc_overshoot && pWelsSvcRc->iRemainingBits < 0) {
+ 	  // carry over bitrate deficit, so we don't overshoot
+-    pWelsSvcRc->iRemainingBits += VGOP_SIZE * pWelsSvcRc->iBitsPerFrame;
++    pWelsSvcRc->iRemainingBits += kiWindowBits;
+   } else {
+     // but never more than target bitrate.
+-    pWelsSvcRc->iRemainingBits = VGOP_SIZE * pWelsSvcRc->iBitsPerFrame;
++    pWelsSvcRc->iRemainingBits = kiWindowBits;
+   }
+ 
+   if (fix_rc_overshoot) {
+     // store last allocated bits to correctly recalculate carry over
+     pWelsSvcRc->iLastAllocatedBits = pWelsSvcRc->iRemainingBits;
+   }
+-  pWelsSvcRc->iRemainingWeights = pWelsSvcRc->iGopNumberInVGop * WEIGHT_MULTIPLY;
++  pWelsSvcRc->iRemainingWeights = kiGopsInWindow * WEIGHT_MULTIPLY;
++  pWelsSvcRc->iGopsInWindow = kiGopsInWindow;
+ 
+   pWelsSvcRc->iFrameCodedInVGop = 0;
+   pWelsSvcRc->iGopIndexInVGop = 0;
+@@ -390,7 +416,9 @@ void RcUpdateTemporalZero (sWelsEncCtx* pEncCtx) {
+ #endif
+     RcInitTlWeight (pEncCtx);
+     RcInitVGop (pEncCtx);
+-  } else if (pWelsSvcRc->iGopIndexInVGop == pWelsSvcRc->iGopNumberInVGop || pEncCtx->eSliceType == I_SLICE) {
++  } else if (pWelsSvcRc->iGopIndexInVGop == pWelsSvcRc->iGopsInWindow || pEncCtx->eSliceType == I_SLICE
++             // [KFT MAE] switched on mid-window: settle the window now, not VGOP_SIZE frames later
++             || (pEncCtx->pSvcParam->bKftMae && pWelsSvcRc->iGopsInWindow != 1)) {
+ #if GOM_TRACE_FLAG
+     RcTraceVGopBitrate (pEncCtx);
+ #endif
+@@ -587,7 +615,7 @@ void RcDecideTargetBits (sWelsEncCtx* pEncCtx) {
+     else //this case should be not hit. needs to more test case to verify this
+       pWelsSvcRc->iTargetBits = pWelsSvcRc->iRemainingBits;
+     if ((pWelsSvcRc->iTargetBits <= 0) && ((pEncCtx->pSvcParam->iRCMode == RC_BITRATE_MODE)
+-                                           && (pEncCtx->pSvcParam->bEnableFrameSkip == false))) {
++                                           && !RcFrameSkipEnabled (pEncCtx))) {
+       pWelsSvcRc->iCurrentBitsLevel = BITS_EXCEEDED;
+     }
+     pWelsSvcRc->iTargetBits = WELS_CLIP3 (pWelsSvcRc->iTargetBits, pTOverRc->iMinBitsTl, pTOverRc->iMaxBitsTl);
+@@ -807,7 +835,7 @@ void CheckFrameSkipBasedMaxbr (sWelsEncCtx* pEncCtx, const long long uiTimeStamp
+   SWelsSvcRc* pWelsSvcRc = &pEncCtx->pWelsSvcRc[iDidIdx];
+   SSpatialLayerConfig* pDLayerParam     = &pEncCtx->pSvcParam->sSpatialLayers[iDidIdx];
+   //SSpatialLayerInternal* pDLayerParamInternal     = &pEncCtx->pSvcParam->sDependencyLayers[pEncCtx->uiDependencyId];
+-  if (!pEncCtx->pSvcParam->bEnableFrameSkip)
++  if (!RcFrameSkipEnabled (pEncCtx))
+     return;
+   const int32_t iSentBits = pWelsSvcRc->iBitsPerFrame;
+   const int32_t kiOutputMaxBits = pWelsSvcRc->iMaxBitsPerFrame;
+@@ -880,6 +908,9 @@ bool WelsRcCheckFrameStatus (sWelsEncCtx* pEncCtx, long long uiTimeStamp, int32_
+     if (pEncCtx->pFuncList->pfRc.pfWelsRcPicDelayJudge) {
+       pEncCtx->pFuncList->pfRc.pfWelsRcPicDelayJudge (pEncCtx, uiTimeStamp, iDidIdx);
+     }
++    // [KFT MAE] a flag raised by the previous frame, before the switch, must not skip this one
++    if (!RcFrameSkipEnabled (pEncCtx))
++      pEncCtx->pWelsSvcRc[iDidIdx].bSkipFlag = false;
+     if (true == pEncCtx->pWelsSvcRc[iDidIdx].bSkipFlag) {
+       bSkipMustFlag = true;
+     }
+@@ -907,6 +938,9 @@ bool WelsRcCheckFrameStatus (sWelsEncCtx* pEncCtx, long long uiTimeStamp, int32_
+       if (pEncCtx->pFuncList->pfRc.pfWelsRcPicDelayJudge) {
+         pEncCtx->pFuncList->pfRc.pfWelsRcPicDelayJudge (pEncCtx, uiTimeStamp, iDidIdx);
+       }
++      // [KFT MAE] see the simulcast branch above
++      if (!RcFrameSkipEnabled (pEncCtx))
++        pEncCtx->pWelsSvcRc[iDidIdx].bSkipFlag = false;
+       if (true == pEncCtx->pWelsSvcRc[iDidIdx].bSkipFlag) {
+         bSkipMustFlag = true;
+       }
+@@ -1226,7 +1260,7 @@ void  WelsRcPictureInfoUpdateGom (sWelsEncCtx* pEncCtx, int32_t iLayerSize) {
+   }
+   pWelsSvcRc->iRemainingBits -= pWelsSvcRc->iFrameDqBits;
+ 
+-  if (pEncCtx->pSvcParam->bEnableFrameSkip /*&&
++  if (RcFrameSkipEnabled (pEncCtx) /*&&
+       pEncCtx->uiDependencyId == pEncCtx->pSvcParam->iSpatialLayerNum - 1*/) {
+     RcVBufferCalculationSkip (pEncCtx);
+   }
+@@ -1452,7 +1486,7 @@ void WelsRcFrameDelayJudgeTimeStamp (sWelsEncCtx* pEncCtx, long long uiTimeStamp
+   pWelsSvcRc->iBufferFullnessSkip = WELS_MAX ((-1) * (pDLayerConfig->iSpatialBitrate / 4),
+                                     pWelsSvcRc->iBufferFullnessSkip);
+ 
+-  if (pEncCtx->pSvcParam->bEnableFrameSkip) {
++  if (RcFrameSkipEnabled (pEncCtx)) {
+     pWelsSvcRc->bSkipFlag = true;
+     if (pWelsSvcRc->iBufferFullnessSkip < pWelsSvcRc->iBufferSizeSkip) {
+       pWelsSvcRc->bSkipFlag = false;
+diff --git a/codec/encoder/plus/src/welsEncoderExt.cpp b/codec/encoder/plus/src/welsEncoderExt.cpp
+index 636c0cc6..1ecb64cf 100644
+--- a/codec/encoder/plus/src/welsEncoderExt.cpp
++++ b/codec/encoder/plus/src/welsEncoderExt.cpp
+@@ -970,6 +970,14 @@ int CWelsH264SVCEncoder::SetOption (ENCODER_OPTION eOptionId, void* pOption) {
+     }
+   }
+   break;
++  case ENCODER_OPTION_KFT_MAE: { // [KFT MAE] 0: stock VGOP_SIZE budget window; 1: one-GOP window, RC skipper off
++    bool bValue = * ((bool*)pOption);
++    m_pEncContext->pSvcParam->bKftMae = bValue;
++    WelsLog (&m_pWelsTrace->m_sLogCtx, WELS_LOG_INFO,
++             "CWelsH264SVCEncoder::SetOption():ENCODER_OPTION_KFT_MAE, one-gop window(%d)",
++             bValue);
++  }
++  break;
+   case ENCODER_PADDING_PADDING: { // 0:disable padding;1:padding
+     int32_t iValue = * ((int32_t*)pOption);
+     m_pEncContext->pSvcParam->iPaddingFlag = iValue;

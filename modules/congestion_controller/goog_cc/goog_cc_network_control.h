@@ -12,6 +12,7 @@
 #define MODULES_CONGESTION_CONTROLLER_GOOG_CC_GOOG_CC_NETWORK_CONTROL_H_
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include <deque>
 #include <memory>
@@ -147,6 +148,16 @@ class GoogCcNetworkController : public NetworkControllerInterface {
   Timestamp ce_window_start_ = Timestamp::MinusInfinity();
   int ce_window_ce_count_ = 0;             // CE packets seen in current window.
   bool ce_cap_active_ = false;             // a finite cap is currently applied.
+  // [L4Span L7 2026-09-11] Observability, sender only (env KFT_L4S_LOG != 0):
+  // one "[L4S]" stderr line per RTT window that saw CE or had a cap, and the
+  // same row in $UNIFIED_CSV_DIR/l4s_sender.csv. Inert when the env is unset.
+  int ce_window_ect_count_ = 0;            // ECT packets seen in current window.
+  bool l4s_log_enabled_ = false;
+  FILE* l4s_csv_ = nullptr;
+  Timestamp l4s_log_t0_ = Timestamp::MinusInfinity();
+  Timestamp l4s_stat_at_ = Timestamp::MinusInfinity();   // 1 s "[L4S] stat" cadence
+  int64_t l4s_tot_ect_ = 0;                // ECT packets echoed by CCFB, all time
+  int64_t l4s_tot_ce_ = 0;                 // CE packets echoed by CCFB, all time
 
   DataRate last_loss_based_target_rate_;
   DataRate last_pushback_target_rate_;

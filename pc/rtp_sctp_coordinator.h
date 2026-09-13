@@ -529,7 +529,13 @@ class RtpSctpCoordinator {
   // being used instead.
   uint32_t pudica_frame_rtp_ts_ = 0;
   bool pudica_frame_rtp_ts_valid_ = false;
-  std::deque<std::pair<int64_t, double>> pudica_owd_window_;  // (time_us, owd_us)
+  // D_min window. pudica_owd_times_ holds every sample's recv time in arrival
+  // order and sets the expiry frontier; pudica_owd_minq_ holds (arrival index,
+  // owd_us) with owd increasing front to back, so its front is the minimum.
+  std::deque<int64_t> pudica_owd_times_;
+  std::deque<std::pair<int64_t, double>> pudica_owd_minq_;
+  int64_t pudica_owd_pushed_ = 0;   // samples ever added
+  int64_t pudica_owd_expired_ = 0;  // samples ever expired from the front
   static constexpr int64_t kPudicaDminWindowUs = 10'000'000;  // 10 seconds in μs
 
   // SACK_AGG=diff state: previous frame's mean RTT (μs)

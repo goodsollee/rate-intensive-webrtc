@@ -102,6 +102,9 @@ class Conductor : public webrtc::PeerConnectionObserver,
   void DeletePeerConnection();
   void EnsureStreamingUI();
   void AddTracks();
+  // [A43] Restrict every video transceiver to --video_codec (plus RTX/RED/FEC).
+  // Called right before each CreateOffer()/CreateAnswer().
+  void ApplyVideoCodecPreference();
 
   //
   // PeerConnectionObserver implementation.

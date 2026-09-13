@@ -852,8 +852,15 @@ void VideoReceiveStream2::OnDecodableFrameTimeout(TimeDelta wait) {
       rtp_video_stream_receiver_.LastReceivedPacketMs();
 
   // To avoid spamming keyframe requests for a stream that is not active we
-  // check if we have received a packet within the last 5 seconds.
-  constexpr TimeDelta kInactiveDuration = TimeDelta::Seconds(5);
+  // check if we have received a packet within the last 10 seconds.
+  //
+  // [A47] 5 s -> 10 s. FINESSE's timeout path relies on this timer firing a
+  // PLI ~T* after the RAN sweeps, but a RAN episode cannot open while the link
+  // is at zero, so after an outage of ~5 s it opens with no video received for
+  // 5 s and the request never comes: run 1789104825 ep2, last video packet
+  // t=31.0 s, last PLI 35.79 s, sweep 35.99 s, then no PLI and DROP_ALL ran to
+  // its 2 s cap. Outages up to ~9.6 s (10 s - T*) are now covered.
+  constexpr TimeDelta kInactiveDuration = TimeDelta::Seconds(10);
   const bool stream_is_active =
       last_packet_ms &&
       now - Timestamp::Millis(*last_packet_ms) < kInactiveDuration;
