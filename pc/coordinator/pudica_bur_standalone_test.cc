@@ -632,8 +632,8 @@ TEST(CeBrakeCutsCommittedByHalfAlpha) {
   printf("  10 Mbps, alpha=0.4 -> %.3f Mbps\n", after / 1e6);
   EXPECT_NEAR(after, 8'000'000, 1);
   EXPECT_NEAR(c.committed_bps, 8'000'000, 1);
-  EXPECT_GT(c.mi_pending() ? 1 : 0, 0);
-  EXPECT_NEAR(c.mi_decision_now_us(), 5'000'000, 0);
+  EXPECT_LT(c.mi_pending() ? 1 : 0, 1);  // the cut does not arm the hold
+  EXPECT_NEAR(c.mi_decision_now_us(), 0, 0);
 }
 
 TEST(CeBrakeFloorsAtMinRateAndNeverRaises) {
@@ -658,35 +658,46 @@ TEST(CeBrakeAlphaZeroOrNoCommittedIsNoop) {
   EXPECT_LT(empty.mi_pending() ? 1 : 0, 1);
 }
 
-// An MI step at t=1 s, a CE cut at t=2 s. A report on a frame sent at 1.5 s
-// is feedback of the MI step, not of the cut: without the re-armed barrier it
-// releases the MI wait and multiplies the cut B straight back up.
-TEST(CeBrakeBlocksInFlightMiFromReRaising) {
+// The cut leaves the MI/AI-MD feedback barrier exactly as it found it. An MI
+// step at t=1 s arms the hold; a CE cut at t=2 s must not re-arm it (the pilot
+// showed re-arming blocks regrowth and the per-window cuts compound), nor
+// release it. The next decision is the one the controller would have made
+// without the cut, applied to the cut B.
+TEST(CeBrakeLeavesMiHoldStateUnchanged) {
   auto run = [](bool cut) {
     PudicaRtpRateCtrl c;
     c.cfg.ack_ceil_k = 0;  // isolate the barrier from the delivered-rate ceiling
     c.committed_bps = 10'000'000;
     auto o = c.Update(MakeIn(0.30, 0.30, 10'000'000, 1'000'000, 900'000));
     EXPECT_STREQ(o.mode, "PUD-MI");
-    const int64_t after_mi = c.committed_bps;
+    const bool pending_before = c.mi_pending();
+    const int64_t decision_before = c.mi_decision_now_us();
     if (cut) c.ApplyCeBrake(0.5, 2'000'000);
+    EXPECT_GT(pending_before == c.mi_pending() ? 1 : 0, 0);
+    EXPECT_NEAR(c.mi_decision_now_us(), decision_before, 0);
     const int64_t before_report = c.committed_bps;
-    o = c.Update(MakeIn(0.30, 0.30, 10'000'000, 2'050'000, 1'500'000));
-    printf("  cut=%d after_mi=%.2f before=%.2f -> %s %.2f Mbps\n", cut ? 1 : 0,
-           after_mi / 1e6, before_report / 1e6, o.mode, c.committed_bps / 1e6);
-    return std::make_pair(std::string(o.mode), c.committed_bps);
+    // A frame sent before the MI decision still holds; one sent after opens.
+    o = c.Update(MakeIn(0.30, 0.30, 10'000'000, 2'050'000, 950'000));
+    const std::string first(o.mode);
+    o = c.Update(MakeIn(0.30, 0.30, 10'000'000, 2'100'000, 1'500'000));
+    printf("  cut=%d before=%.2f -> %s then %s %.2f Mbps\n", cut ? 1 : 0,
+           before_report / 1e6, first.c_str(), o.mode, c.committed_bps / 1e6);
+    return std::make_pair(first, std::string(o.mode));
   };
   auto no_cut = run(false);
-  EXPECT_STREQ(no_cut.first.c_str(), "PUD-MI");  // control: barrier opens
   auto with_cut = run(true);
-  EXPECT_STREQ(with_cut.first.c_str(), "PUD-HOLD");
-  // The first post-cut frame reopens the barrier (paper wait, ~1 RTT).
+  EXPECT_STREQ(no_cut.first.c_str(), "PUD-HOLD");
+  EXPECT_STREQ(no_cut.second.c_str(), "PUD-MI");
+  EXPECT_STREQ(with_cut.first.c_str(), no_cut.first.c_str());
+  EXPECT_STREQ(with_cut.second.c_str(), no_cut.second.c_str());
+  // With no hold armed, the cut does not create one: the next report MIs.
   PudicaRtpRateCtrl c;
   c.cfg.ack_ceil_k = 0;
   c.committed_bps = 10'000'000;
   c.ApplyCeBrake(0.5, 2'000'000);
   EXPECT_NEAR(c.committed_bps, 7'500'000, 1);
-  auto o = c.Update(MakeIn(0.30, 0.30, 7'500'000, 2'100'000, 2'010'000));
+  EXPECT_LT(c.mi_pending() ? 1 : 0, 1);
+  auto o = c.Update(MakeIn(0.30, 0.30, 7'500'000, 2'100'000, 1'900'000));
   EXPECT_STREQ(o.mode, "PUD-MI");
 }
 

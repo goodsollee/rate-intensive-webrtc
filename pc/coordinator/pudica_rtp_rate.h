@@ -520,30 +520,25 @@ class PudicaRtpRateCtrl {
   // (goog_cc MaybeReactToCe): B <- max(min_rate, B x (1 - alpha/2)). Called at
   // most once per CE-marked RTT window. Returns the committed B after the cut.
   //
-  // Fields touched, and only these:
-  //   committed_bps        -- the cut itself (never raised: if B is already
-  //                           below min_rate it is left alone).
-  //   mi_pending_ / mi_decision_now_us_
-  //                        -- the cut is treated as a new rate ADJUSTMENT: the
-  //                           paper's "wait for feedback of the last
-  //                           adjustment" barrier is re-armed at decision_us,
-  //                           so a report on a frame sent BEFORE the cut (i.e.
-  //                           feedback of the MI/AI-MD step the cut overrides)
-  //                           cannot immediately re-raise B. The barrier opens
-  //                           on the first frame sent at/after the cut, ~1 RTT.
-  //                           This supersedes any in-flight MI/AI-MD wait.
-  // Untouched on purpose: tau_/tau_init_us_, draining_/consecutive_high_,
-  // drain accumulators, the ack ceiling window (and D_min, which lives in the
-  // coordinator). DRAIN/FALLBACK run before the barrier and still fire.
-  // alpha <= 0, or no committed B yet, is a no-op.
+  // Touches committed_bps ONLY (never raised: if B is already below min_rate
+  // it is left alone). The MI/AI-MD feedback barrier (mi_pending_ /
+  // mi_decision_now_us_) is deliberately neither set nor cleared: re-arming it
+  // on every CE window blocked MI/AI regrowth while the next window cut again,
+  // so the cuts compounded (device-C pilot, city trace, L4SPAN_EVAL, client
+  // 6a947d33: 5960 ce_cut lines in ~195 s, committed 16.9 -> 2.3-3.4 Mbps and
+  // stayed, against GCC's 17.1 Mbps mean send under the same CE). Pudica's own
+  // MI/AI-MD regrows between windows, as GCC's delay-based BWE does under its
+  // cap. Also untouched: tau_/tau_init_us_, draining_/consecutive_high_, drain
+  // accumulators, the ack ceiling window (and D_min, in the coordinator).
+  // alpha <= 0, or no committed B yet, is a no-op. decision_us is unused and
+  // kept for the call-site signature.
   int64_t ApplyCeBrake(double alpha, int64_t decision_us) {
+    (void)decision_us;
     if (committed_bps <= 0 || !(alpha > 0.0)) return committed_bps;
     if (alpha > 1.0) alpha = 1.0;
     const int64_t cut = static_cast<int64_t>(
         static_cast<double>(committed_bps) * (1.0 - alpha / 2.0));
     committed_bps = std::min(committed_bps, std::max(cfg.min_rate_bps, cut));
-    mi_pending_ = true;
-    mi_decision_now_us_ = decision_us;
     return committed_bps;
   }
 

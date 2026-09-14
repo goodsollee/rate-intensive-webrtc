@@ -271,7 +271,7 @@ TEST_F(PudicaFeedbackTest, CeWindowCutsCommittedAndPublishedTarget) {
   EXPECT_EQ(after, 7'500'000);
   EXPECT_EQ(CommittedRate(), 7'500'000);
   EXPECT_EQ(PublishedRate(), 7'500'000);
-  EXPECT_TRUE(MiPending());
+  EXPECT_FALSE(MiPending());  // the cut does not arm the MI/AI-MD hold
 }
 
 // GCC warm start (no published Pudica target yet): nothing changes, and the
