@@ -2887,6 +2887,57 @@ bool RtpSctpCoordinator::IsPudicaMode() {
   return pudica_mode_active_.load(std::memory_order_relaxed);
 }
 
+// [MOT-EVAL5 L4S-PUDICA-CE] See header. The published target moves with the
+// committed B in the same step, so GetPudicaRtpOverride() (called later in the
+// same OnTransportPacketsFeedback, from DelayBasedBwe) already returns the cut
+// value and the next Eq.6 sample stores it as B_k. No lock: this runs on the
+// same sequence as PudicaUpdateRtpTarget(), which mutates pudica_rtp_ctrl_
+// unlocked today.
+bool RtpSctpCoordinator::OnPudicaCeWindow(double alpha,
+                                          int64_t at_us,
+                                          int64_t* before_bps,
+                                          int64_t* after_bps) {
+  if (!pudica_mode_active_.load(std::memory_order_relaxed)) return false;
+  RtpSctpCoordinator* self = active_instance_;
+  if (self == nullptr || self->config_.mode != CoordinatorMode::kPudica ||
+      self->pudica_legacy_) {
+    return false;
+  }
+  const int64_t target = pudica_rtp_target_bps_.load(std::memory_order_relaxed);
+  if (target <= 0) return false;  // GCC warm start: GCC still owns the rate.
+  PudicaRtpRateCtrl& ctrl = self->pudica_rtp_ctrl_;
+  // Same seeding as PudicaUpdateRtpTarget(): committed follows the published
+  // target until the paper controller has made its first decision.
+  if (ctrl.committed_bps <= 0) ctrl.committed_bps = target;
+  const int64_t before = ctrl.committed_bps;
+  // Decision time on the sender clock, as PudicaUpdateRtpTarget() uses for the
+  // feedback barrier (compared against frame first-send times).
+  const int64_t after = ctrl.ApplyCeBrake(alpha, rtc::TimeMicros());
+  int64_t ceiling = ctrl.cfg.max_rate_bps;
+  if (ceiling <= 0) ceiling = kPudicaAppCapBps;
+  const int64_t published =
+      std::max(self->config_.min_rate_bps, std::min(ceiling, after));
+  pudica_rtp_target_bps_.store(published, std::memory_order_relaxed);
+  if (before_bps) *before_bps = before;
+  if (after_bps) *after_bps = after;
+  static const bool kLog = []() {
+    const char* l4s = std::getenv("KFT_L4S_LOG");
+    const char* wl = std::getenv("KFT_WEBRTC_LOG");
+    auto on = [](const char* e) {
+      return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+    };
+    return on(l4s) || on(wl);
+  }();
+  if (kLog) {
+    fprintf(stderr,
+            "[L4S-PUDICA] ce_cut at_ms=%.1f alpha=%.5f before_bps=%lld "
+            "after_bps=%lld published_bps=%lld\n",
+            at_us / 1000.0, alpha, static_cast<long long>(before),
+            static_cast<long long>(after), static_cast<long long>(published));
+  }
+  return true;
+}
+
 // [A28d] One row per GetPudicaRtpOverride() call. Called from the TWCC
 // feedback path (DelayBasedBwe), which is a different thread from the frame
 // path that writes pudica_ctrl.csv, hence its own mutex and stream.

@@ -515,8 +515,42 @@ class PudicaRtpRateCtrl {
     drain_recv_bps_ = 0;
   }
 
+  // [MOT-EVAL5 L4S-PUDICA-CE] One L4S CE window's multiplicative decrease,
+  // applied to Pudica's own committed B with the SAME law as the GCC CE brake
+  // (goog_cc MaybeReactToCe): B <- max(min_rate, B x (1 - alpha/2)). Called at
+  // most once per CE-marked RTT window. Returns the committed B after the cut.
+  //
+  // Fields touched, and only these:
+  //   committed_bps        -- the cut itself (never raised: if B is already
+  //                           below min_rate it is left alone).
+  //   mi_pending_ / mi_decision_now_us_
+  //                        -- the cut is treated as a new rate ADJUSTMENT: the
+  //                           paper's "wait for feedback of the last
+  //                           adjustment" barrier is re-armed at decision_us,
+  //                           so a report on a frame sent BEFORE the cut (i.e.
+  //                           feedback of the MI/AI-MD step the cut overrides)
+  //                           cannot immediately re-raise B. The barrier opens
+  //                           on the first frame sent at/after the cut, ~1 RTT.
+  //                           This supersedes any in-flight MI/AI-MD wait.
+  // Untouched on purpose: tau_/tau_init_us_, draining_/consecutive_high_,
+  // drain accumulators, the ack ceiling window (and D_min, which lives in the
+  // coordinator). DRAIN/FALLBACK run before the barrier and still fire.
+  // alpha <= 0, or no committed B yet, is a no-op.
+  int64_t ApplyCeBrake(double alpha, int64_t decision_us) {
+    if (committed_bps <= 0 || !(alpha > 0.0)) return committed_bps;
+    if (alpha > 1.0) alpha = 1.0;
+    const int64_t cut = static_cast<int64_t>(
+        static_cast<double>(committed_bps) * (1.0 - alpha / 2.0));
+    committed_bps = std::min(committed_bps, std::max(cfg.min_rate_bps, cut));
+    mi_pending_ = true;
+    mi_decision_now_us_ = decision_us;
+    return committed_bps;
+  }
+
   bool draining() const { return draining_; }
   int consecutive_high() const { return consecutive_high_; }
+  bool mi_pending() const { return mi_pending_; }
+  int64_t mi_decision_now_us() const { return mi_decision_now_us_; }
 
  private:
   // [A33] The delivered-rate ceiling bounds GROWTH only. It is floored at the

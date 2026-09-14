@@ -198,7 +198,7 @@ GoogCcNetworkController::GoogCcNetworkController(NetworkControllerConfig config,
         l4s_csv_ = std::fopen(path.c_str(), "w");
         if (l4s_csv_) {
           std::fprintf(l4s_csv_,
-                       "t_ms,n_ce,n_ect,alpha,rtt_ms,target_mbps,cap_mbps,active\n");
+                       "t_ms,n_ce,n_ect,alpha,rtt_ms,target_mbps,cap_mbps,active,owner\n");
           std::fflush(l4s_csv_);
         }
       }
@@ -931,7 +931,30 @@ void GoogCcNetworkController::MaybeReactToCe(
   const DataRate target = bandwidth_estimation_->target_rate();
   DataRate cap = DataRate::PlusInfinity();
   const bool was_active = ce_cap_active_;
-  if (ce_window_ce_count_ > 0) {
+  bool pudica_cut = false;
+  int64_t pudica_before_bps = 0;
+  int64_t pudica_after_bps = 0;
+  if (ce_window_ce_count_ > 0 && RtpSctpCoordinator::IsPudicaMode()) {
+    // [MOT-EVAL5 L4S-PUDICA-CE] Pudica owns the RTP-video rate, so the same
+    // law B x (1 - alpha/2) is applied to Pudica's COMMITTED B, once per CE
+    // window. Clipping only the published target with SetCeLimit left Pudica's
+    // B untouched, so it bounced back after one CE-free window. No SetCeLimit
+    // here as well: that would cut twice, (1 - alpha/2)^2. Threading: this and
+    // Pudica's feedback hook (DelayBasedBwe -> OnPudicaPacketFeedback) both run
+    // inside this OnTransportPacketsFeedback call; keep it that way. When no
+    // Pudica paper controller is in charge yet (GCC warm start, legacy), the
+    // call returns false and the GCC cap below applies as before.
+    pudica_cut = RtpSctpCoordinator::OnPudicaCeWindow(
+        ce_alpha_, at_time.us(), &pudica_before_bps, &pudica_after_bps);
+  }
+  if (pudica_cut) {
+    // A cap left over from a warm-start GCC reaction would double-cut.
+    if (ce_cap_active_) {
+      bandwidth_estimation_->SetCeLimit(DataRate::PlusInfinity(), at_time);
+      ce_cap_active_ = false;
+    }
+    cap = DataRate::BitsPerSec(pudica_after_bps);
+  } else if (ce_window_ce_count_ > 0) {
     // Multiplicative decrease once per RTT that saw CE (paper §2).
     cap = target * (1.0 - ce_alpha_ / 2.0);
     bandwidth_estimation_->SetCeLimit(cap, at_time);
@@ -943,20 +966,27 @@ void GoogCcNetworkController::MaybeReactToCe(
   }
   // [L4Span L7] One row per window that saw CE, applied a cap, or released
   // one -- quiet (no row) while the link is uncongested.
+  // [MOT-EVAL5] Pudica rows: target_mbps = Pudica committed B BEFORE the cut,
+  // cap_mbps = committed B AFTER it, active = 0 (no SSBE cap), and the trailing
+  // owner column says which controller took the cut ("gcc" / "pudica").
   if (l4s_log_enabled_ && (ce_window_ce_count_ > 0 || was_active)) {
     const double t_ms = (at_time - l4s_log_t0_).ms<double>();
     const double cap_mbps = cap.IsFinite() ? cap.bps<double>() / 1e6 : -1.0;
+    const double row_target_mbps = pudica_cut
+                                       ? pudica_before_bps / 1e6
+                                       : target.bps<double>() / 1e6;
+    const char* owner = pudica_cut ? "pudica" : "gcc";
     std::fprintf(stderr,
                  "[L4S] t=%.0f n_ce=%d n_ect=%d alpha=%.4f rtt_ms=%.1f "
-                 "target_mbps=%.3f cap_mbps=%.3f active=%d\n",
+                 "target_mbps=%.3f cap_mbps=%.3f active=%d owner=%s\n",
                  t_ms, ce_window_ce_count_, ce_window_ect_count_, ce_alpha_,
-                 ce_rtt_ewma_ms_, target.bps<double>() / 1e6, cap_mbps,
-                 ce_cap_active_ ? 1 : 0);
+                 ce_rtt_ewma_ms_, row_target_mbps, cap_mbps,
+                 ce_cap_active_ ? 1 : 0, owner);
     if (l4s_csv_) {
-      std::fprintf(l4s_csv_, "%.0f,%d,%d,%.5f,%.2f,%.4f,%.4f,%d\n", t_ms,
+      std::fprintf(l4s_csv_, "%.0f,%d,%d,%.5f,%.2f,%.4f,%.4f,%d,%s\n", t_ms,
                    ce_window_ce_count_, ce_window_ect_count_, ce_alpha_,
-                   ce_rtt_ewma_ms_, target.bps<double>() / 1e6, cap_mbps,
-                   ce_cap_active_ ? 1 : 0);
+                   ce_rtt_ewma_ms_, row_target_mbps, cap_mbps,
+                   ce_cap_active_ ? 1 : 0, owner);
       std::fflush(l4s_csv_);
     }
   }

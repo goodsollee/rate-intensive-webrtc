@@ -261,6 +261,21 @@ class RtpSctpCoordinator {
   // [A28e] Timer-path variant: returns >0 only when the next-delay fallback
   // actually cut the target, so the periodic path stays inert otherwise.
   static int64_t GetPudicaTimerFallback();
+  // [MOT-EVAL5 L4S-PUDICA-CE] L4S CE brake for Pudica mode. goog_cc's
+  // MaybeReactToCe calls this once per RTT window that saw CE, instead of
+  // SetCeLimit, so Pudica's committed B (and the published target, and hence
+  // Eq.6's B_k) take the GCC law B x (1 - alpha/2). Returns true when the cut
+  // was applied; false (nothing changed) when there is no Pudica paper
+  // controller in charge yet -- not Pudica mode, PUDICA_LEGACY=1, or no
+  // published target (GCC warm start) -- so the caller keeps the GCC cap.
+  // before_bps/after_bps (optional) receive the committed B around the cut.
+  // Threading: runs inside GoogCcNetworkController::OnTransportPacketsFeedback,
+  // the same call sequence that reaches OnPudicaPacketFeedback via
+  // DelayBasedBwe, so it follows the existing unlocked pudica_rtp_ctrl_ access.
+  static bool OnPudicaCeWindow(double alpha,
+                               int64_t at_us,
+                               int64_t* before_bps = nullptr,
+                               int64_t* after_bps = nullptr);
 
   // ===== Called by DcSctpTransport =====
 

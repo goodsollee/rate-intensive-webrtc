@@ -74,6 +74,10 @@ class PudicaFeedbackTest : public ::testing::Test {
   }
   void SetDmin(double us) { coordinator_->pudica_d_min_us_ = us; }
   int64_t CommittedRate() const { return coordinator_->pudica_rtp_ctrl_.committed_bps; }
+  int64_t PublishedRate() const {
+    return coordinator_->pudica_rtp_target_bps_.load();
+  }
+  bool MiPending() const { return coordinator_->pudica_rtp_ctrl_.mi_pending(); }
   int64_t OldestAfterFeedback(uint64_t* oldest_id) const {
     return PacingController::PudicaOldestUnackedSendUs(
         coordinator_->pudica_acked_send_id_.load(), oldest_id);
@@ -253,6 +257,44 @@ TEST_F(PudicaFeedbackTest, DelayedBatchWaitsForActualMiDecisionTime) {
 
 TEST_F(PudicaFeedbackTest, DelayedBatchWaitsForActualAimdDecisionTime) {
   CheckDelayedBatchBarrier(true);
+}
+
+// [MOT-EVAL5 L4S-PUDICA-CE] The goog_cc CE window cuts Pudica's committed B and
+// the published target together, with the GCC law B x (1 - alpha/2).
+TEST_F(PudicaFeedbackTest, CeWindowCutsCommittedAndPublishedTarget) {
+  ASSERT_TRUE(RtpSctpCoordinator::IsPudicaMode());
+  SetPublishedRate(10'000'000);
+  SetCommittedRate(10'000'000);
+  int64_t before = 0, after = 0;
+  EXPECT_TRUE(RtpSctpCoordinator::OnPudicaCeWindow(0.5, 0, &before, &after));
+  EXPECT_EQ(before, 10'000'000);
+  EXPECT_EQ(after, 7'500'000);
+  EXPECT_EQ(CommittedRate(), 7'500'000);
+  EXPECT_EQ(PublishedRate(), 7'500'000);
+  EXPECT_TRUE(MiPending());
+}
+
+// GCC warm start (no published Pudica target yet): nothing changes, and the
+// caller keeps the GCC SetCeLimit path.
+TEST_F(PudicaFeedbackTest, CeWindowIsNoopBeforePudicaPublishesATarget) {
+  SetPublishedRate(0);
+  SetCommittedRate(0);
+  EXPECT_FALSE(RtpSctpCoordinator::OnPudicaCeWindow(0.5, 0));
+  EXPECT_EQ(CommittedRate(), 0);
+  EXPECT_EQ(PublishedRate(), 0);
+}
+
+// Not Pudica mode: zero effect (GCC arm stays on SetCeLimit).
+TEST_F(PudicaFeedbackTest, CeWindowIsNoopOutsidePudicaMode) {
+  coordinator_.reset();
+  CoordinatorConfig config;
+  config.mode = CoordinatorMode::kDisabled;
+  coordinator_ = std::make_unique<RtpSctpCoordinator>(nullptr, config);
+  ASSERT_FALSE(RtpSctpCoordinator::IsPudicaMode());
+  SetCommittedRate(10'000'000);
+  EXPECT_FALSE(RtpSctpCoordinator::OnPudicaCeWindow(0.5, 0));
+  EXPECT_EQ(CommittedRate(), 10'000'000);
+  EXPECT_EQ(PublishedRate(), 0);
 }
 
 }  // namespace webrtc
